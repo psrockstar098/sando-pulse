@@ -14,7 +14,7 @@ const knowledge = @import("../storage/knowledge.zig");
 const sources = @import("sources.zig");
 const source_manager = @import("source_manager.zig");
 const rss = @import("rss.zig");
-const fetchers = @import("fetchers.zig");
+const connectors = @import("connectors.zig");
 const normalizer = @import("normalizer.zig");
 const validate = @import("validate.zig");
 const entities = @import("../engine/entities.zig");
@@ -99,7 +99,9 @@ fn ingestOneSource(
         .errors = 0,
         .duration_ms = 0,
     };
-    const body = fetchers.fetchFeed(alloc, io, source.feed_url, environ) catch {
+    // Fetch through the RSS connector (3.2 framework); the connector
+    // is the single place where fetch policy lives.
+    const body = connectors.rssConnector().fetch(alloc, io, source.feed_url, environ) catch {
         report.errors += 1;
         report.duration_ms = timex.nowMillis(io) - start;
         if (ks) |k| recordHealth(k, alloc, source.id, now, false, "fetch failed", 0);

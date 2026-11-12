@@ -25,6 +25,7 @@ pub const engine_ranking = @import("engine/ranking.zig");
 pub const engine_search = @import("engine/search.zig");
 pub const engine_temporal = @import("engine/temporal.zig");
 pub const engine_vectors = @import("engine/vectors.zig");
+pub const ingestion_connectors = @import("ingestion/connectors.zig");
 pub const ingestion_fetchers = @import("ingestion/fetchers.zig");
 pub const ingestion_normalizer = @import("ingestion/normalizer.zig");
 pub const ingestion_pipeline = @import("ingestion/pipeline.zig");

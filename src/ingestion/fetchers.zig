@@ -411,14 +411,25 @@ fn parseStatus(head: []const u8) ?u16 {
 }
 
 /// Origin-form request target: "/path?query", default "/".
+/// Uses the percent-ENCODED form (formatEscaped): toRawMaybeAlloc
+/// decodes %20 back to a raw space, which puts a literal space in the
+/// request line — strict servers (Nominatim/Varnish) close the
+/// connection without responding. Found live 2026-11-12 via the OSM
+/// connector: head_raw len 0 on every Nominatim fetch until this fix.
 fn requestTarget(alloc: std.mem.Allocator, uri: std.Uri) ![]u8 {
-    const path = try uri.path.toRawMaybeAlloc(alloc);
-    const p = if (path.len == 0) "/" else path;
+    const path = try std.fmt.allocPrint(alloc, "{f}", .{std.fmt.alt(uri.path, .formatEscaped)});
     if (uri.query) |q| {
-        const qs = try q.toRawMaybeAlloc(alloc);
+        defer alloc.free(path);
+        const qs = try std.fmt.allocPrint(alloc, "{f}", .{std.fmt.alt(q, .formatEscaped)});
+        defer alloc.free(qs);
+        const p = if (path.len == 0) "/" else path;
         return std.fmt.allocPrint(alloc, "{s}?{s}", .{ p, qs });
     }
-    return alloc.dupe(u8, p);
+    if (path.len == 0) {
+        alloc.free(path);
+        return alloc.dupe(u8, "/");
+    }
+    return path;
 }
 
 const HeadInfo = struct {
