@@ -7,6 +7,7 @@ const types = @import("../common/types.zig");
 const rss = @import("rss.zig");
 const sources = @import("sources.zig");
 const entities = @import("../engine/entities.zig");
+const geo = @import("../engine/geo.zig");
 
 pub fn normalize(
     alloc: std.mem.Allocator,
@@ -19,6 +20,22 @@ pub fn normalize(
     const combined = try std.mem.concat(alloc, u8, &.{ title, " ", text });
     const ent = try entities.extract(alloc, combined);
     const id = try types.contentHash(alloc, source.id, item.link, title);
+    // Geo-tag: first named city wins; else the first named county's capital.
+    // Coordinates come from the verified OSM table (engine/geo.zig).
+    var lat: ?f64 = null;
+    var lon: ?f64 = null;
+    if (ent.cities.len > 0) {
+        if (geo.lookup(ent.cities[0])) |p| {
+            lat = p.lat;
+            lon = p.lon;
+        }
+    }
+    if (lat == null and ent.counties.len > 0) {
+        if (geo.countyPoint(ent.counties[0])) |p| {
+            lat = p.lat;
+            lon = p.lon;
+        }
+    }
     return .{
         .id = id,
         .source_id = source.id,
@@ -32,6 +49,8 @@ pub fn normalize(
         .reliability = source.reliability,
         .topics = ent.topics,
         .content_hash = id,
+        .lat = lat,
+        .lon = lon,
     };
 }
 
@@ -58,4 +77,28 @@ test "normalize builds a document with real content and topics" {
     }
     try std.testing.expect(saw_energy);
     try std.testing.expectEqual(@as(usize, 64), doc.id.len);
+}
+
+test "normalize geo-tags a Monrovia story, leaves others untagged" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const src = sources.find("new-dawn").?;
+    const monrovia = try normalize(alloc, src, .{
+        .title = "Fuel shortage hits Monrovia",
+        .link = "https://thenewdawnliberia.com/fuel-shortage",
+        .description = "Fuel stations report long queues.",
+        .pub_date = 1794496800,
+    }, 1794497000);
+    try std.testing.expect(monrovia.lat != null);
+    try std.testing.expectApproxEqAbs(@as(f64, 6.3204), monrovia.lat.?, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, -10.8060), monrovia.lon.?, 0.001);
+    const nowhere = try normalize(alloc, src, .{
+        .title = "Markets open early",
+        .link = "https://thenewdawnliberia.com/markets",
+        .description = "Traders set up stalls.",
+        .pub_date = 1794496800,
+    }, 1794497000);
+    try std.testing.expectEqual(@as(?f64, null), nowhere.lat);
+    try std.testing.expectEqual(@as(?f64, null), nowhere.lon);
 }

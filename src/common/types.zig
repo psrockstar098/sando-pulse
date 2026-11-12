@@ -22,6 +22,13 @@ pub const Document = struct {
     reliability: f32,
     topics: []const []const u8,
     content_hash: []const u8,
+    /// WGS-84 coordinates when the document is linked to a known Liberian
+    /// place (set at ingest from the geo lookup; null otherwise).
+    lat: ?f64 = null,
+    lon: ?f64 = null,
+    /// Document embedding from the configured provider (128 dims by
+    /// default); null when the document was ingested without one.
+    embedding: ?[]const f32 = null,
 };
 
 /// Internal search request produced by the query planner.
@@ -77,6 +84,10 @@ pub const SearchQuery = struct {
     geo: ?GeoFilter = null,
     /// When true, also match trigram-similar terms (fuzzy search).
     fuzzy: bool = false,
+    /// Query embedding for semantic candidate retrieval (pgvector `<=>`
+    /// ordering + distance cutoff). Null when no embedding provider is
+    /// configured; the engine then ranks on keyword signals only.
+    query_embedding: ?[]const f32 = null,
 };
 
 /// The planner's output: what the query means, in Pulse's own terms.

@@ -62,6 +62,9 @@ pub const MemoryStore = struct {
             .reliability = d.reliability,
             .topics = try topics.toOwnedSlice(alloc),
             .content_hash = try alloc.dupe(u8, d.content_hash),
+            .lat = d.lat,
+            .lon = d.lon,
+            .embedding = if (d.embedding) |e| try alloc.dupe(f32, e) else null,
         };
     }
 

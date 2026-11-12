@@ -258,6 +258,54 @@ pub fn escapeLikePattern(alloc: Allocator, s: []const u8) ![]u8 {
     return out.toOwnedSlice(alloc);
 }
 
+/// Format an embedding as a pgvector literal: `'[0.1,0.2,...]'::vector`.
+/// Values print with `{d}` (shortest round-trip); the literal is quoted
+/// and cast, so no SQL injection is possible through float formatting.
+pub fn formatVectorLiteral(alloc: Allocator, vec: []const f32) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '\'');
+    try out.append(alloc, '[');
+    for (vec, 0..) |v, i| {
+        if (i > 0) try out.append(alloc, ',');
+        const s = try std.fmt.allocPrint(alloc, "{d}", .{v});
+        defer alloc.free(s);
+        try out.appendSlice(alloc, s);
+    }
+    try out.appendSlice(alloc, "]'::vector");
+    return out.toOwnedSlice(alloc);
+}
+
+/// Parse a pgvector text value like "[0.1,0.2]" back into floats.
+/// Caller owns the result; null input yields null.
+pub fn parseVectorText(alloc: Allocator, val: ?[]const u8) !?[]f32 {
+    const s = val orelse return null;
+    const inner = std.mem.trim(u8, s, "[] ");
+    if (inner.len == 0) return null;
+    var out: std.ArrayList(f32) = .empty;
+    errdefer out.deinit(alloc);
+    var it = std.mem.splitScalar(u8, inner, ',');
+    while (it.next()) |tok| {
+        const t = std.mem.trim(u8, tok, " ");
+        if (t.len == 0) continue;
+        try out.append(alloc, try std.fmt.parseFloat(f32, t));
+    }
+    const owned: ?[]f32 = try out.toOwnedSlice(alloc);
+    return owned;
+}
+
+test "formatVectorLiteral round-trips through parseVectorText" {
+    const alloc = std.testing.allocator;
+    const vec = [_]f32{ 1, 0.5, -0.25, 0 };
+    const lit = try formatVectorLiteral(alloc, &vec);
+    defer alloc.free(lit);
+    try std.testing.expectEqualStrings("'[1,0.5,-0.25,0]'::vector", lit);
+    const back = (try parseVectorText(alloc, "[1,0.5,-0.25,0]")).?;
+    defer alloc.free(back);
+    try std.testing.expectEqualSlices(f32, &vec, back);
+    try std.testing.expectEqual(@as(?[]f32, null), try parseVectorText(alloc, null));
+}
+
 /// Validate an identifier (table/column name) and return it double-quoted.
 /// Only [A-Za-z0-9_.$] plus a non-leading digit rule is accepted; anything
 /// else is rejected rather than escaped into SQL.
@@ -1079,11 +1127,22 @@ pub const PostgresStore = struct {
         defer a.free(esc_doc_text);
         const esc_doc_hash = try escapeLiteral(a, doc.content_hash);
         defer a.free(esc_doc_hash);
+        const lat_sql = if (doc.lat) |v| try std.fmt.allocPrint(a, "{d}", .{v}) else try a.dupe(u8, "NULL");
+        defer a.free(lat_sql);
+        const lon_sql = if (doc.lon) |v| try std.fmt.allocPrint(a, "{d}", .{v}) else try a.dupe(u8, "NULL");
+        defer a.free(lon_sql);
+        const geom_sql = if (doc.lat != null and doc.lon != null)
+            try std.fmt.allocPrint(a, "ST_SetSRID(ST_MakePoint({d}, {d}), 4326)::geography", .{ doc.lon.?, doc.lat.? })
+        else
+            try a.dupe(u8, "NULL");
+        defer a.free(geom_sql);
+        const emb_sql = if (doc.embedding) |vec| try formatVectorLiteral(a, vec) else try a.dupe(u8, "NULL");
+        defer a.free(emb_sql);
         const doc_sql = try std.fmt.allocPrint(a,
             \\INSERT INTO documents
             \\  (id, source_id, title, url, text, published_at, fetched_at,
-            \\   reliability, topics, content_hash)
-            \\VALUES ({s}, {s}, {s}, {s}, {s}, {s}, {s}, {d}, {s}, {s})
+            \\   reliability, topics, content_hash, lat, lon, geom, embedding)
+            \\VALUES ({s}, {s}, {s}, {s}, {s}, {s}, {s}, {d}, {s}, {s}, {s}, {s}, {s}, {s})
             \\ON CONFLICT (id) DO NOTHING
         , .{
             esc_doc_id,
@@ -1096,6 +1155,10 @@ pub const PostgresStore = struct {
             doc.reliability,
             topics_sql.items,
             esc_doc_hash,
+            lat_sql,
+            lon_sql,
+            geom_sql,
+            emb_sql,
         });
         defer a.free(doc_sql);
         try client.exec(a, doc_sql);
@@ -1127,7 +1190,8 @@ pub const PostgresStore = struct {
             \\SELECT d.id, d.source_id, s.name, s.home_url, d.title, d.url, d.text,
             \\  extract(epoch from d.published_at)::bigint,
             \\  extract(epoch from d.fetched_at)::bigint,
-            \\  d.reliability, d.topics, d.content_hash
+            \\  d.reliability, d.topics, d.content_hash,
+            \\  d.embedding::text, d.lat, d.lon
             \\FROM documents d JOIN sources s ON s.id = d.source_id
         );
 
@@ -1200,7 +1264,7 @@ pub const PostgresStore = struct {
     }
 
     fn documentFromRow(alloc: Allocator, row: Row) !types.Document {
-        if (row.cols.len != 12) return error.ProtocolError;
+        if (row.cols.len != 15) return error.ProtocolError;
         const c = row.cols;
         const req = struct {
             fn text(cols: []?[]const u8, idx: usize) ![]const u8 {
@@ -1220,6 +1284,9 @@ pub const PostgresStore = struct {
             .reliability = try std.fmt.parseFloat(f32, try req(c, 9)),
             .topics = try parseTextArray(alloc, c[10]),
             .content_hash = try alloc.dupe(u8, try req(c, 11)),
+            .embedding = try parseVectorText(alloc, c[12]),
+            .lat = if (c[13]) |v| try std.fmt.parseFloat(f64, v) else null,
+            .lon = if (c[14]) |v| try std.fmt.parseFloat(f64, v) else null,
         };
     }
 
