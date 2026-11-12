@@ -182,7 +182,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (is_worker) {
         if (once) {
-            const report = try worker.runOnce(alloc, io, repo, sink, if (archiver) |*a| a else null, &m, init.environ_map, embedder, ks);
+            const report = try worker.runOnce(alloc, io, repo, sink, if (archiver) |*a| a else null, &m, init.environ_map, embedder, ks, cfg.ingest_interval_s);
             std.debug.print("ingest once: docs {d} -> {d}, {d} sources, had_error={}\n", .{
                 report.docs_before,
                 report.docs_after,

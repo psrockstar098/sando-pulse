@@ -30,6 +30,7 @@ pub const ingestion_normalizer = @import("ingestion/normalizer.zig");
 pub const ingestion_pipeline = @import("ingestion/pipeline.zig");
 pub const ingestion_rss = @import("ingestion/rss.zig");
 pub const ingestion_sources = @import("ingestion/sources.zig");
+pub const ingestion_source_manager = @import("ingestion/source_manager.zig");
 pub const ingestion_validate = @import("ingestion/validate.zig");
 pub const storage_memory = @import("storage/memory.zig");
 pub const storage_knowledge = @import("storage/knowledge.zig");

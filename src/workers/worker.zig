@@ -22,8 +22,9 @@ pub fn runOnce(
     environ: ?*const std.process.Environ.Map,
     embedder: ?providers.EmbeddingProvider,
     ks: ?knowledge.KnowledgeStore,
+    default_interval_s: u64,
 ) !pipeline.IngestReport {
-    const report = try pipeline.runOnce(alloc, io, repo, sink, archiver, environ, embedder, ks);
+    const report = try pipeline.runOnce(alloc, io, repo, sink, archiver, environ, embedder, ks, default_interval_s);
     m.observeIngestRun(report.had_error);
     m.setDocumentsIndexed(@intCast(report.docs_after));
     logging.info("ingest run done", &.{
@@ -50,7 +51,7 @@ pub fn runLoop(
     while (true) {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
-        _ = runOnce(arena.allocator(), io, repo, sink, archiver, m, environ, embedder, ks) catch |e| {
+        _ = runOnce(arena.allocator(), io, repo, sink, archiver, m, environ, embedder, ks, cfg.ingest_interval_s) catch |e| {
             logging.err("ingest run failed", &.{.{ .key = "error", .value = @errorName(e) }});
             m.observeIngestRun(true);
         };

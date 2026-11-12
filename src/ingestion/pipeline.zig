@@ -12,6 +12,7 @@ const types = @import("../common/types.zig");
 const repository = @import("../storage/repository.zig");
 const knowledge = @import("../storage/knowledge.zig");
 const sources = @import("sources.zig");
+const source_manager = @import("source_manager.zig");
 const rss = @import("rss.zig");
 const fetchers = @import("fetchers.zig");
 const normalizer = @import("normalizer.zig");
@@ -34,6 +35,9 @@ pub const SourceReport = struct {
     inserted: usize,
     errors: usize,
     duration_ms: i64,
+    /// True when the run skipped this source (disabled, auth missing,
+    /// or interval not elapsed) — not an error, just no fetch.
+    skipped: bool = false,
 };
 
 pub const IngestReport = struct {
@@ -85,6 +89,7 @@ fn ingestOneSource(
     environ: ?*const std.process.Environ.Map,
     embedder: ?providers.EmbeddingProvider,
     ks: ?knowledge.KnowledgeStore,
+    limit: usize,
 ) SourceReport {
     const start = timex.nowMillis(io);
     var report = SourceReport{
@@ -116,7 +121,10 @@ fn ingestOneSource(
         return report;
     };
     report.fetched = items.len;
-    for (items) |item| {
+    // Per-source collection limit (3.1): only the first N items of a
+    // run are processed; the rest wait for the next run.
+    const limited = items[0..@min(items.len, limit)];
+    for (limited) |item| {
         var doc = normalizer.normalize(alloc, source, item, now) catch {
             report.errors += 1;
             continue;
@@ -185,6 +193,7 @@ pub fn runOnce(
     environ: ?*const std.process.Environ.Map,
     embedder: ?providers.EmbeddingProvider,
     ks: ?knowledge.KnowledgeStore,
+    default_interval_s: u64,
 ) !IngestReport {
     const start = timex.nowMillis(io);
     const now = timex.nowSeconds(io);
@@ -192,8 +201,44 @@ pub fn runOnce(
     var reports: std.ArrayList(SourceReport) = .empty;
     var had_error = false;
     for (sources.sources) |source| {
-        if (!source.enabled) continue;
-        const r = ingestOneSource(alloc, io, repo, source, sink, archiver, now, environ, embedder, ks);
+        // Per-source runtime config (3.1): env overrides, auth state,
+        // interval scheduling against the recorded last run.
+        const rt = source_manager.resolve(alloc, environ, source, default_interval_s) catch {
+            logging.warn("source config failed, using registry defaults", &.{.{ .key = "source", .value = source.id }});
+            continue;
+        };
+        if (!rt.enabled) continue;
+        if (rt.auth == .missing) {
+            logging.warn("source skipped: credential env var not set", &.{
+                .{ .key = "source", .value = source.id },
+                .{ .key = "auth_env_var", .value = rt.auth_env_var orelse "" },
+            });
+            try reports.append(alloc, .{
+                .source_id = source.id,
+                .fetched = 0,
+                .inserted = 0,
+                .errors = 0,
+                .duration_ms = 0,
+                .skipped = true,
+            });
+            continue;
+        }
+        if (ks) |k| {
+            const health = k.getSourceHealth(alloc, source.id) catch null;
+            const last_run = if (health) |h| h.last_run_at else null;
+            if (!source_manager.isDue(rt.interval_s, now, last_run)) {
+                try reports.append(alloc, .{
+                    .source_id = source.id,
+                    .fetched = 0,
+                    .inserted = 0,
+                    .errors = 0,
+                    .duration_ms = 0,
+                    .skipped = true,
+                });
+                continue;
+            }
+        }
+        const r = ingestOneSource(alloc, io, repo, source, sink, archiver, now, environ, embedder, ks, rt.limit);
         if (r.errors > 0) had_error = true;
         logging.info("ingest source done", &.{
             .{ .key = "source", .value = source.id },
