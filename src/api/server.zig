@@ -3,6 +3,9 @@
 //! Routes:
 //!   GET  /v1/health   public — liveness + index size
 //!   GET  /v1/sources  public — source registry + per-source doc counts
+//!   GET  /v1/events   public — persisted event clusters (Roadmap 3.4)
+//!   GET  /v1/locations public — reference places (Roadmap 3.6)
+//!   GET  /v1/statistics public — seeded statistics (Roadmap 3.6)
 //!   GET  /metrics     public — Prometheus exposition (Roadmap 1.5)
 //!   POST /v1/query    auth + rate limit — planned search with citations
 //!   POST /v1/ingest   auth + rate limit — manual document ingest
@@ -14,11 +17,14 @@ const logging = @import("../common/logging.zig");
 const types = @import("../common/types.zig");
 const config = @import("../config/config.zig");
 const repository = @import("../storage/repository.zig");
+const knowledge = @import("../storage/knowledge.zig");
 const planner = @import("../engine/planner.zig");
 const search = @import("../engine/search.zig");
 const entities = @import("../engine/entities.zig");
 const geo = @import("../engine/geo.zig");
+const language = @import("../engine/language.zig");
 const sources = @import("../ingestion/sources.zig");
+const validate = @import("../ingestion/validate.zig");
 const pipeline = @import("../ingestion/pipeline.zig");
 const providers = @import("../ai/providers.zig");
 const auth = @import("auth.zig");
@@ -39,6 +45,9 @@ pub const Server = struct {
     /// Embedding provider for semantic search + ingest-time embeddings.
     /// Null when PULSE_EMBEDDING_PROVIDER=none (or external without keys).
     embedder: ?providers.EmbeddingProvider = null,
+    /// Knowledge store for events/locations/statistics (Roadmap 3.4).
+    /// Always present (memory or Postgres, matching the repo).
+    knowledge: ?knowledge.KnowledgeStore = null,
 
     pub fn serve(self: *Server) !void {
         const addr = std.Io.net.IpAddress.parse(self.cfg.host, self.cfg.port) catch |e| {
@@ -210,6 +219,51 @@ pub const Server = struct {
             return;
         }
 
+        if (method == .GET and std.mem.eql(u8, path, "/v1/events")) {
+            if (self.knowledge) |k| {
+                const events = k.listEvents(alloc, 20) catch {
+                    self.respondError(req, alloc, req_id, .internal_server_error, "events_failed", "Failed to list events");
+                    return;
+                };
+                const body = try query_json.buildEventsResponse(alloc, req_id, events);
+                self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+                try respondJson(req, .ok, body, req_id);
+                return;
+            }
+            self.respondError(req, alloc, req_id, .internal_server_error, "events_unavailable", "Knowledge store unavailable");
+            return;
+        }
+
+        if (method == .GET and std.mem.eql(u8, path, "/v1/locations")) {
+            if (self.knowledge) |k| {
+                const locs = k.listLocations(alloc, null, 100) catch {
+                    self.respondError(req, alloc, req_id, .internal_server_error, "locations_failed", "Failed to list locations");
+                    return;
+                };
+                const body = try query_json.buildLocationsResponse(alloc, req_id, locs);
+                self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+                try respondJson(req, .ok, body, req_id);
+                return;
+            }
+            self.respondError(req, alloc, req_id, .internal_server_error, "locations_unavailable", "Knowledge store unavailable");
+            return;
+        }
+
+        if (method == .GET and std.mem.eql(u8, path, "/v1/statistics")) {
+            if (self.knowledge) |k| {
+                const stats = k.listStatistics(alloc) catch {
+                    self.respondError(req, alloc, req_id, .internal_server_error, "statistics_failed", "Failed to list statistics");
+                    return;
+                };
+                const body = try query_json.buildStatisticsResponse(alloc, req_id, stats);
+                self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+                try respondJson(req, .ok, body, req_id);
+                return;
+            }
+            self.respondError(req, alloc, req_id, .internal_server_error, "statistics_unavailable", "Knowledge store unavailable");
+            return;
+        }
+
         if (method == .GET and std.mem.eql(u8, path, "/metrics")) {
             const body = try self.metrics.render(alloc);
             self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
@@ -290,6 +344,23 @@ pub const Server = struct {
                 .reliability = source.reliability,
                 .topics = ent.topics,
                 .content_hash = id,
+                .lang = language.identify(combined),
+            };
+            // Summary (3.3): extractive only, stored when it condenses.
+            {
+                var summarizer = providers.ExtractiveSummarizer{};
+                if (summarizer.provider().summarize(alloc, ir.text, 2)) |raw| {
+                    if (!std.mem.eql(u8, raw, ir.text)) {
+                        doc.summary = raw;
+                    } else {
+                        alloc.free(raw);
+                    }
+                } else |_| {}
+            }
+            // Validation (3.3): malformed manual ingests are rejected.
+            validate.validate(doc) catch {
+                self.respondError(req, alloc, req_id, .bad_request, "invalid_document", "Document failed validation (title, URL, text, or source)");
+                return;
             };
             // Geo-tag from the extracted entities, same as the pipeline.
             if (ent.cities.len > 0) {
@@ -314,6 +385,14 @@ pub const Server = struct {
                 self.respondError(req, alloc, req_id, .internal_server_error, "ingest_failed", "Failed to store document");
                 return;
             };
+            // Knowledge recording (3.4): entities + event clustering.
+            // Failures are warnings only — the document is already stored.
+            if (self.knowledge) |k| {
+                k.recordEntities(alloc, doc, ent) catch {};
+                if (k.upsertEventForDoc(alloc, doc, ent)) |ev| {
+                    alloc.free(ev);
+                } else |_| {}
+            }
             if (self.sink) |s| {
                 s.publish(s.ptr, alloc, doc.id, doc.source_id) catch {};
             }
@@ -326,6 +405,8 @@ pub const Server = struct {
 
         if ((method == .GET or method == .POST) and
             (std.mem.eql(u8, path, "/v1/health") or std.mem.eql(u8, path, "/v1/sources") or
+                std.mem.eql(u8, path, "/v1/events") or std.mem.eql(u8, path, "/v1/locations") or
+                std.mem.eql(u8, path, "/v1/statistics") or
                 std.mem.eql(u8, path, "/metrics") or std.mem.eql(u8, path, "/v1/query") or
                 std.mem.eql(u8, path, "/v1/ingest")))
         {

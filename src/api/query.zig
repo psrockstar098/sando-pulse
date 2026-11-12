@@ -4,6 +4,7 @@
 const std = @import("std");
 const format = @import("../common/format.zig");
 const types = @import("../common/types.zig");
+const knowledge = @import("../storage/knowledge.zig");
 const planner = @import("../engine/planner.zig");
 const search = @import("../engine/search.zig");
 const temporal = @import("../engine/temporal.zig");
@@ -321,6 +322,100 @@ pub fn buildSourcesResponse(
     }
     return stringifyAlloc(alloc, .{
         .sources = list.items,
+        .request_id = req_id,
+    });
+}
+
+/// GET /v1/events — persisted event clusters, newest first.
+pub fn buildEventsResponse(
+    alloc: std.mem.Allocator,
+    req_id: []const u8,
+    events: []const knowledge.KnowledgeEvent,
+) ![]u8 {
+    var list: std.ArrayList(struct {
+        id: []const u8,
+        title: []const u8,
+        topic: []const u8,
+        first_seen: []const u8,
+        last_seen: []const u8,
+        doc_count: usize,
+        summary: ?[]const u8,
+    }) = .empty;
+    for (events) |e| {
+        try list.append(alloc, .{
+            .id = e.id,
+            .title = e.title,
+            .topic = e.topic,
+            .first_seen = try formatIso(alloc, e.first_seen),
+            .last_seen = try formatIso(alloc, e.last_seen),
+            .doc_count = e.doc_count,
+            .summary = e.summary,
+        });
+    }
+    return stringifyAlloc(alloc, .{
+        .events = list.items,
+        .request_id = req_id,
+    });
+}
+
+/// GET /v1/locations — seeded + OSM reference places.
+pub fn buildLocationsResponse(
+    alloc: std.mem.Allocator,
+    req_id: []const u8,
+    locations: []const knowledge.LocationRow,
+) ![]u8 {
+    var list: std.ArrayList(struct {
+        name: []const u8,
+        kind: []const u8,
+        county: ?[]const u8,
+        lat: ?f64,
+        lon: ?f64,
+        source: []const u8,
+        verified_at: ?[]const u8,
+    }) = .empty;
+    for (locations) |l| {
+        try list.append(alloc, .{
+            .name = l.name,
+            .kind = l.kind,
+            .county = l.county,
+            .lat = l.lat,
+            .lon = l.lon,
+            .source = l.source,
+            .verified_at = l.verified_at,
+        });
+    }
+    return stringifyAlloc(alloc, .{
+        .locations = list.items,
+        .request_id = req_id,
+    });
+}
+
+/// GET /v1/statistics — seeded statistical datasets with provenance.
+pub fn buildStatisticsResponse(
+    alloc: std.mem.Allocator,
+    req_id: []const u8,
+    stats: []const knowledge.StatisticRow,
+) ![]u8 {
+    var list: std.ArrayList(struct {
+        key: []const u8,
+        value: f64,
+        unit: []const u8,
+        period: []const u8,
+        source: []const u8,
+        verified_at: ?[]const u8,
+    }) = .empty;
+    for (stats) |s| {
+        try list.append(alloc, .{
+            .key = s.key,
+            .value = s.value,
+            .unit = s.unit,
+            .period = s.period,
+            .source = s.source,
+            .verified_at = s.verified_at,
+        });
+    }
+    return stringifyAlloc(alloc, .{
+        .statistics = list.items,
         .request_id = req_id,
     });
 }

@@ -17,8 +17,10 @@ const std = @import("std");
 const logging = @import("common/logging.zig");
 const config = @import("config/config.zig");
 const repository = @import("storage/repository.zig");
+const knowledge = @import("storage/knowledge.zig");
 const memory = @import("storage/memory.zig");
 const postgres = @import("storage/postgres.zig");
+const postgres_knowledge = @import("storage/postgres_knowledge.zig");
 const redis = @import("storage/redis.zig");
 const object_store = @import("storage/object_store.zig");
 const pipeline = @import("ingestion/pipeline.zig");
@@ -104,6 +106,9 @@ pub fn main(init: std.process.Init) !void {
     var pg_store: ?*postgres.PostgresStore = null;
     var repo: repository.Repository = undefined;
     var store_name: []const u8 = "memory";
+    var ks: ?knowledge.KnowledgeStore = null;
+    var mem_knowledge: ?*knowledge.MemoryKnowledge = null;
+    var pg_knowledge: ?*postgres_knowledge.PostgresKnowledge = null;
     if (cfg.database_url) |url| {
         logging.info("opening postgres store", &.{});
         const pg = try alloc.create(postgres.PostgresStore);
@@ -113,11 +118,19 @@ pub fn main(init: std.process.Init) !void {
         pg_store = pg;
         repo = pg.asRepository();
         store_name = "postgres";
+        const pgk = try alloc.create(postgres_knowledge.PostgresKnowledge);
+        pgk.* = try postgres_knowledge.PostgresKnowledge.init(alloc, io, url);
+        pg_knowledge = pgk;
+        ks = pgk.asKnowledge();
     } else {
         const mem = try alloc.create(memory.MemoryStore);
         mem.* = memory.MemoryStore.init(alloc);
         mem_store = mem;
         repo = mem.asRepository();
+        const mk = try alloc.create(knowledge.MemoryKnowledge);
+        mk.* = knowledge.MemoryKnowledge.init(alloc);
+        mem_knowledge = mk;
+        ks = mk.asKnowledge();
     }
 
     // --- redis (optional; streams + cache). Failure warns, never blocks boot.
@@ -169,7 +182,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (is_worker) {
         if (once) {
-            const report = try worker.runOnce(alloc, io, repo, sink, if (archiver) |*a| a else null, &m, init.environ_map, embedder);
+            const report = try worker.runOnce(alloc, io, repo, sink, if (archiver) |*a| a else null, &m, init.environ_map, embedder, ks);
             std.debug.print("ingest once: docs {d} -> {d}, {d} sources, had_error={}\n", .{
                 report.docs_before,
                 report.docs_after,
@@ -178,7 +191,7 @@ pub fn main(init: std.process.Init) !void {
             });
             return;
         }
-        try worker.runLoop(alloc, io, cfg, repo, sink, if (archiver) |*a| a else null, &m, init.environ_map, embedder);
+        try worker.runLoop(alloc, io, cfg, repo, sink, if (archiver) |*a| a else null, &m, init.environ_map, embedder, ks);
         return;
     }
 
@@ -192,6 +205,7 @@ pub fn main(init: std.process.Init) !void {
         .limiter = &limiter,
         .sink = sink,
         .embedder = embedder,
+        .knowledge = ks,
     };
     try srv.serve();
 }

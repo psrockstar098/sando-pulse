@@ -10,10 +10,13 @@ const logging = @import("../common/logging.zig");
 const timex = @import("../common/time.zig");
 const types = @import("../common/types.zig");
 const repository = @import("../storage/repository.zig");
+const knowledge = @import("../storage/knowledge.zig");
 const sources = @import("sources.zig");
 const rss = @import("rss.zig");
 const fetchers = @import("fetchers.zig");
 const normalizer = @import("normalizer.zig");
+const validate = @import("validate.zig");
+const entities = @import("../engine/entities.zig");
 const object_store = @import("../storage/object_store.zig");
 const providers = @import("../ai/providers.zig");
 
@@ -41,6 +44,36 @@ pub const IngestReport = struct {
     had_error: bool,
 };
 
+/// Record one source's fetch outcome in the knowledge store (Roadmap
+/// 3.1 health monitoring). Success resets the failure streak and stamps
+/// last_success_at; failure keeps the old success time and grows the
+/// streak. `docs_total` accumulates across runs. Never fatal.
+fn recordHealth(
+    ks: knowledge.KnowledgeStore,
+    alloc: std.mem.Allocator,
+    source_id: []const u8,
+    now: i64,
+    ok: bool,
+    err_detail: ?[]const u8,
+    inserted: usize,
+) void {
+    const prev = ks.getSourceHealth(alloc, source_id) catch null;
+    const health = knowledge.SourceHealth{
+        .source_id = source_id,
+        .last_run_at = now,
+        .last_success_at = if (ok) now else if (prev) |p| p.last_success_at else null,
+        .last_error = if (ok) null else err_detail,
+        .consecutive_failures = if (ok) 0 else if (prev) |p| p.consecutive_failures + 1 else 1,
+        .docs_total = (if (prev) |p| p.docs_total else 0) + inserted,
+    };
+    ks.recordSourceHealth(alloc, health) catch |e| {
+        logging.warn("source health record failed", &.{
+            .{ .key = "source", .value = source_id },
+            .{ .key = "error", .value = @errorName(e) },
+        });
+    };
+}
+
 fn ingestOneSource(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -51,6 +84,7 @@ fn ingestOneSource(
     now: i64,
     environ: ?*const std.process.Environ.Map,
     embedder: ?providers.EmbeddingProvider,
+    ks: ?knowledge.KnowledgeStore,
 ) SourceReport {
     const start = timex.nowMillis(io);
     var report = SourceReport{
@@ -63,6 +97,7 @@ fn ingestOneSource(
     const body = fetchers.fetchFeed(alloc, io, source.feed_url, environ) catch {
         report.errors += 1;
         report.duration_ms = timex.nowMillis(io) - start;
+        if (ks) |k| recordHealth(k, alloc, source.id, now, false, "fetch failed", 0);
         return report;
     };
     // Archive the raw feed (best effort).
@@ -77,11 +112,18 @@ fn ingestOneSource(
     const items = rss.parse(alloc, body) catch {
         report.errors += 1;
         report.duration_ms = timex.nowMillis(io) - start;
+        if (ks) |k| recordHealth(k, alloc, source.id, now, false, "parse failed", 0);
         return report;
     };
     report.fetched = items.len;
     for (items) |item| {
         var doc = normalizer.normalize(alloc, source, item, now) catch {
+            report.errors += 1;
+            continue;
+        };
+        // Validation (3.3): a malformed document is dropped and counted,
+        // never stored half-valid.
+        validate.validate(doc) catch {
             report.errors += 1;
             continue;
         };
@@ -104,6 +146,23 @@ fn ingestOneSource(
             continue;
         };
         report.inserted += 1;
+        // Knowledge recording (3.4): entities + event clustering.
+        // Failures are warnings only — the document is already stored.
+        if (ks) |k| {
+            const combined = std.mem.concat(alloc, u8, &.{ doc.title, " ", doc.text }) catch null;
+            if (combined) |c| {
+                if (entities.extract(alloc, c)) |ent| {
+                    k.recordEntities(alloc, doc, ent) catch |e| {
+                        logging.warn("knowledge entities failed", &.{ .{ .key = "source", .value = source.id }, .{ .key = "error", .value = @errorName(e) } });
+                    };
+                    if (k.upsertEventForDoc(alloc, doc, ent)) |ev| {
+                        alloc.free(ev);
+                    } else |e| {
+                        logging.warn("knowledge event failed", &.{ .{ .key = "source", .value = source.id }, .{ .key = "error", .value = @errorName(e) } });
+                    }
+                } else |_| {}
+            }
+        }
         if (sink) |s| {
             s.publish(s.ptr, alloc, doc.id, doc.source_id) catch {
                 logging.warn("event publish failed", &.{.{ .key = "source", .value = source.id }});
@@ -111,6 +170,9 @@ fn ingestOneSource(
         }
     }
     report.duration_ms = timex.nowMillis(io) - start;
+    // Reached only when fetch + parse succeeded: the source is healthy
+    // even if individual items failed validation/storage.
+    if (ks) |k| recordHealth(k, alloc, source.id, now, true, null, report.inserted);
     return report;
 }
 
@@ -122,6 +184,7 @@ pub fn runOnce(
     archiver: ?*object_store.S3Client,
     environ: ?*const std.process.Environ.Map,
     embedder: ?providers.EmbeddingProvider,
+    ks: ?knowledge.KnowledgeStore,
 ) !IngestReport {
     const start = timex.nowMillis(io);
     const now = timex.nowSeconds(io);
@@ -130,7 +193,7 @@ pub fn runOnce(
     var had_error = false;
     for (sources.sources) |source| {
         if (!source.enabled) continue;
-        const r = ingestOneSource(alloc, io, repo, source, sink, archiver, now, environ, embedder);
+        const r = ingestOneSource(alloc, io, repo, source, sink, archiver, now, environ, embedder, ks);
         if (r.errors > 0) had_error = true;
         logging.info("ingest source done", &.{
             .{ .key = "source", .value = source.id },

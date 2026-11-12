@@ -6,6 +6,7 @@ const std = @import("std");
 const logging = @import("../common/logging.zig");
 const config = @import("../config/config.zig");
 const repository = @import("../storage/repository.zig");
+const knowledge = @import("../storage/knowledge.zig");
 const pipeline = @import("../ingestion/pipeline.zig");
 const object_store = @import("../storage/object_store.zig");
 const metrics = @import("../api/metrics.zig");
@@ -20,8 +21,9 @@ pub fn runOnce(
     m: *metrics.Metrics,
     environ: ?*const std.process.Environ.Map,
     embedder: ?providers.EmbeddingProvider,
+    ks: ?knowledge.KnowledgeStore,
 ) !pipeline.IngestReport {
-    const report = try pipeline.runOnce(alloc, io, repo, sink, archiver, environ, embedder);
+    const report = try pipeline.runOnce(alloc, io, repo, sink, archiver, environ, embedder, ks);
     m.observeIngestRun(report.had_error);
     m.setDocumentsIndexed(@intCast(report.docs_after));
     logging.info("ingest run done", &.{
@@ -43,11 +45,12 @@ pub fn runLoop(
     m: *metrics.Metrics,
     environ: ?*const std.process.Environ.Map,
     embedder: ?providers.EmbeddingProvider,
+    ks: ?knowledge.KnowledgeStore,
 ) !void {
     while (true) {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
-        _ = runOnce(arena.allocator(), io, repo, sink, archiver, m, environ, embedder) catch |e| {
+        _ = runOnce(arena.allocator(), io, repo, sink, archiver, m, environ, embedder, ks) catch |e| {
             logging.err("ingest run failed", &.{.{ .key = "error", .value = @errorName(e) }});
             m.observeIngestRun(true);
         };
