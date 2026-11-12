@@ -303,7 +303,6 @@ pub fn searchAndRank(
     var ranked: std.ArrayList(RankedDoc) = .empty;
     for (candidates) |doc| {
         const s = try ranking.scoreDocument(alloc, doc, p.terms, p.counties, p.organizations, p.topics, now);
-        var fused: f64 = s.total;
         var fuzzy_score: ?f64 = null;
         var semantic_score: ?f64 = null;
         if (fuzzy_pass and p.terms.len > 0) {
@@ -312,12 +311,36 @@ pub fn searchAndRank(
         if (opts.embedder != null and query_vec != null) {
             semantic_score = try semanticScoreForDoc(alloc, opts.embedder.?, query_vec.?, doc);
         }
+        // Relevance-gate lift: ranking.scoreDocument zeroes the base when
+        // no query term appears verbatim (Roadmap 1 gate, so unrelated
+        // docs cannot pass on recency + reliability alone). A fuzzy or
+        // semantic match is real evidence too — without this, the fuzzy
+        // second pass could never surface anything (its docs have zero
+        // exact overlap by definition, and the 0.2 fuzzy blend alone
+        // cannot reach the 0.25 threshold). When the base was gated to
+        // zero, credit the best fuzzy/semantic signal (>= 0.5) as the
+        // effective relevance for the fusion. A doc with no signal at all
+        // still scores 0 and cannot pass on recency + reliability alone.
+        var base_total: f64 = s.total;
+        if (s.relevance == 0) {
+            var eff_rel: ?f64 = null;
+            if (fuzzy_score) |fs| {
+                if (fs >= 0.5) eff_rel = fs;
+            }
+            if (semantic_score) |ss| {
+                if (ss >= 0.5 and (eff_rel == null or ss > eff_rel.?)) eff_rel = ss;
+            }
+            if (eff_rel) |er| {
+                base_total = 0.35 * er + 0.22 * @as(f64, s.reliability) + 0.18 * @as(f64, s.recency) + 0.15 * @as(f64, s.context) + 0.10 * @as(f64, s.coverage);
+            }
+        }
+        var fused = base_total;
         if (fuzzy_score != null and semantic_score != null) {
-            fused = 0.6 * @as(f64, s.total) + 0.2 * fuzzy_score.? + 0.2 * semantic_score.?;
+            fused = 0.6 * base_total + 0.2 * fuzzy_score.? + 0.2 * semantic_score.?;
         } else if (fuzzy_score != null) {
-            fused = 0.8 * @as(f64, s.total) + 0.2 * fuzzy_score.?;
+            fused = 0.8 * base_total + 0.2 * fuzzy_score.?;
         } else if (semantic_score != null) {
-            fused = 0.7 * @as(f64, s.total) + 0.3 * semantic_score.?;
+            fused = 0.7 * base_total + 0.3 * semantic_score.?;
         }
         if (fused >= ranking.min_evidence_score) {
             try ranked.append(alloc, .{
@@ -593,4 +616,50 @@ test "searchAndRank clusters events and buckets timeline days" {
     // Timeline buckets exist (all ranked docs are from today).
     try std.testing.expect(out.timeline.len >= 1);
     try std.testing.expectEqual(@as(i64, 1794441600), out.timeline[0].day_start);
+}
+
+test "searchAndRank single-term typo recovers via fuzzy pass" {
+    // Regression test (found live 2026-11-12): a one-word typo query must
+    // recover the document through the fuzzy second pass. The Roadmap 1
+    // relevance gate zeroes the keyword base for zero exact overlap, so
+    // the fusion credits a >= 0.5 fuzzy signal as effective relevance.
+    const memory = @import("../storage/memory.zig");
+    const providers_mod = @import("../ai/providers.zig");
+    const now: i64 = 1794518400; // 2026-11-12 21:20 UTC
+    var store = memory.MemoryStore.init(std.testing.allocator);
+    defer store.deinit();
+    const repo = store.asRepository();
+    var local = providers_mod.LocalHashEmbedding{ .dims_count = 128 };
+    const emb = local.provider();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const mk = struct {
+        fn doc(alloc2: std.mem.Allocator, emb2: providers_mod.EmbeddingProvider, id: []const u8, title: []const u8, text: []const u8, url: []const u8) !types.Document {
+            const full = try std.mem.concat(alloc2, u8, &.{ title, " ", text });
+            return .{
+                .id = id,
+                .source_id = "new-dawn",
+                .source_name = "New Dawn",
+                .source_url = "https://thenewdawnliberia.com/",
+                .title = title,
+                .url = url,
+                .text = text,
+                .published_at = null,
+                .fetched_at = now,
+                .reliability = 0.70,
+                .topics = &.{ "energy", "economy" },
+                .content_hash = id,
+                .embedding = try emb2.embed(alloc2, full),
+            };
+        }
+    }.doc;
+    try repo.insertDocument(try mk(alloc, emb, "d1", "Fuel shortage hits Monrovia as queues grow", "Fuel stations in Monrovia report long queues as the fuel shortage continues across the city.", "https://example.com/1"));
+    try repo.insertDocument(try mk(alloc, emb, "d2", "Fuel shortage continues in Monrovia for a second day", "The fuel shortage in Monrovia continues into a second day.", "https://example.com/2"));
+    const p = try planner.plan(alloc, "Monrova", &.{ "new-dawn" }, now, 0);
+    const out = try searchAndRank(alloc, repo, p, now, .{ .embedder = emb });
+    try std.testing.expect(out.sufficient);
+    try std.testing.expectEqual(@as(usize, 2), out.results.len);
+    try std.testing.expect(out.results[0].fuzzy_score != null);
+    try std.testing.expect(out.results[0].fuzzy_score.? >= 0.5);
 }

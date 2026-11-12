@@ -1218,15 +1218,16 @@ pub const PostgresStore = struct {
                     if (q.fuzzy) {
                         // word_similarity measures the term against the
                         // most similar word in the title (pg_trgm). The
-                        // score dilutes with title length: a one-typo word
-                        // in a 4-word title scores ~0.24, unrelated titles
-                        // score 0 (verified live 2026-11-12), so the SQL
-                        // threshold is deliberately loose at 0.2 — the
-                        // engine re-scores fuzzy candidates with the strict
-                        // per-word 0.5 trigram check before ranking.
+                        // score dilutes with title length — measured live
+                        // 2026-11-12 for 'monrova': 4-word title 0.24,
+                        // 7-word 0.14, 8-word 0.12; unrelated titles 0.00.
+                        // The SQL threshold is therefore a loose 0.1
+                        // candidate floor; the engine re-scores fuzzy
+                        // candidates with the strict per-word 0.5 trigram
+                        // check before ranking.
                         try where.appendSlice(alloc, " OR word_similarity(d.title, ");
                         try appendEscapedLiteral(&where, alloc, term);
-                        try where.appendSlice(alloc, ") > 0.2");
+                        try where.appendSlice(alloc, ") > 0.1");
                     }
                 }
             }

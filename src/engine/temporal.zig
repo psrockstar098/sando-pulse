@@ -319,10 +319,20 @@ pub fn describe(alloc: std.mem.Allocator, range: TimeRange, tz_offset_minutes: i
     const off: i64 = @as(i64, tz_offset_minutes) * 60;
     const from = civilFromDays(@divFloor(range.from + off, seconds_per_day));
     const to = civilFromDays(@divFloor(range.to - 1 + off, seconds_per_day));
+    // NOTE (Zig 0.17.1 fmt quirk, found live 2026-11-12): a width spec on a
+    // signed integer prints an explicit '+' for positive values
+    // ("{d:04}" on i64 2026 -> "+2026"). Civil dates here are always
+    // post-1970, so cast to u64 first — unsigned values pad cleanly.
+    const fy: u64 = @intCast(from.year);
+    const fm: u64 = @intCast(from.month);
+    const fd: u64 = @intCast(from.day);
+    const ty: u64 = @intCast(to.year);
+    const tm: u64 = @intCast(to.month);
+    const td: u64 = @intCast(to.day);
     if (from.year == to.year and from.month == to.month and from.day == to.day) {
-        return std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}", .{ from.year, from.month, from.day });
+        return std.fmt.allocPrint(alloc, "{d:04}-{d:02}-{d:02}", .{ fy, fm, fd });
     }
-    return std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}..{d:0>4}-{d:0>2}-{d:0>2}", .{ from.year, from.month, from.day, to.year, to.month, to.day });
+    return std.fmt.allocPrint(alloc, "{d:04}-{d:02}-{d:02}..{d:04}-{d:02}-{d:02}", .{ fy, fm, fd, ty, tm, td });
 }
 
 test "temporal: day boundaries in Monrovia (UTC+0)" {
@@ -386,4 +396,18 @@ test "temporal: civil date round trip" {
     const cl = civilFromDays(leap);
     try std.testing.expectEqual(@as(i64, 29), cl.day);
     try std.testing.expectEqual(@as(i64, 2), cl.month);
+}
+
+test "temporal: describe formats a single day" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const r = resolve("today", 1794484800, 0).?;
+    const label = try describe(alloc, r, 0);
+    std.debug.print("describe today: [{s}]\n", .{label});
+    try std.testing.expectEqualStrings("2026-11-12", label);
+    const w = resolve("last week", 1794484800, 0).?;
+    const wl = try describe(alloc, w, 0);
+    std.debug.print("describe last week: [{s}]\n", .{wl});
+    try std.testing.expectEqualStrings("2026-11-02..2026-11-08", wl);
 }
