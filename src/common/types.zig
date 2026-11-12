@@ -29,6 +29,12 @@ pub const Document = struct {
     /// Document embedding from the configured provider (128 dims by
     /// default); null when the document was ingested without one.
     embedding: ?[]const f32 = null,
+    /// Extractive summary (first 1-3 sentences of the cleaned text),
+    /// set by the ingestion normalizer; null when not summarized.
+    summary: ?[]const u8 = null,
+    /// ISO 639-1 language code, set by the ingestion normalizer's
+    /// language identification; "en" is the default.
+    lang: []const u8 = "en",
 };
 
 /// Internal search request produced by the query planner.

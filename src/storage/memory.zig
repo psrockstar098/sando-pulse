@@ -47,6 +47,8 @@ pub const MemoryStore = struct {
         alloc.free(d.topics);
         alloc.free(d.content_hash);
         if (d.embedding) |e| alloc.free(e);
+        if (d.summary) |s| alloc.free(s);
+        alloc.free(d.lang);
     }
 
     fn dupeDocument(alloc: std.mem.Allocator, d: types.Document) !types.Document {
@@ -68,6 +70,8 @@ pub const MemoryStore = struct {
             .lat = d.lat,
             .lon = d.lon,
             .embedding = if (d.embedding) |e| try alloc.dupe(f32, e) else null,
+            .summary = if (d.summary) |s| try alloc.dupe(u8, s) else null,
+            .lang = try alloc.dupe(u8, d.lang),
         };
     }
 

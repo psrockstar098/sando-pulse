@@ -1138,11 +1138,15 @@ pub const PostgresStore = struct {
         defer a.free(geom_sql);
         const emb_sql = if (doc.embedding) |vec| try formatVectorLiteral(a, vec) else try a.dupe(u8, "NULL");
         defer a.free(emb_sql);
+        const esc_lang = try escapeLiteral(a, doc.lang);
+        defer a.free(esc_lang);
+        const summary_sql = if (doc.summary) |s| try escapeLiteral(a, s) else try a.dupe(u8, "NULL");
+        defer a.free(summary_sql);
         const doc_sql = try std.fmt.allocPrint(a,
             \\INSERT INTO documents
             \\  (id, source_id, title, url, text, published_at, fetched_at,
-            \\   reliability, topics, content_hash, lat, lon, geom, embedding)
-            \\VALUES ({s}, {s}, {s}, {s}, {s}, {s}, {s}, {d}, {s}, {s}, {s}, {s}, {s}, {s})
+            \\   reliability, topics, content_hash, lat, lon, geom, embedding, lang, summary)
+            \\VALUES ({s}, {s}, {s}, {s}, {s}, {s}, {s}, {d}, {s}, {s}, {s}, {s}, {s}, {s}, {s}, {s})
             \\ON CONFLICT (id) DO NOTHING
         , .{
             esc_doc_id,
@@ -1159,6 +1163,8 @@ pub const PostgresStore = struct {
             lon_sql,
             geom_sql,
             emb_sql,
+            esc_lang,
+            summary_sql,
         });
         defer a.free(doc_sql);
         try client.exec(a, doc_sql);
@@ -1191,7 +1197,7 @@ pub const PostgresStore = struct {
             \\  extract(epoch from d.published_at)::bigint,
             \\  extract(epoch from d.fetched_at)::bigint,
             \\  d.reliability, d.topics, d.content_hash,
-            \\  d.embedding::text, d.lat, d.lon
+            \\  d.embedding::text, d.lat, d.lon, d.lang, d.summary
             \\FROM documents d JOIN sources s ON s.id = d.source_id
         );
 
@@ -1317,7 +1323,7 @@ pub const PostgresStore = struct {
     }
 
     fn documentFromRow(alloc: Allocator, row: Row) !types.Document {
-        if (row.cols.len != 15) return error.ProtocolError;
+        if (row.cols.len != 17) return error.ProtocolError;
         const c = row.cols;
         const req = struct {
             fn text(cols: []?[]const u8, idx: usize) ![]const u8 {
@@ -1340,6 +1346,8 @@ pub const PostgresStore = struct {
             .embedding = try parseVectorText(alloc, c[12]),
             .lat = if (c[13]) |v| try std.fmt.parseFloat(f64, v) else null,
             .lon = if (c[14]) |v| try std.fmt.parseFloat(f64, v) else null,
+            .lang = try alloc.dupe(u8, try req(c, 15)),
+            .summary = if (c[16]) |s| try alloc.dupe(u8, s) else null,
         };
     }
 
@@ -1581,7 +1589,8 @@ test "postgres: parseTextArray" {
 /// Read one variable from the process environment without libc.
 /// Zig 0.17 std has no getenv without linking libc, so the live test reads
 /// /proc/self/environ directly (Linux-only; the live test is dev-only).
-fn getTestEnvVar(alloc: Allocator, io: std.Io, name: []const u8) !?[]u8 {
+/// Public so other storage modules' live tests can reuse it.
+pub fn getTestEnvVar(alloc: Allocator, io: std.Io, name: []const u8) !?[]u8 {
     const proc_dir = std.Io.Dir.openDirAbsolute(io, "/proc/self", .{}) catch return null;
     defer proc_dir.close(io);
     var file = proc_dir.openFile(io, "environ", .{}) catch return null;

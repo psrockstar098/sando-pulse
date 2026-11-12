@@ -8,6 +8,8 @@ const rss = @import("rss.zig");
 const sources = @import("sources.zig");
 const entities = @import("../engine/entities.zig");
 const geo = @import("../engine/geo.zig");
+const language = @import("../engine/language.zig");
+const providers = @import("../ai/providers.zig");
 
 pub fn normalize(
     alloc: std.mem.Allocator,
@@ -36,6 +38,17 @@ pub fn normalize(
             lon = p.lon;
         }
     }
+    // Summary (3.3): extractive only — repeats the source's own
+    // sentences, never writes new claims. Stored only when it condenses
+    // the text (short descriptions keep summary null; readers fall back
+    // to text). Language (3.3): stopword heuristic, "en" by default.
+    var summarizer = providers.ExtractiveSummarizer{};
+    const raw_summary = try summarizer.provider().summarize(alloc, text, 2);
+    const summary: ?[]const u8 = if (std.mem.eql(u8, raw_summary, text)) blk: {
+        alloc.free(raw_summary);
+        break :blk null;
+    } else raw_summary;
+    const lang = language.identify(combined);
     return .{
         .id = id,
         .source_id = source.id,
@@ -51,6 +64,8 @@ pub fn normalize(
         .content_hash = id,
         .lat = lat,
         .lon = lon,
+        .summary = summary,
+        .lang = lang,
     };
 }
 
