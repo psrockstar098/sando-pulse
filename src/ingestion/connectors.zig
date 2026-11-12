@@ -12,14 +12,19 @@
 //! Live connectors: RSS (the 10 registry sources), Website (explicit
 //! allowlist only — PULSE_WEBSITE_ALLOWLIST, comma-separated hosts),
 //! Government (configured public endpoint — PULSE_GOVERNMENT_URL),
-//! OpenStreetMap (Nominatim, public, no key; 1 req/s usage policy).
-//! Stubs (interface + unavailable reason, no client code): Facebook
-//! (authorized Page token), Google (approved Custom Search API),
-//! YouTube (Data API key), Reddit (approved API client).
+//! OpenStreetMap (Nominatim, public, no key; 1 req/s usage policy),
+//! Facebook (Graph API adapter — the full connector lives in
+//! connectors/facebook/; the adapter gates on the token and fetches
+//! Graph API URLs. Without a token it reports unavailable).
+//! Stubs (interface + unavailable reason, no client code): Google
+//! (approved Custom Search API), YouTube (Data API key), Reddit
+//! (approved API client).
 
 const std = @import("std");
 const fetchers = @import("fetchers.zig");
 const rss = @import("rss.zig");
+const fb_auth = @import("connectors/facebook/auth.zig");
+const fb_client = @import("connectors/facebook/client.zig");
 
 pub const Kind = enum {
     rss,
@@ -293,11 +298,42 @@ var rss_state = RssConnector{};
 var website_state = WebsiteConnector{};
 var government_state = GovernmentConnector{};
 var osm_state = OsmConnector{};
-var facebook_state = StubConnector{
-    .kind = .facebook,
-    .name = "Facebook",
-    .reason = "not implemented: needs an authorized Page access token (FACEBOOK_PAGE_TOKEN); Page content is only ever fetched with authorization, never scraped",
+/// Facebook adapter: the framework-level connector for the Graph
+/// API. The full connector (registry, collect, webhooks, scheduler)
+/// lives in connectors/facebook/; this adapter is the transport
+/// face: check() gates on the access token, fetch() GETs a Graph
+/// API URL with the token appended. Without a token it reports
+/// unavailable — the same gate as the full connector's validate(),
+/// minus the registry check (the adapter has no io handle to read
+/// the registry file).
+pub const FacebookAdapter = struct {
+    pub fn connector(self: *FacebookAdapter) Connector {
+        return .{
+            .kind = .facebook,
+            .name = "Facebook",
+            .ptr = self,
+            .vtable = &.{
+                .check = checkFn,
+                .fetch = fetchFn,
+            },
+        };
+    }
+
+    fn checkFn(_: *anyopaque, _: std.mem.Allocator, environ: ?*const std.process.Environ.Map) Availability {
+        const cfg = fb_auth.AuthConfig.load(environ);
+        if (!cfg.hasToken()) {
+            return .{ .unavailable = "no Facebook access token configured (PULSE_FACEBOOK_ACCESS_TOKEN)" };
+        }
+        return .available;
+    }
+
+    fn fetchFn(_: *anyopaque, alloc: std.mem.Allocator, io: std.Io, url: []const u8, environ: ?*const std.process.Environ.Map) anyerror![]u8 {
+        const cfg = fb_auth.AuthConfig.load(environ);
+        return fb_client.fetchGraph(alloc, io, url, cfg, environ);
+    }
 };
+
+var facebook_state = FacebookAdapter{};
 var google_state = StubConnector{
     .kind = .google,
     .name = "Google",

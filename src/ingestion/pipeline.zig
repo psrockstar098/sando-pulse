@@ -15,6 +15,7 @@ const sources = @import("sources.zig");
 const source_manager = @import("source_manager.zig");
 const rss = @import("rss.zig");
 const connectors = @import("connectors.zig");
+const facebook = @import("connectors/facebook/facebook.zig");
 const normalizer = @import("normalizer.zig");
 const validate = @import("validate.zig");
 const entities = @import("../engine/entities.zig");
@@ -78,6 +79,60 @@ fn recordHealth(
     };
 }
 
+/// Store one already-normalized, already-validated document:
+/// ingest-time embedding, idempotent insert, knowledge recording
+/// (entities + event clustering), event publish. Returns true when
+/// the document was inserted. Knowledge/sink failures only warn —
+/// the document is already stored. Shared by the RSS and Facebook
+/// paths so both go through exactly one store step.
+fn storeDocument(
+    alloc: std.mem.Allocator,
+    repo: repository.Repository,
+    sink: ?EventSink,
+    embedder: ?providers.EmbeddingProvider,
+    ks: ?knowledge.KnowledgeStore,
+    doc: *types.Document,
+) bool {
+    // Ingest-time embedding: title + text, capped at 4000 bytes so an
+    // external API call stays cheap. A failed embedding never blocks
+    // the document — it is stored without one.
+    if (embedder) |emb| {
+        const full = std.mem.concat(alloc, u8, &.{ doc.title, " ", doc.text }) catch null;
+        if (full) |text| {
+            const capped = if (text.len > 4000) text[0..4000] else text;
+            if (emb.embed(alloc, capped)) |vec| {
+                doc.embedding = vec;
+            } else |_| {
+                logging.warn("ingest embedding failed", &.{.{ .key = "source", .value = doc.source_id }});
+            }
+        }
+    }
+    repo.insertDocument(doc.*) catch return false;
+    // Knowledge recording (3.4): entities + event clustering.
+    // Failures are warnings only — the document is already stored.
+    if (ks) |k| {
+        const combined = std.mem.concat(alloc, u8, &.{ doc.title, " ", doc.text }) catch null;
+        if (combined) |c| {
+            if (entities.extract(alloc, c)) |ent| {
+                k.recordEntities(alloc, doc.*, ent) catch |e| {
+                    logging.warn("knowledge entities failed", &.{ .{ .key = "source", .value = doc.source_id }, .{ .key = "error", .value = @errorName(e) } });
+                };
+                if (k.upsertEventForDoc(alloc, doc.*, ent)) |ev| {
+                    alloc.free(ev);
+                } else |e| {
+                    logging.warn("knowledge event failed", &.{ .{ .key = "source", .value = doc.source_id }, .{ .key = "error", .value = @errorName(e) } });
+                }
+            } else |_| {}
+        }
+    }
+    if (sink) |s| {
+        s.publish(s.ptr, alloc, doc.id, doc.source_id) catch {
+            logging.warn("event publish failed", &.{.{ .key = "source", .value = doc.source_id }});
+        };
+    }
+    return true;
+}
+
 fn ingestOneSource(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -137,52 +192,72 @@ fn ingestOneSource(
             report.errors += 1;
             continue;
         };
-        // Ingest-time embedding: title + text, capped at 4000 bytes so an
-        // external API call stays cheap. A failed embedding never blocks
-        // the document — it is stored without one.
-        if (embedder) |emb| {
-            const full = std.mem.concat(alloc, u8, &.{ doc.title, " ", doc.text }) catch null;
-            if (full) |text| {
-                const capped = if (text.len > 4000) text[0..4000] else text;
-                if (emb.embed(alloc, capped)) |vec| {
-                    doc.embedding = vec;
-                } else |_| {
-                    logging.warn("ingest embedding failed", &.{.{ .key = "source", .value = source.id }});
-                }
-            }
-        }
-        repo.insertDocument(doc) catch {
+        if (!storeDocument(alloc, repo, sink, embedder, ks, &doc)) {
             report.errors += 1;
             continue;
-        };
+        }
         report.inserted += 1;
-        // Knowledge recording (3.4): entities + event clustering.
-        // Failures are warnings only — the document is already stored.
-        if (ks) |k| {
-            const combined = std.mem.concat(alloc, u8, &.{ doc.title, " ", doc.text }) catch null;
-            if (combined) |c| {
-                if (entities.extract(alloc, c)) |ent| {
-                    k.recordEntities(alloc, doc, ent) catch |e| {
-                        logging.warn("knowledge entities failed", &.{ .{ .key = "source", .value = source.id }, .{ .key = "error", .value = @errorName(e) } });
-                    };
-                    if (k.upsertEventForDoc(alloc, doc, ent)) |ev| {
-                        alloc.free(ev);
-                    } else |e| {
-                        logging.warn("knowledge event failed", &.{ .{ .key = "source", .value = source.id }, .{ .key = "error", .value = @errorName(e) } });
-                    }
-                } else |_| {}
-            }
-        }
-        if (sink) |s| {
-            s.publish(s.ptr, alloc, doc.id, doc.source_id) catch {
-                logging.warn("event publish failed", &.{.{ .key = "source", .value = source.id }});
-            };
-        }
     }
     report.duration_ms = timex.nowMillis(io) - start;
     // Reached only when fetch + parse succeeded: the source is healthy
     // even if individual items failed validation/storage.
     if (ks) |k| recordHealth(k, alloc, source.id, now, true, null, report.inserted);
+    return report;
+}
+
+/// Facebook leg (Roadmap 3.2): poll due registered pages through
+/// the Facebook connector and store new posts through the same store
+/// step as RSS. Unavailable (no token / no pages) reports a skipped
+/// source, never an error. Health is recorded under "facebook" for
+/// the run; per-page health lives in the connector's page states.
+fn ingestFacebook(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    repo: repository.Repository,
+    sink: ?EventSink,
+    now: i64,
+    environ: ?*const std.process.Environ.Map,
+    embedder: ?providers.EmbeddingProvider,
+    ks: ?knowledge.KnowledgeStore,
+    fb: *facebook.FacebookConnector,
+) SourceReport {
+    const start = timex.nowMillis(io);
+    var report = SourceReport{
+        .source_id = "facebook",
+        .fetched = 0,
+        .inserted = 0,
+        .errors = 0,
+        .duration_ms = 0,
+    };
+    if (fb.validate() != null) {
+        report.skipped = true;
+        report.duration_ms = timex.nowMillis(io) - start;
+        return report;
+    }
+    // Registry edits take effect without a restart.
+    fb.reloadRegistry(io) catch |e| {
+        logging.warn("facebook registry reload failed", &.{.{ .key = "error", .value = @errorName(e) }});
+    };
+    const outcome = fb.collect(alloc, io, environ, now) catch |e| {
+        report.errors += 1;
+        report.duration_ms = timex.nowMillis(io) - start;
+        logging.warn("facebook collect failed", &.{.{ .key = "error", .value = @errorName(e) }});
+        return report;
+    };
+    report.fetched = outcome.docs.len;
+    for (outcome.docs) |*doc| {
+        validate.validate(doc.*) catch {
+            report.errors += 1;
+            continue;
+        };
+        if (!storeDocument(alloc, repo, sink, embedder, ks, doc)) {
+            report.errors += 1;
+            continue;
+        }
+        report.inserted += 1;
+    }
+    report.duration_ms = timex.nowMillis(io) - start;
+    if (ks) |k| recordHealth(k, alloc, "facebook", now, report.errors == 0, null, report.inserted);
     return report;
 }
 
@@ -196,6 +271,9 @@ pub fn runOnce(
     embedder: ?providers.EmbeddingProvider,
     ks: ?knowledge.KnowledgeStore,
     default_interval_s: u64,
+    /// Facebook connector (null when the process runs without one).
+    /// Its collect() is a no-op while unconfigured.
+    fb: ?*facebook.FacebookConnector,
 ) !IngestReport {
     const start = timex.nowMillis(io);
     const now = timex.nowSeconds(io);
@@ -244,6 +322,17 @@ pub fn runOnce(
         if (r.errors > 0) had_error = true;
         logging.info("ingest source done", &.{
             .{ .key = "source", .value = source.id },
+            .{ .key = "fetched", .value = try std.fmt.allocPrint(alloc, "{d}", .{r.fetched}) },
+            .{ .key = "inserted", .value = try std.fmt.allocPrint(alloc, "{d}", .{r.inserted}) },
+            .{ .key = "errors", .value = try std.fmt.allocPrint(alloc, "{d}", .{r.errors}) },
+        });
+        try reports.append(alloc, r);
+    }
+    if (fb) |connector| {
+        const r = ingestFacebook(alloc, io, repo, sink, now, environ, embedder, ks, connector);
+        if (r.errors > 0) had_error = true;
+        logging.info("ingest source done", &.{
+            .{ .key = "source", .value = "facebook" },
             .{ .key = "fetched", .value = try std.fmt.allocPrint(alloc, "{d}", .{r.fetched}) },
             .{ .key = "inserted", .value = try std.fmt.allocPrint(alloc, "{d}", .{r.inserted}) },
             .{ .key = "errors", .value = try std.fmt.allocPrint(alloc, "{d}", .{r.errors}) },

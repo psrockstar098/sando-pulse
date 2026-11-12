@@ -8,6 +8,7 @@ const config = @import("../config/config.zig");
 const repository = @import("../storage/repository.zig");
 const knowledge = @import("../storage/knowledge.zig");
 const pipeline = @import("../ingestion/pipeline.zig");
+const facebook = @import("../ingestion/connectors/facebook/facebook.zig");
 const object_store = @import("../storage/object_store.zig");
 const metrics = @import("../api/metrics.zig");
 const providers = @import("../ai/providers.zig");
@@ -23,8 +24,9 @@ pub fn runOnce(
     embedder: ?providers.EmbeddingProvider,
     ks: ?knowledge.KnowledgeStore,
     default_interval_s: u64,
+    fb: ?*facebook.FacebookConnector,
 ) !pipeline.IngestReport {
-    const report = try pipeline.runOnce(alloc, io, repo, sink, archiver, environ, embedder, ks, default_interval_s);
+    const report = try pipeline.runOnce(alloc, io, repo, sink, archiver, environ, embedder, ks, default_interval_s, fb);
     m.observeIngestRun(report.had_error);
     m.setDocumentsIndexed(@intCast(report.docs_after));
     logging.info("ingest run done", &.{
@@ -47,11 +49,12 @@ pub fn runLoop(
     environ: ?*const std.process.Environ.Map,
     embedder: ?providers.EmbeddingProvider,
     ks: ?knowledge.KnowledgeStore,
+    fb: ?*facebook.FacebookConnector,
 ) !void {
     while (true) {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
-        _ = runOnce(arena.allocator(), io, repo, sink, archiver, m, environ, embedder, ks, cfg.ingest_interval_s) catch |e| {
+        _ = runOnce(arena.allocator(), io, repo, sink, archiver, m, environ, embedder, ks, cfg.ingest_interval_s, fb) catch |e| {
             logging.err("ingest run failed", &.{.{ .key = "error", .value = @errorName(e) }});
             m.observeIngestRun(true);
         };

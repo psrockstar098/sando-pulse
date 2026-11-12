@@ -24,6 +24,8 @@ const postgres_knowledge = @import("storage/postgres_knowledge.zig");
 const redis = @import("storage/redis.zig");
 const object_store = @import("storage/object_store.zig");
 const pipeline = @import("ingestion/pipeline.zig");
+const facebook = @import("ingestion/connectors/facebook/facebook.zig");
+const fb_notifications = @import("ingestion/connectors/facebook/notifications.zig");
 const sources = @import("ingestion/sources.zig");
 const auth = @import("api/auth.zig");
 const ratelimit = @import("api/ratelimit.zig");
@@ -180,9 +182,32 @@ pub fn main(init: std.process.Init) !void {
         logging.warn("PULSE_EMBEDDING_PROVIDER=external but no URL/key set: semantic search disabled", &.{});
     }
 
+    // --- facebook connector (Roadmap 3.2) ---
+    // Notification store: Postgres when a database is configured
+    // (durable server -> worker handoff), memory otherwise.
+    // The store structs live in the process arena (never deinited).
+    var notification_store: ?fb_notifications.NotificationStore = null;
+    if (cfg.database_url) |url| {
+        const pgn = try alloc.create(fb_notifications.PostgresNotifications);
+        pgn.* = try fb_notifications.PostgresNotifications.init(alloc, io, url);
+        notification_store = pgn.store();
+    } else {
+        const mn = try alloc.create(fb_notifications.MemoryNotifications);
+        mn.* = fb_notifications.MemoryNotifications.init(alloc);
+        notification_store = mn.store();
+    }
+    var fb_connector = try facebook.FacebookConnector.init(alloc, io, init.environ_map, notification_store);
+    if (fb_connector.validate()) |reason| {
+        logging.info("facebook connector unavailable", &.{.{ .key = "reason", .value = reason }});
+    } else {
+        logging.info("facebook connector ready", &.{
+            .{ .key = "registered_pages", .value = try std.fmt.allocPrint(alloc, "{d}", .{fb_connector.registeredPages()}) },
+        });
+    }
+
     if (is_worker) {
         if (once) {
-            const report = try worker.runOnce(alloc, io, repo, sink, if (archiver) |*a| a else null, &m, init.environ_map, embedder, ks, cfg.ingest_interval_s);
+            const report = try worker.runOnce(alloc, io, repo, sink, if (archiver) |*a| a else null, &m, init.environ_map, embedder, ks, cfg.ingest_interval_s, &fb_connector);
             std.debug.print("ingest once: docs {d} -> {d}, {d} sources, had_error={}\n", .{
                 report.docs_before,
                 report.docs_after,
@@ -191,7 +216,7 @@ pub fn main(init: std.process.Init) !void {
             });
             return;
         }
-        try worker.runLoop(alloc, io, cfg, repo, sink, if (archiver) |*a| a else null, &m, init.environ_map, embedder, ks);
+        try worker.runLoop(alloc, io, cfg, repo, sink, if (archiver) |*a| a else null, &m, init.environ_map, embedder, ks, &fb_connector);
         return;
     }
 
@@ -206,6 +231,7 @@ pub fn main(init: std.process.Init) !void {
         .sink = sink,
         .embedder = embedder,
         .knowledge = ks,
+        .facebook = &fb_connector,
     };
     try srv.serve();
 }

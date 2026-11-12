@@ -6,6 +6,9 @@
 //!   GET  /v1/events   public — persisted event clusters (Roadmap 3.4)
 //!   GET  /v1/locations public — reference places (Roadmap 3.6)
 //!   GET  /v1/statistics public — seeded statistics (Roadmap 3.6)
+//!   GET  /v1/connectors/facebook public — Facebook connector status (3.2)
+//!   GET  /v1/webhooks/facebook public — Meta subscription handshake (3.2)
+//!   POST /v1/webhooks/facebook public — Meta webhook receiver, HMAC-verified (3.2)
 //!   GET  /metrics     public — Prometheus exposition (Roadmap 1.5)
 //!   POST /v1/query    auth + rate limit — planned search with citations
 //!   POST /v1/ingest   auth + rate limit — manual document ingest
@@ -26,6 +29,8 @@ const language = @import("../engine/language.zig");
 const sources = @import("../ingestion/sources.zig");
 const validate = @import("../ingestion/validate.zig");
 const pipeline = @import("../ingestion/pipeline.zig");
+const facebook = @import("../ingestion/connectors/facebook/facebook.zig");
+const fb_webhooks = @import("../ingestion/connectors/facebook/webhooks.zig");
 const providers = @import("../ai/providers.zig");
 const auth = @import("auth.zig");
 const ratelimit = @import("ratelimit.zig");
@@ -48,6 +53,10 @@ pub const Server = struct {
     /// Knowledge store for events/locations/statistics (Roadmap 3.4).
     /// Always present (memory or Postgres, matching the repo).
     knowledge: ?knowledge.KnowledgeStore = null,
+    /// Facebook connector (Roadmap 3.2): status route + webhook
+    /// receiver. Always present; it reports unavailable until a
+    /// token + registry are configured.
+    facebook: ?*facebook.FacebookConnector = null,
 
     pub fn serve(self: *Server) !void {
         const addr = std.Io.net.IpAddress.parse(self.cfg.host, self.cfg.port) catch |e| {
@@ -193,6 +202,11 @@ pub const Server = struct {
     fn pathOf(target: []const u8) []const u8 {
         if (std.mem.indexOfScalar(u8, target, '?')) |i| return target[0..i];
         return target;
+    }
+
+    fn queryOf(target: []const u8) ?[]const u8 {
+        if (std.mem.indexOfScalar(u8, target, '?')) |i| return target[i + 1 ..];
+        return null;
     }
 
     fn handleRequest(self: *Server, req: *std.http.Server.Request) !void {
@@ -403,10 +417,87 @@ pub const Server = struct {
             return;
         }
 
+        if (method == .GET and std.mem.eql(u8, path, "/v1/connectors/facebook")) {
+            const fb = self.facebook orelse {
+                self.respondError(req, alloc, req_id, .service_unavailable, "facebook_unavailable", "Facebook connector unavailable");
+                return;
+            };
+            const body = try fb.statusJson(alloc);
+            self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+            try respondJson(req, .ok, body, req_id);
+            return;
+        }
+
+        // Meta subscription handshake: Meta GETs
+        // ?hub.mode=subscribe&hub.verify_token=...&hub.challenge=...;
+        // Pulse echoes hub.challenge only when the token matches.
+        // No API-key auth here — Meta calls this endpoint, and the
+        // verify token IS the credential.
+        if (method == .GET and std.mem.eql(u8, path, "/v1/webhooks/facebook")) {
+            const fb = self.facebook orelse {
+                self.respondError(req, alloc, req_id, .service_unavailable, "facebook_unavailable", "Facebook connector unavailable");
+                return;
+            };
+            const challenge = fb.handleWebhookVerification(queryOf(req.head.target)) orelse {
+                self.respondError(req, alloc, req_id, .forbidden, "verification_failed", "Webhook verification failed (mode/token)");
+                return;
+            };
+            self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+            try req.respond(challenge, .{
+                .status = .ok,
+                .extra_headers = &.{
+                    .{ .name = "content-type", .value = "text/plain" },
+                    .{ .name = "x-request-id", .value = req_id },
+                },
+            });
+            return;
+        }
+
+        // Meta webhook receiver: the HMAC signature IS the auth
+        // (no API key — Meta calls this endpoint). A failed
+        // signature is 401; an unconfigured app secret is 503.
+        // Validated notifications are recorded for the worker; the
+        // response counts received vs recorded.
+        if (method == .POST and std.mem.eql(u8, path, "/v1/webhooks/facebook")) {
+            const fb = self.facebook orelse {
+                self.respondError(req, alloc, req_id, .service_unavailable, "facebook_unavailable", "Facebook connector unavailable");
+                return;
+            };
+            if (!fb.auth_cfg.canVerifyWebhooks()) {
+                self.respondError(req, alloc, req_id, .service_unavailable, "webhooks_unavailable", "Facebook webhooks not configured (PULSE_FACEBOOK_APP_SECRET)");
+                return;
+            }
+            const body = readBody(req, alloc) catch {
+                self.respondError(req, alloc, req_id, .bad_request, "invalid_request", "Request body too large or unreadable");
+                return;
+            };
+            const sig = headerValue(req.head_buffer, "x-hub-signature-256");
+            if (!fb.verifyWebhookSignature(body, sig)) {
+                self.respondError(req, alloc, req_id, .unauthorized, "bad_signature", "Webhook signature verification failed");
+                return;
+            }
+            const now = timex.nowSeconds(self.io);
+            const notes = fb_webhooks.parseNotification(alloc, body, now) catch {
+                self.respondError(req, alloc, req_id, .bad_request, "invalid_notification", "Webhook body is not a valid page notification");
+                return;
+            };
+            var recorded: usize = 0;
+            for (notes) |n| {
+                fb.recordWebhook(alloc, n) catch continue;
+                recorded += 1;
+            }
+            const resp = try std.fmt.allocPrint(alloc, "{{\"received\":{d},\"recorded\":{d},\"request_id\":\"{s}\"}}", .{ notes.len, recorded, req_id });
+            self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+            try respondJson(req, .ok, resp, req_id);
+            return;
+        }
+
         if ((method == .GET or method == .POST) and
             (std.mem.eql(u8, path, "/v1/health") or std.mem.eql(u8, path, "/v1/sources") or
                 std.mem.eql(u8, path, "/v1/events") or std.mem.eql(u8, path, "/v1/locations") or
                 std.mem.eql(u8, path, "/v1/statistics") or
+                std.mem.eql(u8, path, "/v1/connectors/facebook") or
+                std.mem.eql(u8, path, "/v1/webhooks/facebook") or
                 std.mem.eql(u8, path, "/metrics") or std.mem.eql(u8, path, "/v1/query") or
                 std.mem.eql(u8, path, "/v1/ingest")))
         {
