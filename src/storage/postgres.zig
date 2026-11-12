@@ -1,0 +1,1582 @@
+//! PostgreSQL client + store for Sando Pulse (Roadmap 1).
+//!
+//! Real PostgreSQL wire protocol, standard library only — no external
+//! packages. Simple Query protocol, cleartext + MD5 + SCRAM-SHA-256 auth.
+//!
+//! Design choices (documented, per docs/INTERFACES.md):
+//! * Pool: ONE connection behind a `std.Io.Mutex`, not a 4-connection
+//!   pool. Phase 1 traffic is a single worker + the API server's coarse
+//!   search path; one connection keeps the protocol state machine trivially
+//!   correct (no interleaved Simple Query streams). `PgClient` itself is
+//!   NOT thread-safe — all store access goes through the mutex, and a dead
+//!   connection is dropped and re-established lazily on the next call.
+//! * Plaintext only. `sslmode` is parsed and recorded; `require` /
+//!   `verify-ca` / `verify-full` are REFUSED at connect time with
+//!   `error.TlsNotImplemented` because TLS is out of scope for Phase 1.
+//!   `prefer` (the default) and `disable` connect plaintext, which is the
+//!   intended deployment: the compose network / localhost.
+//! * Timeouts: NONE are available in std 0.17.1's Threaded Io — passing a
+//!   connect timeout panics the process ("TODO implement
+//!   netConnectIpPosix with timeout", verified 2026-11-12), and there is no
+//!   per-read timeout on an established stream. A dead peer therefore blocks
+//!   the calling thread until the OS gives up; the caller must bound the
+//!   call (the server runs store calls on worker threads, never the accept
+//!   loop). This is a known Phase 1 limitation, not a silent hang by
+//!   design. `connect_timeout_s` is kept as the intended value for when
+//!   the std gains connect timeouts.
+//! * No secrets in logs: only host:port/db is ever logged or stored in
+//!   error text. The conninfo string (which carries the password) is never
+//!   printed. `last_error` holds the server's message text only.
+//! * All SQL literals go through `escapeLiteral` (single-quote doubling).
+//!   `standard_conforming_strings` is on by default since PG 9.1, so
+//!   backslashes are literal and are NOT doubled (doubling them would
+//!   change the value). LIKE patterns additionally escape `%`, `_`, `\`.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const types = @import("../common/types.zig");
+const repo_mod = @import("repository.zig");
+
+pub const connect_timeout_s: i64 = 10;
+/// Cap on a single backend message body; guards against a desynced stream
+/// making us allocate unbounded memory.
+const max_message_len: usize = 64 * 1024 * 1024;
+
+pub const PgError = error{
+    InvalidConnInfo,
+    InvalidPort,
+    InvalidHost,
+    UnknownHost,
+    UnsupportedSslMode,
+    TlsNotImplemented,
+    UnsupportedAuthMethod,
+    UnsupportedSaslMechanism,
+    ScramServerNonceMismatch,
+    ScramServerSignatureMismatch,
+    PgServerError,
+    ProtocolError,
+    NotConnected,
+    OutOfMemory,
+};
+
+/// Parsed `postgres://user:pass@host:port/db?sslmode=...`.
+/// All strings are owned by the allocator passed to `parseConnInfo`.
+pub const ConnInfo = struct {
+    user: []const u8,
+    password: ?[]const u8,
+    host: []const u8,
+    port: u16,
+    database: []const u8,
+    sslmode: SslMode,
+
+    pub fn deinit(self: *ConnInfo, alloc: Allocator) void {
+        alloc.free(self.user);
+        if (self.password) |p| alloc.free(p);
+        alloc.free(self.host);
+        alloc.free(self.database);
+        self.* = undefined;
+    }
+
+    /// "host:port/db" — the only connection detail that may appear in logs.
+    pub fn logTarget(self: *const ConnInfo, alloc: Allocator) ![]u8 {
+        return std.fmt.allocPrint(alloc, "{s}:{d}/{s}", .{ self.host, self.port, self.database });
+    }
+};
+
+pub const SslMode = enum { disable, prefer, require, verify_ca, verify_full };
+
+/// Parse a PostgreSQL connection URL. Defaults: port 5432, host
+/// "localhost", user "postgres", database = user, sslmode "prefer".
+/// Percent-decoding is applied to user, password and database.
+pub fn parseConnInfo(alloc: Allocator, s: []const u8) !ConnInfo {
+    const scheme_end = std.mem.indexOf(u8, s, "://") orelse return error.InvalidConnInfo;
+    const scheme = s[0..scheme_end];
+    if (!std.mem.eql(u8, scheme, "postgres") and !std.mem.eql(u8, scheme, "postgresql")) {
+        return error.InvalidConnInfo;
+    }
+    var rest = s[scheme_end + 3 ..];
+
+    var sslmode: SslMode = .prefer;
+    if (std.mem.indexOfScalar(u8, rest, '?')) |qi| {
+        const query = rest[qi + 1 ..];
+        rest = rest[0..qi];
+        var it = std.mem.splitScalar(u8, query, '&');
+        while (it.next()) |pair| {
+            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+            if (!std.mem.eql(u8, pair[0..eq], "sslmode")) continue;
+            const v = pair[eq + 1 ..];
+            if (std.mem.eql(u8, v, "disable")) sslmode = .disable;
+            if (std.mem.eql(u8, v, "prefer")) sslmode = .prefer;
+            if (std.mem.eql(u8, v, "require")) sslmode = .require;
+            if (std.mem.eql(u8, v, "verify-ca")) sslmode = .verify_ca;
+            if (std.mem.eql(u8, v, "verify-full")) sslmode = .verify_full;
+        }
+    }
+
+    // authority / path
+    var authority = rest;
+    var db_part: []const u8 = "";
+    if (std.mem.indexOfScalar(u8, rest, '/')) |si| {
+        authority = rest[0..si];
+        db_part = rest[si + 1 ..];
+    }
+
+    // userinfo@hostport — split at the LAST '@' so a '@' in a password works.
+    var userinfo: []const u8 = "";
+    var hostport = authority;
+    if (std.mem.lastIndexOfScalar(u8, authority, '@')) |ai| {
+        userinfo = authority[0..ai];
+        hostport = authority[ai + 1 ..];
+    }
+
+    // Validate everything on borrowed slices first, then allocate once.
+    // That keeps every error path allocation-free (no partial ConnInfo to free).
+    var user_s: []const u8 = "postgres";
+    var password_s: ?[]const u8 = null;
+    if (userinfo.len > 0) {
+        if (std.mem.indexOfScalar(u8, userinfo, ':')) |ci| {
+            user_s = userinfo[0..ci];
+            password_s = userinfo[ci + 1 ..];
+        } else {
+            user_s = userinfo;
+        }
+    }
+
+    var host_s: []const u8 = "localhost";
+    var port: u16 = 5432;
+    if (hostport.len > 0) {
+        if (hostport[0] == '[') {
+            // IPv6 literal: [::1]:5432
+            const close = std.mem.indexOfScalar(u8, hostport, ']') orelse return error.InvalidConnInfo;
+            host_s = hostport[1..close];
+            const tail = hostport[close + 1 ..];
+            if (tail.len > 0) {
+                if (tail[0] != ':') return error.InvalidConnInfo;
+                port = try parsePort(tail[1..]);
+            }
+        } else if (std.mem.lastIndexOfScalar(u8, hostport, ':')) |ci| {
+            host_s = hostport[0..ci];
+            port = try parsePort(hostport[ci + 1 ..]);
+        } else {
+            host_s = hostport;
+        }
+        if (host_s.len == 0) return error.InvalidConnInfo;
+    }
+
+    const db_s: []const u8 = if (db_part.len > 0) db_part else user_s;
+
+    const user = try pctDecode(alloc, user_s);
+    errdefer alloc.free(user);
+    var password: ?[]u8 = null;
+    if (password_s) |ps| password = try pctDecode(alloc, ps);
+    errdefer if (password) |p| alloc.free(p);
+    const host = try alloc.dupe(u8, host_s);
+    errdefer alloc.free(host);
+    const database = try pctDecode(alloc, db_s);
+
+    return .{
+        .user = user,
+        .password = password,
+        .host = host,
+        .port = port,
+        .database = database,
+        .sslmode = sslmode,
+    };
+}
+
+fn parsePort(s: []const u8) !u16 {
+    if (s.len == 0) return error.InvalidPort;
+    return std.fmt.parseInt(u16, s, 10) catch return error.InvalidPort;
+}
+
+/// Percent-decode (%XX -> byte). A bare '%' or a non-hex pair is an error.
+/// '+' is left as-is: conninfo is a URI, not form data.
+fn pctDecode(alloc: Allocator, s: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '%') {
+            if (i + 2 >= s.len) return error.InvalidConnInfo;
+            const hi = std.fmt.charToDigit(s[i + 1], 16) catch return error.InvalidConnInfo;
+            const lo = std.fmt.charToDigit(s[i + 2], 16) catch return error.InvalidConnInfo;
+            try out.append(alloc, @as(u8, hi) * 16 + @as(u8, lo));
+            i += 3;
+        } else {
+            try out.append(alloc, s[i]);
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// Escape a value as a SQL string literal: wrap in single quotes, double
+/// any embedded single quote. Backslashes are NOT escaped (see header).
+pub fn escapeLiteral(alloc: Allocator, s: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.append(alloc, '\'');
+    for (s) |c| {
+        if (c == '\'') try out.append(alloc, '\'');
+        try out.append(alloc, c);
+    }
+    try out.append(alloc, '\'');
+    return out.toOwnedSlice(alloc);
+}
+
+/// Append a SQL string literal directly into a byte list (no allocation).
+/// Equivalent to `escapeLiteral` but writes into `list` instead of returning
+/// an owned slice — use this when the literal is spliced into a larger SQL
+/// string so the escaped value does not leak.
+fn appendEscapedLiteral(list: *std.ArrayList(u8), alloc: Allocator, s: []const u8) !void {
+    try list.append(alloc, '\'');
+    for (s) |c| {
+        if (c == '\'') try list.append(alloc, '\'');
+        try list.append(alloc, c);
+    }
+    try list.append(alloc, '\'');
+}
+
+/// Append a LIKE pattern literal (`'%escaped%'`) directly into a byte list.
+fn appendLikeLiteral(list: *std.ArrayList(u8), alloc: Allocator, s: []const u8) !void {
+    try list.append(alloc, '\'');
+    try list.append(alloc, '%');
+    for (s) |c| {
+        if (c == '\\' or c == '%' or c == '_') try list.append(alloc, '\\');
+        try list.append(alloc, c);
+    }
+    try list.append(alloc, '%');
+    try list.append(alloc, '\'');
+}
+
+/// Escape a value for use inside a LIKE/ILIKE pattern: `\`, `%` and `_`
+/// are backslash-escaped. The result still needs `escapeLiteral` around it.
+pub fn escapeLikePattern(alloc: Allocator, s: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (s) |c| {
+        if (c == '\\' or c == '%' or c == '_') try out.append(alloc, '\\');
+        try out.append(alloc, c);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// Validate an identifier (table/column name) and return it double-quoted.
+/// Only [A-Za-z0-9_.$] plus a non-leading digit rule is accepted; anything
+/// else is rejected rather than escaped into SQL.
+pub fn escapeIdent(alloc: Allocator, s: []const u8) ![]u8 {
+    if (s.len == 0) return error.InvalidConnInfo;
+    for (s, 0..) |c, i| {
+        const ok = std.ascii.isAlphanumeric(c) or c == '_' or c == '$';
+        if (!ok) return error.InvalidConnInfo;
+        if (i == 0 and std.ascii.isDigit(c)) return error.InvalidConnInfo;
+    }
+    return std.fmt.allocPrint(alloc, "\"{s}\"", .{s});
+}
+
+/// One text row from the server. NULL columns are `null`; every value is
+/// owned by the allocator passed to `query`.
+pub const Row = struct {
+    cols: []?[]const u8,
+};
+
+pub const QueryResult = struct {
+    rows: []Row,
+    /// Command tag from CommandComplete ("SELECT 3", "INSERT 0 1", ...).
+    command_tag: []const u8 = "",
+
+    /// Free every row, column value and the command tag. Call after the
+    /// caller has copied out what it needs (or after duping the values).
+    pub fn deinit(self: *QueryResult, alloc: Allocator) void {
+        for (self.rows) |row| {
+            for (row.cols) |col| {
+                if (col) |v| alloc.free(v);
+            }
+            alloc.free(row.cols);
+        }
+        alloc.free(self.rows);
+        if (self.command_tag.len > 0) alloc.free(self.command_tag);
+        self.rows = &.{};
+        self.command_tag = "";
+    }
+};
+
+/// Startup message (no type byte): length + protocol 196608 + params.
+/// Layout: int32 len | int32 196608 | "user\0" user "\0" "database\0" db "\0" "\0".
+fn buildStartupMessage(alloc: Allocator, user: []const u8, database: []const u8) ![]u8 {
+    const body_len = 4 + "user".len + 1 + user.len + 1 + "database".len + 1 + database.len + 1 + 1;
+    const total = 4 + body_len;
+    var out = try alloc.alloc(u8, total);
+    std.mem.writeInt(u32, out[0..4], @intCast(total), .big);
+    std.mem.writeInt(u32, out[4..8], 196608, .big);
+    var p: usize = 8;
+    @memcpy(out[p .. p + 4], "user");
+    p += 4;
+    out[p] = 0;
+    p += 1;
+    @memcpy(out[p .. p + user.len], user);
+    p += user.len;
+    out[p] = 0;
+    p += 1;
+    @memcpy(out[p .. p + 8], "database");
+    p += 8;
+    out[p] = 0;
+    p += 1;
+    @memcpy(out[p .. p + database.len], database);
+    p += database.len;
+    out[p] = 0;
+    p += 1;
+    out[p] = 0;
+    return out;
+}
+
+/// MD5 password response: "md5" ++ hex(md5(hex(md5(password ++ user)) ++ salt)).
+fn md5PasswordResponse(alloc: Allocator, password: []const u8, user: []const u8, salt: [4]u8) ![]u8 {
+    var inner: [16]u8 = undefined;
+    var h1 = std.crypto.hash.Md5.init(.{});
+    h1.update(password);
+    h1.update(user);
+    h1.final(&inner);
+    const inner_hex = std.fmt.bytesToHex(inner, .lower);
+
+    var outer: [16]u8 = undefined;
+    var h2 = std.crypto.hash.Md5.init(.{});
+    h2.update(&inner_hex);
+    h2.update(&salt);
+    h2.final(&outer);
+    const outer_hex = std.fmt.bytesToHex(outer, .lower);
+
+    var out = try alloc.alloc(u8, 3 + 32);
+    @memcpy(out[0..3], "md5");
+    @memcpy(out[3..35], &outer_hex);
+    return out;
+}
+
+/// PBKDF2-HMAC-SHA256, RFC 2898. `out` must be 32 bytes for SCRAM.
+/// Salt is PG-generated (16 bytes); anything over 124 bytes is refused
+/// rather than silently truncated.
+fn pbkdf2Sha256(password: []const u8, salt: []const u8, iterations: u32, out: *[32]u8) void {
+    const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
+    std.debug.assert(salt.len <= 124);
+    var u: [32]u8 = undefined;
+    var t: [32]u8 = undefined;
+    var first: [128]u8 = undefined;
+    @memcpy(first[0..salt.len], salt);
+    std.mem.writeInt(u32, first[salt.len..][0..4], 1, .big);
+    Hmac.create(&u, first[0 .. salt.len + 4], password);
+    @memcpy(&t, &u);
+    var i: u32 = 1;
+    while (i < iterations) : (i += 1) {
+        Hmac.create(&u, &u, password);
+        for (&t, u) |*a, b| a.* ^= b;
+    }
+    @memcpy(out, &t);
+}
+
+/// Encoded length of `n` bytes in standard padded base64.
+fn b64EncodedLen(n: usize) usize {
+    return (n + 2) / 3 * 4;
+}
+
+/// Decoded length of a standard padded base64 string.
+fn b64DecodedLen(s: []const u8) !usize {
+    if (s.len % 4 != 0) return error.ProtocolError;
+    var n = s.len / 4 * 3;
+    if (s.len >= 1 and s[s.len - 1] == '=') n -= 1;
+    if (s.len >= 2 and s[s.len - 2] == '=') n -= 1;
+    return n;
+}
+
+/// SCRAM-SHA-256 client-first-message-bare: "n=<user>,r=<nonce_b64>".
+/// '=' and ',' in the username are escaped as =3D / =2C (RFC 5802).
+fn buildClientFirstBare(alloc: Allocator, user: []const u8, nonce_b64: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(alloc, "n=");
+    for (user) |c| {
+        if (c == '=') try out.appendSlice(alloc, "=3D") else if (c == ',') try out.appendSlice(alloc, "=2C") else try out.append(alloc, c);
+    }
+    try out.appendSlice(alloc, ",r=");
+    try out.appendSlice(alloc, nonce_b64);
+    return out.toOwnedSlice(alloc);
+}
+
+/// One PostgreSQL connection. NOT thread-safe — the caller (PostgresStore)
+/// serializes access with a mutex. The buffered reader is plain fields
+/// (array + offsets), never self-referential pointers, so the struct can
+/// be moved by value safely.
+pub const PgClient = struct {
+    alloc: Allocator,
+    io: std.Io,
+    info: ConnInfo,
+    stream: std.Io.net.Stream,
+    read_buf: [8192]u8 = undefined,
+    read_pos: usize = 0,
+    read_len: usize = 0,
+    /// Last server error message text (no secrets), if any.
+    last_error: ?[]u8 = null,
+    open: bool = false,
+
+    pub fn connect(alloc: Allocator, io: std.Io, conninfo: []const u8) !PgClient {
+        var info = try parseConnInfo(alloc, conninfo);
+        // `info` is freed here on early errors; once it moves into `self`,
+        // the flag is cleared and `closeStreamOnly` owns it instead.
+        // (Without the flag the two errdefers would double-free.)
+        var info_owned = true;
+        errdefer if (info_owned) info.deinit(alloc);
+        switch (info.sslmode) {
+            .require, .verify_ca, .verify_full => return error.TlsNotImplemented,
+            .disable, .prefer => {},
+        }
+        const addr = try resolveHost(io, info.host, info.port);
+        const stream = std.Io.net.IpAddress.connect(&addr, io, .{
+            .mode = .stream,
+            // NOTE: std 0.17.1's Threaded Io PANICS ("TODO implement
+            // netConnectIpPosix with timeout") if a timeout is passed here,
+            // so connect is unbounded. No per-read timeout exists either.
+            // The caller must bound the call (worker thread, never the
+            // accept loop). Revisit when the std gains connect timeouts.
+            .timeout = .none,
+        }) catch |err| {
+            return err;
+        };
+        var self = PgClient{
+            .alloc = alloc,
+            .io = io,
+            .info = info,
+            .stream = stream,
+            .open = true,
+        };
+        info_owned = false;
+        errdefer self.closeStreamOnly();
+        const startup = try buildStartupMessage(alloc, info.user, info.database);
+        defer alloc.free(startup);
+        try self.sendRaw(startup);
+        try self.authenticate();
+        return self;
+    }
+
+    pub fn close(self: *PgClient) void {
+        if (!self.open) return;
+        // Best effort Terminate ('X'); ignore failure, we are closing anyway.
+        var term = [_]u8{ 'X', 0, 0, 0, 4 };
+        _ = self.sendRaw(&term) catch {};
+        self.closeStreamOnly();
+    }
+
+    fn closeStreamOnly(self: *PgClient) void {
+        if (!self.open) return;
+        self.open = false;
+        self.stream.close(self.io);
+        self.info.deinit(self.alloc);
+        if (self.last_error) |e| self.alloc.free(e);
+        self.last_error = null;
+    }
+
+    /// SELECT 1 — proves the connection is alive.
+    pub fn ping(self: *PgClient) !void {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const res = try self.query(arena.allocator(), "SELECT 1");
+        if (res.rows.len != 1) return error.ProtocolError;
+    }
+
+    /// Simple Query, rows discarded. Use for DDL/DML with no result.
+    pub fn exec(self: *PgClient, alloc: Allocator, sql: []const u8) !void {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var res = try self.runQuery(arena.allocator(), alloc, sql, false);
+        defer res.deinit(alloc);
+    }
+
+    /// Simple Query, rows returned. Row values are owned by `alloc`.
+    pub fn query(self: *PgClient, alloc: Allocator, sql: []const u8) !QueryResult {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        return self.runQuery(arena.allocator(), alloc, sql, true);
+    }
+
+    // ---- low-level I/O ----
+
+    fn sendRaw(self: *PgClient, data: []const u8) !void {
+        var wbuf: [4096]u8 = undefined;
+        var w = self.stream.writer(self.io, &wbuf);
+        try w.interface.writeAll(data);
+        try w.interface.flush();
+    }
+
+    /// Read exactly `buf.len` bytes, refilling the internal buffer as needed.
+    fn readExact(self: *PgClient, buf: []u8) !void {
+        var done: usize = 0;
+        while (done < buf.len) {
+            if (self.read_pos < self.read_len) {
+                const n = @min(buf.len - done, self.read_len - self.read_pos);
+                @memcpy(buf[done .. done + n], self.read_buf[self.read_pos .. self.read_pos + n]);
+                self.read_pos += n;
+                done += n;
+                continue;
+            }
+            self.read_pos = 0;
+            var bufs: [1][]u8 = .{self.read_buf[0..]};
+            self.read_len = try self.stream.read(self.io, &bufs);
+            if (self.read_len == 0) return error.EndOfStream;
+        }
+    }
+
+    fn readByte(self: *PgClient) !u8 {
+        var b: [1]u8 = undefined;
+        try self.readExact(&b);
+        return b[0];
+    }
+
+    fn readU32(self: *PgClient) !u32 {
+        var b: [4]u8 = undefined;
+        try self.readExact(&b);
+        return std.mem.readInt(u32, &b, .big);
+    }
+
+    fn readI16(self: *PgClient) !i16 {
+        var b: [2]u8 = undefined;
+        try self.readExact(&b);
+        return std.mem.readInt(i16, &b, .big);
+    }
+
+    fn readI32(self: *PgClient) !i32 {
+        var b: [4]u8 = undefined;
+        try self.readExact(&b);
+        return std.mem.readInt(i32, &b, .big);
+    }
+
+    const Message = struct {
+        kind: u8,
+        body: []u8,
+    };
+
+    /// Read one backend message. Body is allocated in `arena`.
+    fn readMessage(self: *PgClient, arena: Allocator) !Message {
+        const kind = try self.readByte();
+        const len = try self.readU32();
+        if (len < 4 or len - 4 > max_message_len) return error.ProtocolError;
+        const body = try arena.alloc(u8, len - 4);
+        try self.readExact(body);
+        return .{ .kind = kind, .body = body };
+    }
+
+    fn setServerError(self: *PgClient, body: []const u8) void {
+        // ErrorResponse body: (byte code, cstring)*, terminated by 0.
+        // Keep the 'M' (message) field, plus the 'C' (code) if present.
+        var msg: []const u8 = "unknown server error";
+        var code: ?[]const u8 = null;
+        var i: usize = 0;
+        while (i < body.len and body[i] != 0) {
+            const field = body[i];
+            const start = i + 1;
+            const end = std.mem.indexOfScalarPos(u8, body, start, 0) orelse body.len;
+            const val = body[start..end];
+            if (field == 'M') msg = val;
+            if (field == 'C') code = val;
+            i = end + 1;
+        }
+        if (self.last_error) |e| self.alloc.free(e);
+        self.last_error = if (code) |c|
+            std.fmt.allocPrint(self.alloc, "{s} (code {s})", .{ msg, c }) catch null
+        else
+            std.fmt.allocPrint(self.alloc, "{s}", .{msg}) catch null;
+    }
+
+    fn sendPasswordMessage(self: *PgClient, payload: []const u8) !void {
+        // 'p' | int32 len (4 + payload) | payload (no trailing NUL for SASL).
+        var hdr: [5]u8 = undefined;
+        hdr[0] = 'p';
+        std.mem.writeInt(u32, hdr[1..5], @intCast(4 + payload.len), .big);
+        try self.sendRaw(&hdr);
+        try self.sendRaw(payload);
+    }
+
+    /// Startup-phase loop: handles auth (cleartext/MD5/SCRAM), ParameterStatus,
+    /// notices, and errors until ReadyForQuery.
+    fn authenticate(self: *PgClient) !void {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        // The SCRAM exchange needs the cleartext password; see `scram_password`.
+        scram_password = self.info.password;
+        defer scram_password = null;
+
+        var scram: ?ScramState = null;
+        while (true) {
+            const msg = try self.readMessage(aa);
+            switch (msg.kind) {
+                'R' => {
+                    if (msg.body.len < 4) return error.ProtocolError;
+                    const code = std.mem.readInt(i32, msg.body[0..4], .big);
+                    switch (code) {
+                        0 => {}, // AuthenticationOk
+                        3 => { // CleartextPassword
+                            const pw = self.info.password orelse return error.UnsupportedAuthMethod;
+                            var payload = try aa.alloc(u8, pw.len + 1);
+                            @memcpy(payload[0..pw.len], pw);
+                            payload[pw.len] = 0;
+                            try self.sendPasswordMessage(payload);
+                        },
+                        5 => { // MD5Password
+                            if (msg.body.len < 8) return error.ProtocolError;
+                            const pw = self.info.password orelse return error.UnsupportedAuthMethod;
+                            const salt: [4]u8 = msg.body[4..8].*;
+                            const resp = try md5PasswordResponse(aa, pw, self.info.user, salt);
+                            var payload = try aa.alloc(u8, resp.len + 1);
+                            @memcpy(payload[0..resp.len], resp);
+                            payload[resp.len] = 0;
+                            try self.sendPasswordMessage(payload);
+                        },
+                        10 => { // SASL
+                            // Body: mechanism names, NUL-separated, ending with NUL.
+                            var found = false;
+                            var it = std.mem.splitScalar(u8, msg.body[4..], 0);
+                            while (it.next()) |mech| {
+                                if (mech.len == 0) break;
+                                if (std.mem.eql(u8, mech, "SCRAM-SHA-256")) found = true;
+                            }
+                            if (!found) return error.UnsupportedSaslMechanism;
+                            scram = try ScramState.init(aa, self.io, self.info.user);
+                            const st = &scram.?;
+                            // SASLInitialResponse: mechanism NUL, int32 len, response.
+                            var payload: std.ArrayList(u8) = .empty;
+                            try payload.appendSlice(aa, "SCRAM-SHA-256");
+                            try payload.append(aa, 0);
+                            var lenb: [4]u8 = undefined;
+                            std.mem.writeInt(u32, &lenb, @intCast(st.client_first.len), .big);
+                            try payload.appendSlice(aa, &lenb);
+                            try payload.appendSlice(aa, st.client_first);
+                            try self.sendPasswordMessage(payload.items);
+                        },
+                        11 => { // SASLContinue: server-first-message
+                            const st = &(scram orelse return error.ProtocolError);
+                            try st.handleServerFirst(aa, msg.body[4..]);
+                            try self.sendPasswordMessage(st.client_final);
+                        },
+                        12 => { // SASLFinal: server signature
+                            const st = &(scram orelse return error.ProtocolError);
+                            try st.verifyServerFinal(msg.body[4..]);
+                            scram = null;
+                        },
+                        else => return error.UnsupportedAuthMethod,
+                    }
+                },
+                'S', 'N' => {}, // ParameterStatus, NoticeResponse: ignore
+                'K' => {}, // BackendKeyData (process id + secret key): not needed
+                'E' => {
+                    self.setServerError(msg.body);
+                    return error.PgServerError;
+                },
+                'Z' => return, // ReadyForQuery — authenticated
+                else => return error.ProtocolError,
+            }
+        }
+    }
+
+    /// Run one Simple Query ('Q'). `arena` is scratch for message bodies;
+    /// when `collect` is true, row values are duped into `row_alloc`.
+    fn runQuery(self: *PgClient, arena: Allocator, row_alloc: Allocator, sql: []const u8, collect: bool) !QueryResult {
+        if (!self.open) return error.NotConnected;
+        // 'Q' | int32 len | sql NUL
+        var hdr: [5]u8 = undefined;
+        hdr[0] = 'Q';
+        std.mem.writeInt(u32, hdr[1..5], @intCast(4 + sql.len + 1), .big);
+        try self.sendRaw(&hdr);
+        try self.sendRaw(sql);
+        try self.sendRaw(&[_]u8{0});
+
+        var rows: std.ArrayList(Row) = .empty;
+        var command_tag: []const u8 = "";
+        while (true) {
+            const msg = try self.readMessage(arena);
+            switch (msg.kind) {
+                'T', 'I' => {}, // RowDescription, EmptyQueryResponse
+                'D' => {
+                    if (!collect) continue;
+                    if (msg.body.len < 2) return error.ProtocolError;
+                    const ncols = std.mem.readInt(i16, msg.body[0..2], .big);
+                    if (ncols < 0) return error.ProtocolError;
+                    const cols = try row_alloc.alloc(?[]const u8, @intCast(ncols));
+                    var p: usize = 2;
+                    for (cols) |*col| {
+                        if (p + 4 > msg.body.len) return error.ProtocolError;
+                        const clen = std.mem.readInt(i32, msg.body[p..][0..4], .big);
+                        p += 4;
+                        if (clen == -1) {
+                            col.* = null;
+                        } else if (clen < 0 or p + @as(usize, @intCast(clen)) > msg.body.len) {
+                            return error.ProtocolError;
+                        } else {
+                            const val = msg.body[p .. p + @as(usize, @intCast(clen))];
+                            p += @as(usize, @intCast(clen));
+                            col.* = try row_alloc.dupe(u8, val);
+                        }
+                    }
+                    try rows.append(row_alloc, .{ .cols = cols });
+                },
+                'C' => {
+                    // CommandComplete body is a NUL-terminated tag.
+                    const end = std.mem.indexOfScalar(u8, msg.body, 0) orelse msg.body.len;
+                    if (command_tag.len > 0) row_alloc.free(command_tag);
+                    command_tag = try row_alloc.dupe(u8, msg.body[0..end]);
+                },
+                'E' => {
+                    self.setServerError(msg.body);
+                    // Drain until ReadyForQuery so the connection stays usable.
+                    while (true) {
+                        const m2 = try self.readMessage(arena);
+                        if (m2.kind == 'Z') break;
+                    }
+                    return error.PgServerError;
+                },
+                'N', 'S' => {},
+                'Z' => return .{ .rows = try rows.toOwnedSlice(row_alloc), .command_tag = command_tag },
+                else => return error.ProtocolError,
+            }
+        }
+    }
+};
+
+/// SCRAM-SHA-256 client state (RFC 5802 / RFC 7677).
+const ScramState = struct {
+    client_first: []const u8,
+    client_first_bare: []const u8,
+    server_first: []const u8 = "",
+    client_final: []const u8 = "",
+    salted_password: [32]u8 = undefined,
+    auth_message: []const u8 = "",
+    client_nonce_b64: []const u8,
+
+    fn deinit(self: *ScramState, alloc: Allocator) void {
+        alloc.free(self.client_first);
+        alloc.free(self.client_first_bare);
+        alloc.free(self.client_nonce_b64);
+        if (self.server_first.len > 0) alloc.free(self.server_first);
+        if (self.client_final.len > 0) alloc.free(self.client_final);
+        if (self.auth_message.len > 0) alloc.free(self.auth_message);
+    }
+
+    fn init(alloc: Allocator, io: std.Io, user: []const u8) !ScramState {
+        var nonce_raw: [18]u8 = undefined;
+        io.random(&nonce_raw);
+        const nonce_b64 = try alloc.alloc(u8, b64EncodedLen(nonce_raw.len));
+        _ = std.base64.standard.Encoder.encode(nonce_b64, &nonce_raw);
+        const bare = try buildClientFirstBare(alloc, user, nonce_b64);
+        const first = try std.fmt.allocPrint(alloc, "n,,{s}", .{bare});
+        return .{
+            .client_first = first,
+            .client_first_bare = bare,
+            .client_nonce_b64 = nonce_b64,
+        };
+    }
+
+    fn handleServerFirst(self: *ScramState, alloc: Allocator, server_first: []const u8) !void {
+        // server-first-message: r=<nonce>,s=<base64 salt>,i=<iterations>
+        var server_nonce: ?[]const u8 = null;
+        var salt_b64: ?[]const u8 = null;
+        var iterations: u32 = 0;
+        var it = std.mem.splitScalar(u8, server_first, ',');
+        while (it.next()) |attr| {
+            if (attr.len < 2 or attr[1] != '=') return error.ProtocolError;
+            switch (attr[0]) {
+                'r' => server_nonce = attr[2..],
+                's' => salt_b64 = attr[2..],
+                'i' => iterations = std.fmt.parseInt(u32, attr[2..], 10) catch return error.ProtocolError,
+                else => {},
+            }
+        }
+        const sn = server_nonce orelse return error.ProtocolError;
+        const sb = salt_b64 orelse return error.ProtocolError;
+        if (iterations == 0) return error.ProtocolError;
+        if (!std.mem.startsWith(u8, sn, self.client_nonce_b64)) return error.ScramServerNonceMismatch;
+
+        const salt_len = try b64DecodedLen(sb);
+        const salt = try alloc.alloc(u8, salt_len);
+        std.base64.standard.Decoder.decode(salt, sb) catch return error.ProtocolError;
+
+        // NOTE: the password is needed here; it is passed via the global below.
+        // (Kept on the struct through `password` — see connect flow.)
+        const password = scram_password orelse return error.UnsupportedAuthMethod;
+        pbkdf2Sha256(password, salt, iterations, &self.salted_password);
+
+        const client_final_wo_proof = try std.fmt.allocPrint(alloc, "c=biws,r={s}", .{sn});
+        self.auth_message = try std.fmt.allocPrint(alloc, "{s},{s},{s}", .{
+            self.client_first_bare, server_first, client_final_wo_proof,
+        });
+
+        const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
+        var client_key: [32]u8 = undefined;
+        Hmac.create(&client_key, "Client Key", &self.salted_password);
+        var stored_key: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(&client_key, &stored_key, .{});
+        var sig: [32]u8 = undefined;
+        Hmac.create(&sig, self.auth_message, &stored_key);
+        var proof: [32]u8 = undefined;
+        for (&proof, client_key, sig) |*p, ck, s| p.* = ck ^ s;
+        const proof_b64 = try alloc.alloc(u8, b64EncodedLen(proof.len));
+        _ = std.base64.standard.Encoder.encode(proof_b64, &proof);
+        self.server_first = try alloc.dupe(u8, server_first);
+        self.client_final = try std.fmt.allocPrint(alloc, "{s},p={s}", .{ client_final_wo_proof, proof_b64 });
+    }
+
+    fn verifyServerFinal(self: *ScramState, body: []const u8) !void {
+        // SASLFinal body: "v=<base64 server signature>"
+        if (body.len < 2 or body[0] != 'v' or body[1] != '=') return error.ProtocolError;
+        const want_b64 = body[2..];
+        const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
+        var server_key: [32]u8 = undefined;
+        Hmac.create(&server_key, "Server Key", &self.salted_password);
+        var want_sig: [32]u8 = undefined;
+        Hmac.create(&want_sig, self.auth_message, &server_key);
+        const got_len = b64DecodedLen(want_b64) catch return error.ProtocolError;
+        if (got_len != 32) return error.ScramServerSignatureMismatch;
+        var got: [32]u8 = undefined;
+        std.base64.standard.Decoder.decode(&got, want_b64) catch return error.ScramServerSignatureMismatch;
+        if (!std.crypto.timing_safe.eql([32]u8, got, want_sig)) return error.ScramServerSignatureMismatch;
+    }
+};
+
+// The SCRAM exchange needs the cleartext password inside `handleServerFirst`.
+// `authenticate` sets this thread-local-adjacent slot before the exchange and
+// clears it right after; the password is never logged or stored elsewhere.
+// (Single-connection + mutex design means no two exchanges can interleave.)
+threadlocal var scram_password: ?[]const u8 = null;
+
+fn resolveHost(io: std.Io, host: []const u8, port: u16) !std.Io.net.IpAddress {
+    if (std.Io.net.IpAddress.parse(host, port)) |ip| return ip else |_| {}
+    const name = std.Io.net.HostName.init(host) catch return error.InvalidHost;
+    var results_buf: [16]std.Io.net.HostName.LookupResult = undefined;
+    var queue = std.Io.Queue(std.Io.net.HostName.LookupResult).init(&results_buf);
+    name.lookup(io, &queue, .{ .port = port }) catch |err| switch (err) {
+        error.UnknownHostName => return error.UnknownHost,
+        else => return err,
+    };
+    var out: [16]std.Io.net.HostName.LookupResult = undefined;
+    const n = queue.get(io, &out, 1) catch return error.UnknownHost;
+    for (out[0..n]) |r| {
+        if (r == .address) return r.address;
+    }
+    return error.UnknownHost;
+}
+
+/// Apply `<dir>/*.sql` in filename order. Each migration runs inside its
+/// own BEGIN/COMMIT and is then recorded in `schema_migrations` under its
+/// filename stem (e.g. "001_initial"). Re-running is a no-op: versions
+/// already recorded are skipped. `dir` may be absolute or relative to the
+/// process working directory.
+pub fn runMigrations(alloc: Allocator, io: std.Io, conninfo: []const u8, dir: []const u8) !void {
+    var client = try PgClient.connect(alloc, io, conninfo);
+    defer client.close();
+    try client.exec(alloc,
+        \\CREATE TABLE IF NOT EXISTS schema_migrations (
+        \\  version TEXT PRIMARY KEY,
+        \\  applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        \\)
+    );
+
+    var d = openDirForMigrations(io, dir) catch |err| return err;
+    defer d.close(io);
+
+    var names: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (names.items) |n| alloc.free(n);
+        names.deinit(alloc);
+    }
+    var it = d.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".sql")) continue;
+        try names.append(alloc, try alloc.dupe(u8, entry.name));
+    }
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+
+    for (names.items) |fname| {
+        const version = fname[0 .. fname.len - ".sql".len];
+        const esc_version = try escapeLiteral(alloc, version);
+        defer alloc.free(esc_version);
+        const check_sql = try std.fmt.allocPrint(alloc,
+            "SELECT 1 FROM schema_migrations WHERE version = {s}",
+            .{esc_version});
+        defer alloc.free(check_sql);
+        var res = try client.query(alloc, check_sql);
+        defer res.deinit(alloc);
+        if (res.rows.len > 0) continue;
+
+        const sql = try d.readFileAlloc(io, fname, alloc, .limited(16 * 1024 * 1024));
+        defer alloc.free(sql);
+        const wrapped = try std.fmt.allocPrint(alloc, "BEGIN;\n{s}\nCOMMIT;", .{sql});
+        defer alloc.free(wrapped);
+        client.exec(alloc, wrapped) catch |err| {
+            client.exec(alloc, "ROLLBACK;") catch {};
+            return err;
+        };
+        const ins = try std.fmt.allocPrint(alloc,
+            "INSERT INTO schema_migrations(version) VALUES ({s})",
+            .{esc_version});
+        defer alloc.free(ins);
+        try client.exec(alloc, ins);
+    }
+}
+
+fn openDirForMigrations(io: std.Io, dir: []const u8) !std.Io.Dir {
+    if (std.fs.path.isAbsolute(dir)) {
+        return std.Io.Dir.openDirAbsolute(io, dir, .{ .iterate = true });
+    }
+    return std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true });
+}
+
+/// PostgreSQL-backed `repository.Repository`.
+///
+/// Connection strategy: ONE connection behind a mutex (see header). The
+/// connection is opened eagerly by `init` and re-established lazily if a
+/// call finds it dead.
+pub const PostgresStore = struct {
+    alloc: Allocator,
+    io: std.Io,
+    conninfo: []const u8,
+    mutex: std.Io.Mutex = .init,
+    client: ?PgClient = null,
+
+    pub fn init(alloc: Allocator, io: std.Io, conninfo: []const u8) !PostgresStore {
+        var self = PostgresStore{
+            .alloc = alloc,
+            .io = io,
+            .conninfo = try alloc.dupe(u8, conninfo),
+        };
+        errdefer alloc.free(self.conninfo);
+        self.client = try PgClient.connect(alloc, io, conninfo);
+        return self;
+    }
+
+    pub fn deinit(self: *PostgresStore) void {
+        if (self.client) |*c| c.close();
+        self.client = null;
+        self.alloc.free(self.conninfo);
+    }
+
+    pub fn repository(self: *PostgresStore) repo_mod.Repository {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    /// Alias matching the interface in docs/INTERFACES.md (and MemoryStore).
+    pub fn asRepository(self: *PostgresStore) repo_mod.Repository {
+        return self.repository();
+    }
+
+    const vtable = repo_mod.Repository.VTable{
+        .insertDocument = repoInsertDocument,
+        .search = repoSearch,
+        .countDocuments = repoCountDocuments,
+        .countBySource = repoCountBySource,
+        .deinit = repoDeinit,
+    };
+
+    fn repoInsertDocument(ptr: *anyopaque, doc: types.Document) anyerror!void {
+        const self: *PostgresStore = @ptrCast(@alignCast(ptr));
+        return self.insertDocument(doc);
+    }
+
+    fn repoSearch(ptr: *anyopaque, alloc: Allocator, q: types.SearchQuery) anyerror![]types.Document {
+        const self: *PostgresStore = @ptrCast(@alignCast(ptr));
+        return self.search(alloc, q);
+    }
+
+    fn repoCountDocuments(ptr: *anyopaque) usize {
+        const self: *PostgresStore = @ptrCast(@alignCast(ptr));
+        return self.countDocuments();
+    }
+
+    fn repoCountBySource(ptr: *anyopaque, alloc: Allocator) anyerror![]types.SourceCount {
+        const self: *PostgresStore = @ptrCast(@alignCast(ptr));
+        return self.countBySource(alloc);
+    }
+
+    fn repoDeinit(ptr: *anyopaque) void {
+        const self: *PostgresStore = @ptrCast(@alignCast(ptr));
+        self.deinit();
+    }
+
+    /// Get a live client, reconnecting if the previous one died.
+    /// Caller must hold `mutex`.
+    fn ensureClient(self: *PostgresStore) !*PgClient {
+        if (self.client == null) {
+            self.client = try PgClient.connect(self.alloc, self.io, self.conninfo);
+        }
+        return &self.client.?;
+    }
+
+    /// Drop the current connection; the next call reconnects.
+    /// Caller must hold `mutex`.
+    fn dropClient(self: *PostgresStore) void {
+        if (self.client) |*c| c.close();
+        self.client = null;
+    }
+
+    pub fn insertDocument(self: *PostgresStore, doc: types.Document) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const client = self.ensureClient() catch |err| return err;
+        self.insertDocumentLocked(client, doc) catch |err| {
+            self.dropClient();
+            return err;
+        };
+    }
+
+    fn insertDocumentLocked(self: *PostgresStore, client: *PgClient, doc: types.Document) !void {
+        const a = self.alloc;
+        // The source row must exist for the FK; the feed URL is unknown here,
+        // so the source home URL stands in for it.
+        const esc_src_id = try escapeLiteral(a, doc.source_id);
+        defer a.free(esc_src_id);
+        const esc_src_name = try escapeLiteral(a, doc.source_name);
+        defer a.free(esc_src_name);
+        const esc_src_url = try escapeLiteral(a, doc.source_url);
+        defer a.free(esc_src_url);
+        const src_sql = try std.fmt.allocPrint(a,
+            \\INSERT INTO sources (id, name, home_url, feed_url, reliability)
+            \\VALUES ({s}, {s}, {s}, {s}, {d}) ON CONFLICT (id) DO NOTHING
+        , .{
+            esc_src_id,
+            esc_src_name,
+            esc_src_url,
+            esc_src_url,
+            doc.reliability,
+        });
+        defer a.free(src_sql);
+        try client.exec(a, src_sql);
+
+        const published = if (doc.published_at) |ts|
+            try std.fmt.allocPrint(a, "to_timestamp({d})", .{ts})
+        else
+            try a.dupe(u8, "NULL");
+        defer a.free(published);
+        const fetched = try std.fmt.allocPrint(a, "to_timestamp({d})", .{doc.fetched_at});
+        defer a.free(fetched);
+
+        var topics_sql: std.ArrayList(u8) = .empty;
+        defer topics_sql.deinit(a);
+        if (doc.topics.len == 0) {
+            try topics_sql.appendSlice(a, "'{}'");
+        } else {
+            try topics_sql.appendSlice(a, "ARRAY[");
+            for (doc.topics, 0..) |t, i| {
+                if (i > 0) try topics_sql.appendSlice(a, ", ");
+                try appendEscapedLiteral(&topics_sql, a, t);
+            }
+            try topics_sql.appendSlice(a, "]::text[]");
+        }
+
+        const esc_doc_id = try escapeLiteral(a, doc.id);
+        defer a.free(esc_doc_id);
+        const esc_doc_title = try escapeLiteral(a, doc.title);
+        defer a.free(esc_doc_title);
+        const esc_doc_url = try escapeLiteral(a, doc.url);
+        defer a.free(esc_doc_url);
+        const esc_doc_text = try escapeLiteral(a, doc.text);
+        defer a.free(esc_doc_text);
+        const esc_doc_hash = try escapeLiteral(a, doc.content_hash);
+        defer a.free(esc_doc_hash);
+        const doc_sql = try std.fmt.allocPrint(a,
+            \\INSERT INTO documents
+            \\  (id, source_id, title, url, text, published_at, fetched_at,
+            \\   reliability, topics, content_hash)
+            \\VALUES ({s}, {s}, {s}, {s}, {s}, {s}, {s}, {d}, {s}, {s})
+            \\ON CONFLICT (id) DO NOTHING
+        , .{
+            esc_doc_id,
+            esc_src_id,
+            esc_doc_title,
+            esc_doc_url,
+            esc_doc_text,
+            published,
+            fetched,
+            doc.reliability,
+            topics_sql.items,
+            esc_doc_hash,
+        });
+        defer a.free(doc_sql);
+        try client.exec(a, doc_sql);
+    }
+
+    /// Coarse candidate retrieval (the engine ranks afterwards). Matches any
+    /// of `q.terms` via FTS (`websearch_to_tsquery` over `search_vector`)
+    /// OR per-term ILIKE on title/text, up to 100 rows, newest first.
+    /// Filters: topics use the `topics` array overlap; organizations match
+    /// `source_id` or source name; counties have no column in the schema, so
+    /// they match as ILIKE terms against title/text (coarse fallback).
+    pub fn search(self: *PostgresStore, alloc: Allocator, q: types.SearchQuery) ![]types.Document {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const client = try self.ensureClient();
+        const docs = self.searchLocked(client, alloc, q) catch |err| {
+            self.dropClient();
+            return err;
+        };
+        return docs;
+    }
+
+    fn searchLocked(self: *PostgresStore, client: *PgClient, alloc: Allocator, q: types.SearchQuery) ![]types.Document {
+        _ = self;
+        const limit = if (q.limit == 0) 100 else @min(q.limit, 100);
+        var sql: std.ArrayList(u8) = .empty;
+        defer sql.deinit(alloc);
+        try sql.appendSlice(alloc,
+            \\SELECT d.id, d.source_id, s.name, s.home_url, d.title, d.url, d.text,
+            \\  extract(epoch from d.published_at)::bigint,
+            \\  extract(epoch from d.fetched_at)::bigint,
+            \\  d.reliability, d.topics, d.content_hash
+            \\FROM documents d JOIN sources s ON s.id = d.source_id
+        );
+
+        var where: std.ArrayList(u8) = .empty;
+        defer where.deinit(alloc);
+        if (q.terms.len > 0) {
+            // FTS over the joined terms, OR per-term ILIKE fallback.
+            const joined = try std.mem.join(alloc, " ", q.terms);
+            defer alloc.free(joined);
+            try where.appendSlice(alloc, "(d.search_vector @@ websearch_to_tsquery('english', ");
+            try appendEscapedLiteral(&where, alloc, joined);
+            try where.appendSlice(alloc, ")");
+            for (q.terms) |term| {
+                try where.appendSlice(alloc, " OR d.title ILIKE ");
+                try appendLikeLiteral(&where, alloc, term);
+                try where.appendSlice(alloc, " OR d.text ILIKE ");
+                try appendLikeLiteral(&where, alloc, term);
+            }
+            try where.appendSlice(alloc, ")");
+        }
+        if (q.organizations.len > 0) {
+            if (where.items.len > 0) try where.appendSlice(alloc, " AND ");
+            try where.appendSlice(alloc, "(");
+            for (q.organizations, 0..) |org, i| {
+                if (i > 0) try where.appendSlice(alloc, " OR ");
+                try where.appendSlice(alloc, "d.source_id = ");
+                try appendEscapedLiteral(&where, alloc, org);
+                try where.appendSlice(alloc, " OR s.name ILIKE ");
+                try appendLikeLiteral(&where, alloc, org);
+            }
+            try where.appendSlice(alloc, ")");
+        }
+        if (q.topics.len > 0) {
+            if (where.items.len > 0) try where.appendSlice(alloc, " AND ");
+            try where.appendSlice(alloc, "d.topics && ARRAY[");
+            for (q.topics, 0..) |t, i| {
+                if (i > 0) try where.appendSlice(alloc, ", ");
+                try appendEscapedLiteral(&where, alloc, t);
+            }
+            try where.appendSlice(alloc, "]::text[]");
+        }
+        if (q.counties.len > 0) {
+            // No county column exists on documents; coarse text match.
+            if (where.items.len > 0) try where.appendSlice(alloc, " AND ");
+            try where.appendSlice(alloc, "(");
+            for (q.counties, 0..) |county, i| {
+                if (i > 0) try where.appendSlice(alloc, " OR ");
+                try where.appendSlice(alloc, "d.title ILIKE ");
+                try appendLikeLiteral(&where, alloc, county);
+                try where.appendSlice(alloc, " OR d.text ILIKE ");
+                try appendLikeLiteral(&where, alloc, county);
+            }
+            try where.appendSlice(alloc, ")");
+        }
+        if (where.items.len > 0) {
+            try sql.appendSlice(alloc, " WHERE ");
+            try sql.appendSlice(alloc, where.items);
+        }
+        const tail = try std.fmt.allocPrint(alloc, " ORDER BY d.fetched_at DESC LIMIT {d}", .{limit});
+        defer alloc.free(tail);
+        try sql.appendSlice(alloc, tail);
+
+        var res = try client.query(alloc, sql.items);
+        defer res.deinit(alloc);
+        var docs = try alloc.alloc(types.Document, res.rows.len);
+        for (res.rows, 0..) |row, i| {
+            docs[i] = try documentFromRow(alloc, row);
+        }
+        return docs;
+    }
+
+    fn documentFromRow(alloc: Allocator, row: Row) !types.Document {
+        if (row.cols.len != 12) return error.ProtocolError;
+        const c = row.cols;
+        const req = struct {
+            fn text(cols: []?[]const u8, idx: usize) ![]const u8 {
+                return cols[idx] orelse return error.ProtocolError;
+            }
+        }.text;
+        return .{
+            .id = try alloc.dupe(u8, try req(c, 0)),
+            .source_id = try alloc.dupe(u8, try req(c, 1)),
+            .source_name = try alloc.dupe(u8, try req(c, 2)),
+            .source_url = try alloc.dupe(u8, try req(c, 3)),
+            .title = try alloc.dupe(u8, try req(c, 4)),
+            .url = try alloc.dupe(u8, try req(c, 5)),
+            .text = try alloc.dupe(u8, try req(c, 6)),
+            .published_at = if (c[7]) |v| try std.fmt.parseInt(i64, v, 10) else null,
+            .fetched_at = try std.fmt.parseInt(i64, try req(c, 8), 10),
+            .reliability = try std.fmt.parseFloat(f32, try req(c, 9)),
+            .topics = try parseTextArray(alloc, c[10]),
+            .content_hash = try alloc.dupe(u8, try req(c, 11)),
+        };
+    }
+
+    pub fn countDocuments(self: *PostgresStore) usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const client = self.ensureClient() catch return 0;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const res = client.query(arena.allocator(), "SELECT count(*) FROM documents") catch {
+            self.dropClient();
+            return 0;
+        };
+        if (res.rows.len == 0) return 0;
+        const v = res.rows[0].cols[0] orelse return 0;
+        return std.fmt.parseInt(usize, v, 10) catch 0;
+    }
+
+    pub fn countBySource(self: *PostgresStore, alloc: Allocator) ![]types.SourceCount {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const client = try self.ensureClient();
+        var res = client.query(alloc,
+            "SELECT source_id, count(*) FROM documents GROUP BY source_id ORDER BY count(*) DESC",
+        ) catch |err| {
+            self.dropClient();
+            return err;
+        };
+        defer res.deinit(alloc);
+        var out = try alloc.alloc(types.SourceCount, res.rows.len);
+        for (res.rows, 0..) |row, i| {
+            if (row.cols.len != 2) return error.ProtocolError;
+            out[i] = .{
+                .source_id = try alloc.dupe(u8, row.cols[0] orelse return error.ProtocolError),
+                .count = std.fmt.parseInt(usize, row.cols[1] orelse return error.ProtocolError, 10) catch
+                    return error.ProtocolError,
+            };
+        }
+        return out;
+    }
+};
+
+/// Parse a PostgreSQL TEXT[] literal: `{a,b,c}`, `{}` for empty, NULL -> empty.
+/// Topic values are taxonomy slugs (no commas/quotes), so a plain split is
+/// exact for this schema.
+fn parseTextArray(alloc: Allocator, val: ?[]const u8) ![]const []const u8 {
+    const s = val orelse return &.{};
+    if (s.len < 2 or s[0] != '{' or s[s.len - 1] != '}') return error.ProtocolError;
+    const inner = s[1 .. s.len - 1];
+    if (inner.len == 0) return &.{};
+    var out: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, inner, ',');
+    while (it.next()) |elem| {
+        if (elem.len == 0) continue;
+        try out.append(alloc, try alloc.dupe(u8, elem));
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+const testing = std.testing;
+
+test "postgres: startup message bytes" {
+    const alloc = testing.allocator;
+    const msg = try buildStartupMessage(alloc, "postgres", "pulse");
+    defer alloc.free(msg);
+    // int32 len=38 | int32 196608 | "user\0postgres\0database\0pulse\0\0"
+    const want = [_]u8{ 0, 0, 0, 38, 0, 3, 0, 0 } ++
+        "user\x00postgres\x00database\x00pulse\x00\x00";
+    try testing.expectEqualSlices(u8, want[0..], msg);
+}
+
+test "postgres: md5 password response" {
+    const alloc = testing.allocator;
+    // Ground truth computed with Python hashlib (see task notes):
+    // md5("secret"+"postgres") = 53f48b7c..., outer over salt 01 02 03 04.
+    const resp = try md5PasswordResponse(alloc, "secret", "postgres", .{ 1, 2, 3, 4 });
+    defer alloc.free(resp);
+    try testing.expectEqualStrings("md5bb41a296aab6baccb36ff243a562abff", resp);
+}
+
+test "postgres: pbkdf2-sha256 matches RFC 6070 vectors" {
+    var out: [32]u8 = undefined;
+    pbkdf2Sha256("password", "salt", 1, &out);
+    try testing.expectEqualStrings(
+        "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b",
+        &std.fmt.bytesToHex(out, .lower),
+    );
+    pbkdf2Sha256("password", "salt", 2, &out);
+    try testing.expectEqualStrings(
+        "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43",
+        &std.fmt.bytesToHex(out, .lower),
+    );
+    pbkdf2Sha256("password", "salt", 4096, &out);
+    try testing.expectEqualStrings(
+        "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a",
+        &std.fmt.bytesToHex(out, .lower),
+    );
+}
+
+test "postgres: scram client-first message format" {
+    const alloc = testing.allocator;
+    // Fixed nonce so the message is deterministic.
+    const bare = try buildClientFirstBare(alloc, "postgres", "rOprNGfwEbeRWgbNEkqO");
+    defer alloc.free(bare);
+    try testing.expectEqualStrings("n=postgres,r=rOprNGfwEbeRWgbNEkqO", bare);
+
+    const escaped = try buildClientFirstBare(alloc, "a=b,c", "AAAAAAAAAAAAAAAAAAAAAA==");
+    defer alloc.free(escaped);
+    try testing.expectEqualStrings("n=a=3Db=2Cc,r=AAAAAAAAAAAAAAAAAAAAAA==", escaped);
+
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    var st = try ScramState.init(alloc, threaded.io(), "postgres");
+    defer st.deinit(alloc);
+    try testing.expect(std.mem.startsWith(u8, st.client_first, "n,,n=postgres,r="));
+    try testing.expectEqual(@as(usize, 24), st.client_nonce_b64.len);
+}
+
+test "postgres: escapeLiteral" {
+    const alloc = testing.allocator;
+    const cases = [_]struct { in: []const u8, want: []const u8 }{
+        .{ .in = "", .want = "''" },
+        .{ .in = "plain", .want = "'plain'" },
+        .{ .in = "o'clock", .want = "'o''clock'" },
+        .{ .in = "back\\slash", .want = "'back\\slash'" }, // backslashes stay literal
+        .{ .in = "100%_x", .want = "'100%_x'" },
+    };
+    for (cases) |c| {
+        const got = try escapeLiteral(alloc, c.in);
+        defer alloc.free(got);
+        try testing.expectEqualStrings(c.want, got);
+    }
+    // Two single quotes -> each doubled, inside quotes: ''''''
+    const q = try escapeLiteral(alloc, "''");
+    defer alloc.free(q);
+    try testing.expectEqualStrings("''''''", q);
+}
+
+test "postgres: escapeLikePattern" {
+    const alloc = testing.allocator;
+    const got = try escapeLikePattern(alloc, "50%_off\\sale");
+    defer alloc.free(got);
+    try testing.expectEqualStrings("50\\%\\_off\\\\sale", got);
+}
+
+test "postgres: escapeIdent rejects unsafe names" {
+    const alloc = testing.allocator;
+    const ok = try escapeIdent(alloc, "documents");
+    defer alloc.free(ok);
+    try testing.expectEqualStrings("\"documents\"", ok);
+    try testing.expectError(error.InvalidConnInfo, escapeIdent(alloc, "a; DROP TABLE x"));
+    try testing.expectError(error.InvalidConnInfo, escapeIdent(alloc, "9lives"));
+    try testing.expectError(error.InvalidConnInfo, escapeIdent(alloc, ""));
+}
+
+test "postgres: parseConnInfo" {
+    const alloc = testing.allocator;
+
+    var full = try parseConnInfo(alloc, "postgres://bob:s3cret@db.example.com:5433/pulse?sslmode=disable");
+    defer full.deinit(alloc);
+    try testing.expectEqualStrings("bob", full.user);
+    try testing.expectEqualStrings("s3cret", full.password.?);
+    try testing.expectEqualStrings("db.example.com", full.host);
+    try testing.expectEqual(@as(u16, 5433), full.port);
+    try testing.expectEqualStrings("pulse", full.database);
+    try testing.expectEqual(SslMode.disable, full.sslmode);
+
+    // Defaults: no port, no db, no password, no sslmode.
+    var def = try parseConnInfo(alloc, "postgres://alice@localhost");
+    defer def.deinit(alloc);
+    try testing.expectEqualStrings("alice", def.user);
+    try testing.expectEqual(@as(?[]const u8, null), def.password);
+    try testing.expectEqualStrings("localhost", def.host);
+    try testing.expectEqual(@as(u16, 5432), def.port);
+    try testing.expectEqualStrings("alice", def.database); // db defaults to user
+    try testing.expectEqual(SslMode.prefer, def.sslmode);
+
+    // Missing password + missing user/host: everything defaults.
+    var bare = try parseConnInfo(alloc, "postgres://");
+    defer bare.deinit(alloc);
+    try testing.expectEqualStrings("postgres", bare.user);
+    try testing.expectEqualStrings("localhost", bare.host);
+    try testing.expectEqual(@as(u16, 5432), bare.port);
+    try testing.expectEqualStrings("postgres", bare.database);
+
+    // Percent-decoding in user/password/db.
+    var pct = try parseConnInfo(alloc, "postgres://us%40er:p%40ss@h:5432/d%20b");
+    defer pct.deinit(alloc);
+    try testing.expectEqualStrings("us@er", pct.user);
+    try testing.expectEqualStrings("p@ss", pct.password.?);
+    try testing.expectEqualStrings("d b", pct.database);
+
+    // postgresql:// scheme + sslmode=require parses (connect refuses it).
+    var req = try parseConnInfo(alloc, "postgresql://u:p@h/db?sslmode=require");
+    defer req.deinit(alloc);
+    try testing.expectEqual(SslMode.require, req.sslmode);
+
+    // Invalid port: out of range, non-numeric, empty.
+    try testing.expectError(error.InvalidPort, parseConnInfo(alloc, "postgres://u:p@h:99999/db"));
+    try testing.expectError(error.InvalidPort, parseConnInfo(alloc, "postgres://u:p@h:abc/db"));
+    try testing.expectError(error.InvalidPort, parseConnInfo(alloc, "postgres://u:p@h:/db"));
+
+    // Wrong scheme / no scheme.
+    try testing.expectError(error.InvalidConnInfo, parseConnInfo(alloc, "mysql://u:p@h/db"));
+    try testing.expectError(error.InvalidConnInfo, parseConnInfo(alloc, "u:p@h/db"));
+}
+
+test "postgres: parseConnInfo logTarget never includes the password" {
+    const alloc = testing.allocator;
+    var info = try parseConnInfo(alloc, "postgres://bob:s3cret@db.example.com:5433/pulse");
+    defer info.deinit(alloc);
+    const t = try info.logTarget(alloc);
+    defer alloc.free(t);
+    try testing.expectEqualStrings("db.example.com:5433/pulse", t);
+    try testing.expect(std.mem.indexOf(u8, t, "s3cret") == null);
+}
+
+test "postgres: parseTextArray" {
+    const alloc = testing.allocator;
+    const empty = try parseTextArray(alloc, "{}");
+    try testing.expectEqual(@as(usize, 0), empty.len);
+    const none = try parseTextArray(alloc, null);
+    try testing.expectEqual(@as(usize, 0), none.len);
+    const two = try parseTextArray(alloc, "{energy,politics}");
+    defer {
+        for (two) |e| alloc.free(e);
+        alloc.free(two);
+    }
+    try testing.expectEqual(@as(usize, 2), two.len);
+    try testing.expectEqualStrings("energy", two[0]);
+    try testing.expectEqualStrings("politics", two[1]);
+    try testing.expectError(error.ProtocolError, parseTextArray(alloc, "not-an-array"));
+}
+
+/// Read one variable from the process environment without libc.
+/// Zig 0.17 std has no getenv without linking libc, so the live test reads
+/// /proc/self/environ directly (Linux-only; the live test is dev-only).
+fn getTestEnvVar(alloc: Allocator, io: std.Io, name: []const u8) !?[]u8 {
+    const proc_dir = std.Io.Dir.openDirAbsolute(io, "/proc/self", .{}) catch return null;
+    defer proc_dir.close(io);
+    var file = proc_dir.openFile(io, "environ", .{}) catch return null;
+    defer file.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var reader = file.reader(io, &rbuf);
+    const bytes = reader.interface.readAllocShort(alloc, 1 << 20) catch return null;
+    defer alloc.free(bytes);
+    var it = std.mem.splitScalar(u8, bytes, 0);
+    while (it.next()) |entry| {
+        if (std.mem.startsWith(u8, entry, name) and entry.len > name.len and entry[name.len] == '=') {
+            return try alloc.dupe(u8, entry[name.len + 1 ..]);
+        }
+    }
+    return null;
+}
+
+test "postgres: server dying mid-handshake fails cleanly" {
+    // Guards the connect() errdefer ownership: an auth-phase failure must
+    // return an error, not crash on a double free of the ConnInfo strings.
+    const alloc = testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 18777);
+    var server = std.Io.net.IpAddress.listen(&addr, io, .{ .reuse_address = true }) catch |err| {
+        std.debug.print("skip: cannot bind test listener: {any}\n", .{err});
+        return;
+    };
+    defer server.deinit(io);
+
+    const Acceptor = struct {
+        fn run(srv: *std.Io.net.Server, io2: std.Io) void {
+            var conn = srv.accept(io2) catch return;
+            conn.close(io2); // die immediately, mid-handshake
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Acceptor.run, .{ &server, io });
+    const result = PgClient.connect(alloc, io, "postgres://postgres:pw@127.0.0.1:18777/pulse");
+    t.join();
+    // The server closed before sending anything: the client must fail
+    // (EOF / reset), never succeed and never crash (no double free of
+    // the ConnInfo strings on the auth-phase error path).
+    if (result) |c| {
+        var cl = c;
+        cl.close();
+        return error.TestUnexpectedResult;
+    } else |_| {
+        // Any error is fine (EOF/reset); the point is no crash/double-free.
+    }
+}
+
+test "postgres: live" {
+    const alloc = testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const url = (try getTestEnvVar(alloc, io, "PULSE_TEST_POSTGRES_URL")) orelse {
+        std.debug.print("skip: PULSE_TEST_POSTGRES_URL not set\n", .{});
+        return;
+    };
+    defer alloc.free(url);
+
+    var client = PgClient.connect(alloc, io, url) catch |err| {
+        std.debug.print("live test: connect failed: {any}\n", .{err});
+        return err;
+    };
+    defer client.close();
+
+    try client.ping();
+    try runMigrations(alloc, io, url, "/home/hatch/workspace/pulse/migrations");
+
+    // Insert a test document and read it back.
+    var store = PostgresStore.init(alloc, io, url) catch |err| {
+        std.debug.print("live test: store init failed: {any}\n", .{err});
+        return err;
+    };
+    defer store.deinit();
+
+    const id = try types.contentHash(alloc, "new-dawn", "https://example.com/pg-test", "Pulse PG live test");
+    defer alloc.free(id);
+    const doc = types.Document{
+        .id = id,
+        .source_id = "new-dawn",
+        .source_name = "New Dawn",
+        .source_url = "https://thenewdawnliberia.com/",
+        .title = "Pulse PG live test",
+        .url = "https://example.com/pg-test",
+        .text = "A unique zebraquux marker for the live test.",
+        .published_at = null,
+        .fetched_at = 1762953600,
+        .reliability = 0.70,
+        .topics = &.{"politics"},
+        .content_hash = id,
+    };
+    var repo = store.repository();
+    try repo.insertDocument(doc);
+    // Idempotent re-insert must not error or duplicate.
+    try repo.insertDocument(doc);
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const found = try repo.search(arena.allocator(), .{ .terms = &.{"zebraquux"}, .limit = 10 });
+    try testing.expect(found.len >= 1);
+    var saw_it = false;
+    for (found) |d| {
+        if (std.mem.eql(u8, d.id, id)) saw_it = true;
+    }
+    try testing.expect(saw_it);
+
+    try testing.expect(repo.countDocuments() >= 1);
+    const by_source = try repo.countBySource(arena.allocator());
+    try testing.expect(by_source.len >= 1);
+
+    // Migrations are idempotent: a second run must not error.
+    try runMigrations(alloc, io, url, "/home/hatch/workspace/pulse/migrations");
+}

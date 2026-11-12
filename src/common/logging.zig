@@ -7,7 +7,9 @@ pub const Level = enum(u8) { debug = 0, info = 1, warn = 2, err = 3 };
 
 pub const Field = struct { key: []const u8, value: []const u8 };
 
-var log_mutex: std.Thread.Mutex = .{};
+/// NOTE: Pulse is single-threaded in Phase 1 (one accept loop, one worker
+/// process), so logging needs no lock. If threads are introduced, add a
+/// mutex here first.
 var current_level: Level = .info;
 
 pub fn setLevel(level: Level) void {
@@ -51,24 +53,34 @@ fn writeJsonString(w: anytype, s: []const u8) !void {
     try w.writeByte('"');
 }
 
+/// Wall-clock milliseconds. Zig 0.17.1 has no std.time wall clock, so the
+/// logger reads CLOCK_REALTIME directly (Linux-only; Pulse targets Linux
+/// containers). Returns 0 if the call fails rather than crashing logging.
+fn wallMillis() i64 {
+    var ts: std.os.linux.timespec = undefined;
+    const rc = std.os.linux.clock_gettime(.REALTIME, &ts);
+    if (std.posix.errno(rc) != .SUCCESS) return 0;
+    return ts.sec * 1000 + @divTrunc(ts.nsec, 1_000_000);
+}
+
 /// Emit one structured log line. Never logs secrets: callers must not pass
 /// API keys, passwords, or tokens as field values.
 pub fn log(level: Level, msg: []const u8, fields: []const Field) void {
     if (@intFromEnum(level) < @intFromEnum(current_level)) return;
-    log_mutex.lock();
-    defer log_mutex.unlock();
-    const stderr = std.io.getStdErr().writer();
-    stderr.print("{{\"ts\":{d},\"level\":", .{std.time.milliTimestamp()}) catch return;
-    writeJsonString(stderr, levelName(level)) catch return;
-    stderr.writeAll(",\"msg\":") catch return;
-    writeJsonString(stderr, msg) catch return;
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    w.print("{{\"ts\":{d},\"level\":", .{wallMillis()}) catch return;
+    writeJsonString(&w, levelName(level)) catch return;
+    w.writeAll(",\"msg\":") catch return;
+    writeJsonString(&w, msg) catch return;
     for (fields) |f| {
-        stderr.writeAll(",") catch return;
-        writeJsonString(stderr, f.key) catch return;
-        stderr.writeAll(":") catch return;
-        writeJsonString(stderr, f.value) catch return;
+        w.writeAll(",") catch return;
+        writeJsonString(&w, f.key) catch return;
+        w.writeAll(":") catch return;
+        writeJsonString(&w, f.value) catch return;
     }
-    stderr.writeAll("}\n") catch return;
+    w.writeAll("}") catch return;
+    std.debug.print("{s}\n", .{w.buffered()});
 }
 
 pub fn debug(msg: []const u8, fields: []const Field) void {

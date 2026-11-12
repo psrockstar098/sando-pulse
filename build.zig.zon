@@ -1,7 +1,7 @@
 .{
     .name = .pulse,
     .version = "0.1.0",
-    .fingerprint = 0x70756c73652d7031,
+    .fingerprint = 0x1b16cada73ffbed3,
     .minimum_zig_version = "0.17.1",
     .dependencies = .{},
     .paths = .{

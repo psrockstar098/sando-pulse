@@ -1,0 +1,183 @@
+# Sando Pulse — Roadmap 1 stack.
+# Authored for a real Docker host (Dominic's machine / production).
+# Only the API port (9000) is published; everything else talks on the
+# internal pulse-net network. Dev-only ports (Grafana 3000, Prometheus 9090,
+# MinIO console 9001) are commented out below — uncomment for local dev.
+# Secrets come from the environment / a gitignored .env file — NEVER from
+# this file. Copy .env.example to .env and fill it in.
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: pulse-api:0.1.0
+    command: ["serve"]
+    environment:
+      PULSE_HOST: "0.0.0.0"
+      PULSE_PORT: "9000"
+      PULSE_API_KEY: "${PULSE_API_KEY:-}"
+      PULSE_LOG_LEVEL: "${PULSE_LOG_LEVEL:-info}"
+      DATABASE_URL: "postgres://pulse:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/pulse"
+      REDIS_URL: "redis://redis:6379"
+      MINIO_ENDPOINT: "http://minio:9000"
+      MINIO_ACCESS_KEY: "${MINIO_ACCESS_KEY:?set MINIO_ACCESS_KEY in .env}"
+      MINIO_SECRET_KEY: "${MINIO_SECRET_KEY:?set MINIO_SECRET_KEY in .env}"
+      MINIO_BUCKET: "pulse-raw"
+    ports:
+      - "9000:9000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - pulse-net
+    restart: unless-stopped
+
+  worker:
+    image: pulse-api:0.1.0
+    command: ["worker"]
+    environment:
+      PULSE_HOST: "0.0.0.0"
+      PULSE_PORT: "9000"
+      PULSE_API_KEY: "${PULSE_API_KEY:-}"
+      PULSE_LOG_LEVEL: "${PULSE_LOG_LEVEL:-info}"
+      PULSE_INGEST_INTERVAL_S: "${PULSE_INGEST_INTERVAL_S:-300}"
+      DATABASE_URL: "postgres://pulse:${POSTGRES_PASSWORD}@postgres:5432/pulse"
+      REDIS_URL: "redis://redis:6379"
+      MINIO_ENDPOINT: "http://minio:9000"
+      MINIO_ACCESS_KEY: "${MINIO_ACCESS_KEY}"
+      MINIO_SECRET_KEY: "${MINIO_SECRET_KEY}"
+      MINIO_BUCKET: "pulse-raw"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - pulse-net
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pulse
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}"
+      POSTGRES_DB: pulse
+    volumes:
+      - pulse-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pulse -d pulse"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks:
+      - pulse-net
+    restart: unless-stopped
+
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - pulse-redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks:
+      - pulse-net
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ACCESS_KEY:?set MINIO_ACCESS_KEY in .env}"
+      MINIO_ROOT_PASSWORD: "${MINIO_SECRET_KEY:?set MINIO_SECRET_KEY in .env}"
+    volumes:
+      - pulse-miniodata:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks:
+      - pulse-net
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - pulse-promdata:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    # Dev only: uncomment to reach Prometheus directly.
+    # ports:
+    #   - "9090:9090"
+    depends_on:
+      - api
+      - postgres-exporter
+      - redis-exporter
+    networks:
+      - pulse-net
+    restart: unless-stopped
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:latest
+    environment:
+      DATA_SOURCE_NAME: "postgresql://pulse:${POSTGRES_PASSWORD}@postgres:5432/pulse?sslmode=disable"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - pulse-net
+    restart: unless-stopped
+
+  redis-exporter:
+    image: oliver006/redis_exporter:latest
+    environment:
+      REDIS_ADDR: "redis://redis:6379"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - pulse-net
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env for grafana}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/dashboards:/etc/grafana/dashboards:ro
+      - pulse-grafanadata:/var/lib/grafana
+    # Dev only: uncomment to reach Grafana directly.
+    # ports:
+    #   - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - pulse-net
+    restart: unless-stopped
+
+volumes:
+  pulse-pgdata:
+  pulse-redisdata:
+  pulse-miniodata:
+  pulse-promdata:
+  pulse-grafanadata:
+
+networks:
+  pulse-net:
+    driver: bridge
