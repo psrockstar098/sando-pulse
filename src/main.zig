@@ -28,6 +28,7 @@ const ratelimit = @import("api/ratelimit.zig");
 const metrics = @import("api/metrics.zig");
 const server = @import("api/server.zig");
 const worker = @import("workers/worker.zig");
+const providers = @import("ai/providers.zig");
 
 fn redisSinkPublish(ptr: *anyopaque, alloc: std.mem.Allocator, doc_id: []const u8, source_id: []const u8) anyerror!void {
     const bus: *redis.EventBus = @ptrCast(@alignCast(ptr));
@@ -149,9 +150,26 @@ pub fn main(init: std.process.Init) !void {
     var limiter = ratelimit.RateLimiter.init(alloc, cfg.rate_limit_per_minute, cfg.rate_limit_per_day);
     defer limiter.deinit();
 
+    // Embedding provider for semantic search + ingest-time embeddings.
+    // "local" (default) is a deterministic hashed lexical embedding;
+    // "external" needs PULSE_EMBEDDING_API_URL + KEY; "none" disables it.
+    const embedder = try providers.makeEmbeddingProvider(
+        alloc,
+        io,
+        cfg.embedding_provider,
+        cfg.embedding_api_url,
+        cfg.embedding_api_key,
+        cfg.embedding_model,
+        cfg.embedding_dims,
+        init.environ_map,
+    );
+    if (embedder == null and std.mem.eql(u8, cfg.embedding_provider, "external")) {
+        logging.warn("PULSE_EMBEDDING_PROVIDER=external but no URL/key set: semantic search disabled", &.{});
+    }
+
     if (is_worker) {
         if (once) {
-            const report = try worker.runOnce(alloc, io, repo, sink, if (archiver) |*a| a else null, &m, init.environ_map);
+            const report = try worker.runOnce(alloc, io, repo, sink, if (archiver) |*a| a else null, &m, init.environ_map, embedder);
             std.debug.print("ingest once: docs {d} -> {d}, {d} sources, had_error={}\n", .{
                 report.docs_before,
                 report.docs_after,
@@ -160,7 +178,7 @@ pub fn main(init: std.process.Init) !void {
             });
             return;
         }
-        try worker.runLoop(alloc, io, cfg, repo, sink, if (archiver) |*a| a else null, &m, init.environ_map);
+        try worker.runLoop(alloc, io, cfg, repo, sink, if (archiver) |*a| a else null, &m, init.environ_map, embedder);
         return;
     }
 
@@ -173,6 +191,7 @@ pub fn main(init: std.process.Init) !void {
         .metrics = &m,
         .limiter = &limiter,
         .sink = sink,
+        .embedder = embedder,
     };
     try srv.serve();
 }

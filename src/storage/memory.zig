@@ -46,6 +46,7 @@ pub const MemoryStore = struct {
         for (d.topics) |t| alloc.free(t);
         alloc.free(d.topics);
         alloc.free(d.content_hash);
+        if (d.embedding) |e| alloc.free(e);
     }
 
     fn dupeDocument(alloc: std.mem.Allocator, d: types.Document) !types.Document {

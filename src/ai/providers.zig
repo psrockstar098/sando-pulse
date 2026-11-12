@@ -128,8 +128,10 @@ pub const ExternalEmbedding = struct {
         const self: *ExternalEmbedding = @ptrCast(@alignCast(ptr));
         const url = try std.fmt.allocPrint(alloc, "{s}/embeddings", .{self.base_url});
         defer alloc.free(url);
-        const req = try std.json.stringifyAlloc(alloc, .{ .model = self.model_name, .input = text }, .{});
-        defer alloc.free(req);
+        var aw: std.Io.Writer.Allocating = .init(alloc);
+        defer aw.deinit();
+        try std.json.Stringify.value(.{ .model = self.model_name, .input = text }, .{}, &aw.writer);
+        const req = try aw.toOwnedSlice();
         var res = try fetchers.postJson(alloc, self.io, url, req, self.api_key, self.environ);
         defer res.deinit(alloc);
         if (res.status != 200) return error.EmbeddingApiFailed;
@@ -162,6 +164,42 @@ pub const ExternalEmbedding = struct {
 
     fn deinitFn(_: *anyopaque, _: std.mem.Allocator) void {}
 };
+
+/// Build the configured embedding provider. "none" returns null (keyword
+/// search only). "external" needs both a URL and a key and returns null
+/// without them. Anything else (including the "local" default) returns the
+/// local hashed lexical embedding. The concrete provider structs are
+/// allocated from `alloc` and borrowed by the returned value — in main they
+/// live in the process arena, so they outlive the server/worker.
+pub fn makeEmbeddingProvider(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    provider_name: []const u8,
+    api_url: ?[]const u8,
+    api_key: ?[]const u8,
+    model: []const u8,
+    dims: usize,
+    environ: ?*const std.process.Environ.Map,
+) !?EmbeddingProvider {
+    if (std.mem.eql(u8, provider_name, "none")) return null;
+    if (std.mem.eql(u8, provider_name, "external")) {
+        const url = api_url orelse return null;
+        const key = api_key orelse return null;
+        const ext = try alloc.create(ExternalEmbedding);
+        ext.* = .{
+            .base_url = url,
+            .model_name = model,
+            .api_key = key,
+            .dims_count = dims,
+            .io = io,
+            .environ = environ,
+        };
+        return ext.provider();
+    }
+    const local = try alloc.create(LocalHashEmbedding);
+    local.* = .{ .dims_count = dims };
+    return local.provider();
+}
 
 /// ---------------------------------------------------------------------------
 /// Summarization providers

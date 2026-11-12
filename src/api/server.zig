@@ -17,8 +17,10 @@ const repository = @import("../storage/repository.zig");
 const planner = @import("../engine/planner.zig");
 const search = @import("../engine/search.zig");
 const entities = @import("../engine/entities.zig");
+const geo = @import("../engine/geo.zig");
 const sources = @import("../ingestion/sources.zig");
 const pipeline = @import("../ingestion/pipeline.zig");
+const providers = @import("../ai/providers.zig");
 const auth = @import("auth.zig");
 const ratelimit = @import("ratelimit.zig");
 const metrics = @import("metrics.zig");
@@ -34,6 +36,9 @@ pub const Server = struct {
     metrics: *metrics.Metrics,
     limiter: *ratelimit.RateLimiter,
     sink: ?pipeline.EventSink,
+    /// Embedding provider for semantic search + ingest-time embeddings.
+    /// Null when PULSE_EMBEDDING_PROVIDER=none (or external without keys).
+    embedder: ?providers.EmbeddingProvider = null,
 
     pub fn serve(self: *Server) !void {
         const addr = std.Io.net.IpAddress.parse(self.cfg.host, self.cfg.port) catch |e| {
@@ -237,7 +242,10 @@ pub const Server = struct {
                 self.respondError(req, alloc, req_id, .internal_server_error, "planner_failed", "Query planning failed");
                 return;
             };
-            const outcome = search.searchAndRank(alloc, self.repo, p, now) catch {
+            const outcome = search.searchAndRank(alloc, self.repo, p, now, .{
+                .embedder = self.embedder,
+                .tz_offset_minutes = self.cfg.tz_offset_minutes,
+            }) catch {
                 self.respondError(req, alloc, req_id, .internal_server_error, "search_failed", "Search failed");
                 return;
             };
@@ -269,7 +277,7 @@ pub const Server = struct {
                 self.respondError(req, alloc, req_id, .internal_server_error, "ingest_failed", "Failed to hash document");
                 return;
             };
-            const doc = types.Document{
+            var doc = types.Document{
                 .id = id,
                 .source_id = source.id,
                 .source_name = source.name,
@@ -283,6 +291,25 @@ pub const Server = struct {
                 .topics = ent.topics,
                 .content_hash = id,
             };
+            // Geo-tag from the extracted entities, same as the pipeline.
+            if (ent.cities.len > 0) {
+                if (geo.lookup(ent.cities[0])) |place| {
+                    doc.lat = place.lat;
+                    doc.lon = place.lon;
+                }
+            }
+            if (doc.lat == null and ent.counties.len > 0) {
+                if (geo.countyPoint(ent.counties[0])) |place| {
+                    doc.lat = place.lat;
+                    doc.lon = place.lon;
+                }
+            }
+            if (self.embedder) |emb| {
+                const capped = if (combined.len > 4000) combined[0..4000] else combined;
+                if (emb.embed(alloc, capped)) |vec| {
+                    doc.embedding = vec;
+                } else |_| {}
+            }
             self.repo.insertDocument(doc) catch {
                 self.respondError(req, alloc, req_id, .internal_server_error, "ingest_failed", "Failed to store document");
                 return;

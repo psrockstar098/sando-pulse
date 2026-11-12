@@ -15,6 +15,7 @@ const rss = @import("rss.zig");
 const fetchers = @import("fetchers.zig");
 const normalizer = @import("normalizer.zig");
 const object_store = @import("../storage/object_store.zig");
+const providers = @import("../ai/providers.zig");
 
 /// Publish one document-collected event. Implemented by the Redis EventBus
 /// (see storage/redis.zig); the pipeline only knows this interface so it
@@ -49,6 +50,7 @@ fn ingestOneSource(
     archiver: ?*object_store.S3Client,
     now: i64,
     environ: ?*const std.process.Environ.Map,
+    embedder: ?providers.EmbeddingProvider,
 ) SourceReport {
     const start = timex.nowMillis(io);
     var report = SourceReport{
@@ -79,10 +81,24 @@ fn ingestOneSource(
     };
     report.fetched = items.len;
     for (items) |item| {
-        const doc = normalizer.normalize(alloc, source, item, now) catch {
+        var doc = normalizer.normalize(alloc, source, item, now) catch {
             report.errors += 1;
             continue;
         };
+        // Ingest-time embedding: title + text, capped at 4000 bytes so an
+        // external API call stays cheap. A failed embedding never blocks
+        // the document — it is stored without one.
+        if (embedder) |emb| {
+            const full = std.mem.concat(alloc, u8, &.{ doc.title, " ", doc.text }) catch null;
+            if (full) |text| {
+                const capped = if (text.len > 4000) text[0..4000] else text;
+                if (emb.embed(alloc, capped)) |vec| {
+                    doc.embedding = vec;
+                } else |_| {
+                    logging.warn("ingest embedding failed", &.{.{ .key = "source", .value = source.id }});
+                }
+            }
+        }
         repo.insertDocument(doc) catch {
             report.errors += 1;
             continue;
@@ -105,6 +121,7 @@ pub fn runOnce(
     sink: ?EventSink,
     archiver: ?*object_store.S3Client,
     environ: ?*const std.process.Environ.Map,
+    embedder: ?providers.EmbeddingProvider,
 ) !IngestReport {
     const start = timex.nowMillis(io);
     const now = timex.nowSeconds(io);
@@ -113,7 +130,7 @@ pub fn runOnce(
     var had_error = false;
     for (sources.sources) |source| {
         if (!source.enabled) continue;
-        const r = ingestOneSource(alloc, io, repo, source, sink, archiver, now, environ);
+        const r = ingestOneSource(alloc, io, repo, source, sink, archiver, now, environ, embedder);
         if (r.errors > 0) had_error = true;
         logging.info("ingest source done", &.{
             .{ .key = "source", .value = source.id },

@@ -6,6 +6,7 @@ const format = @import("../common/format.zig");
 const types = @import("../common/types.zig");
 const planner = @import("../engine/planner.zig");
 const search = @import("../engine/search.zig");
+const temporal = @import("../engine/temporal.zig");
 const sources = @import("../ingestion/sources.zig");
 
 pub const QueryRequest = struct {
@@ -137,7 +138,18 @@ const ResultJson = struct {
         url: []const u8,
     },
     published_at: ?[]const u8,
-    score: f32,
+    score: f64,
+    /// Fused score (what the ranking actually used) + the keyword base
+    /// parts, so callers can see why a document ranked where it did.
+    score_parts: struct {
+        relevance: f64,
+        reliability: f64,
+        recency: f64,
+        context: f64,
+        coverage: f64,
+    },
+    fuzzy_score: ?f64 = null,
+    semantic_score: ?f64 = null,
 };
 
 const PlanJson = struct {
@@ -146,7 +158,26 @@ const PlanJson = struct {
     counties: []const []const u8,
     organizations: []const []const u8,
     time_range: ?[]const u8,
+    time_from: ?[]const u8 = null,
+    time_to: ?[]const u8 = null,
+    strategy: []const u8,
+    classification_confidence: f64,
     sources: []const []const u8,
+};
+
+const EventJson = struct {
+    id: []const u8,
+    title: []const u8,
+    topic: []const u8,
+    first_seen: []const u8,
+    last_seen: []const u8,
+    doc_count: usize,
+};
+
+const TimelineDayJson = struct {
+    day: []const u8,
+    doc_count: usize,
+    event_titles: []const []const u8,
 };
 
 pub fn buildQueryResponse(
@@ -167,7 +198,36 @@ pub fn buildQueryResponse(
             .url = r.doc.url,
             .source = .{ .name = r.doc.source_name, .url = r.doc.source_url },
             .published_at = if (r.doc.published_at) |ts| try formatIso(alloc, ts) else null,
-            .score = r.score.total,
+            .score = r.fused,
+            .score_parts = .{
+                .relevance = r.score.relevance,
+                .reliability = r.score.reliability,
+                .recency = r.score.recency,
+                .context = r.score.context,
+                .coverage = r.score.coverage,
+            },
+            .fuzzy_score = r.fuzzy_score,
+            .semantic_score = r.semantic_score,
+        });
+    }
+    var events: std.ArrayList(EventJson) = .empty;
+    for (outcome.events) |e| {
+        try events.append(alloc, .{
+            .id = e.id,
+            .title = e.title,
+            .topic = e.topic,
+            .first_seen = try formatIso(alloc, e.first_seen),
+            .last_seen = try formatIso(alloc, e.last_seen),
+            .doc_count = e.doc_count,
+        });
+    }
+    var timeline: std.ArrayList(TimelineDayJson) = .empty;
+    for (outcome.timeline) |d| {
+        const day_label = try temporal.describe(alloc, .{ .from = d.day_start, .to = d.day_start + 86400 }, 0);
+        try timeline.append(alloc, .{
+            .day = day_label,
+            .doc_count = d.doc_count,
+            .event_titles = d.event_titles,
         });
     }
     const resp = .{
@@ -177,12 +237,18 @@ pub fn buildQueryResponse(
         .insufficient_reason = outcome.insufficient_reason,
         .confidence = outcome.confidence,
         .results = results.items,
+        .events = events.items,
+        .timeline = timeline.items,
         .query_plan = PlanJson{
             .intent = p.intent,
             .topics = p.topics,
             .counties = p.counties,
             .organizations = p.organizations,
             .time_range = p.time_range,
+            .time_from = if (p.time_from) |ts| try formatIso(alloc, ts) else null,
+            .time_to = if (p.time_to) |ts| try formatIso(alloc, ts) else null,
+            .strategy = p.strategy,
+            .classification_confidence = p.classification_confidence,
             .sources = p.sources,
         },
         .meta = .{
