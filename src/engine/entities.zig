@@ -112,6 +112,16 @@ fn matchList(alloc: std.mem.Allocator, text_lower: []const u8, candidates: []con
     return out.toOwnedSlice(alloc);
 }
 
+/// Free the outer slices of an Entities value. The strings inside borrow
+/// the static tables and must NOT be freed.
+pub fn freeEntities(alloc: std.mem.Allocator, ent: Entities) void {
+    alloc.free(ent.counties);
+    alloc.free(ent.cities);
+    alloc.free(ent.organizations);
+    alloc.free(ent.people);
+    alloc.free(ent.topics);
+}
+
 /// Extract all known entities from `text`. Result slices reference the
 /// static tables above (except the outer slices, owned by `alloc`).
 /// `alloc` should be an arena: results borrow from it.

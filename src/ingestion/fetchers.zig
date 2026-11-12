@@ -18,6 +18,47 @@ const logging = @import("../common/logging.zig");
 
 pub const user_agent = "SandoPulse/0.1 (Liberia intelligence engine; research use)";
 
+/// HTTP method for a single exchange. GET is the ingestion path; POST is
+/// used by external AI provider adapters (embeddings / chat completions).
+pub const Method = enum { get, post };
+
+/// POST body options. `bearer` is sent as an Authorization header when set;
+/// the key itself never appears in logs.
+pub const PostBody = struct {
+    body: []const u8,
+    content_type: []const u8 = "application/json",
+    bearer: ?[]const u8 = null,
+};
+
+/// POST a JSON body and return the raw response (status + body). No redirect
+/// following: API endpoints answer directly, and a redirect of a POST must
+/// be the caller's explicit decision. Returns error.SourceUnavailable on
+/// transport failure; the caller checks `status` itself.
+pub fn postJson(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    url: []const u8,
+    body: []const u8,
+    bearer: ?[]const u8,
+    environ: ?*const std.process.Environ.Map,
+) !FetchResult {
+    const res = try fetchOnce(alloc, io, url, environ, .post, .{ .body = body, .bearer = bearer });
+    return res;
+}
+
+/// A single fetch result, shared by GET and POST. Public so provider
+/// adapters can read status + body.
+pub const FetchResult = struct {
+    status: u16,
+    location: ?[]u8, // owned, duped from the Location header (if any)
+    body: []u8, // owned
+
+    pub fn deinit(self: FetchResult, alloc: std.mem.Allocator) void {
+        alloc.free(self.body);
+        if (self.location) |loc| alloc.free(loc);
+    }
+};
+
 const max_redirects = 5;
 const max_response_bytes = 9 * 1024 * 1024; // head + body cap per fetch
 const max_head_bytes = 64 * 1024;
@@ -32,7 +73,7 @@ pub fn fetchFeed(alloc: std.mem.Allocator, io: std.Io, url: []const u8, environ:
     var cur = try alloc.dupe(u8, url);
     var hops: u8 = 0;
     while (true) {
-        const res = try fetchOnce(alloc, io, cur, environ);
+        const res = try fetchOnce(alloc, io, cur, environ, .get, null);
         if (res.status == 200) {
             if (res.location) |loc| alloc.free(loc);
             alloc.free(cur);
@@ -62,12 +103,6 @@ pub fn fetchFeed(alloc: std.mem.Allocator, io: std.Io, url: []const u8, environ:
         return error.SourceUnavailable;
     }
 }
-
-const FetchResult = struct {
-    status: u16,
-    location: ?[]u8, // owned, duped from the Location header (if any)
-    body: []u8, // owned
-};
 
 const ProxyCfg = struct {
     uri: std.Uri, // parsed proxy URL; borrows the environ string
@@ -122,8 +157,8 @@ fn resolveUrl(alloc: std.mem.Allocator, base: []const u8, loc: []const u8) ![]u8
     return std.fmt.allocPrint(alloc, "{s}://{s}{s}/{s}", .{ uri.scheme, try uri.host.?.toRawMaybeAlloc(alloc), path[0..dir_end], loc });
 }
 
-/// One GET, no redirect following. Returns the parsed status, Location and body.
-fn fetchOnce(alloc: std.mem.Allocator, io: std.Io, url: []const u8, environ: ?*const std.process.Environ.Map) !FetchResult {
+/// One request, no redirect following. Returns the parsed status, Location and body.
+fn fetchOnce(alloc: std.mem.Allocator, io: std.Io, url: []const u8, environ: ?*const std.process.Environ.Map, method: Method, post: ?PostBody) !FetchResult {
     const uri = std.Uri.parse(url) catch return error.SourceUnavailable;
     const is_https = if (std.ascii.eqlIgnoreCase(uri.scheme, "https"))
         true
@@ -176,13 +211,13 @@ fn fetchOnce(alloc: std.mem.Allocator, io: std.Io, url: []const u8, environ: ?*c
     }
 
     if (is_https) {
-        return fetchTls(alloc, io, &sreader, &swriter, host.bytes, target);
+        return fetchTls(alloc, io, &sreader, &swriter, host.bytes, target, method, post);
     }
     // Plain HTTP: absolute-URI form via proxy (with auth when configured),
     // origin-form direct.
     const absolute: ?[]const u8 = if (proxy != null) url else null;
     const auth: ?[]const u8 = if (proxy) |p| p.auth else null;
-    return exchange(alloc, &sreader.interface, &swriter.interface, target, host.bytes, port, absolute, auth, null);
+    return exchange(alloc, &sreader.interface, &swriter.interface, target, host.bytes, port, absolute, auth, null, method, post);
 }
 
 /// HTTPS exchange over an already-connected (and CONNECT-tunneled, if proxied)
@@ -194,6 +229,8 @@ fn fetchTls(
     swriter: *std.Io.net.Stream.Writer,
     host: []const u8,
     target: []const u8,
+    method: Method,
+    post: ?PostBody,
 ) !FetchResult {
     var bundle: std.crypto.Certificate.Bundle = .empty;
     defer bundle.deinit(alloc);
@@ -215,10 +252,10 @@ fn fetchTls(
         logging.warn("TLS handshake failed", &.{ .{ .key = "host", .value = host }, .{ .key = "error", .value = @errorName(e) } });
         return error.SourceUnavailable;
     };
-    return exchange(alloc, &tls.reader, &tls.writer, target, host, 443, null, null, swriter);
+    return exchange(alloc, &tls.reader, &tls.writer, target, host, 443, null, null, swriter, method, post);
 }
 
-/// Send one GET and read the whole response (Connection: close, so EOF ends
+/// Send one request and read the whole response (Connection: close, so EOF ends
 /// the body). `absolute` is the full URL for proxy absolute-URI form, or
 /// null for origin-form. Returns status, Location and body.
 fn exchange(
@@ -236,17 +273,36 @@ fn exchange(
     // this the server waits for a request that never arrives and answers
     // 408 (Daily Observer) or nothing at all (New Dawn).
     flush_underlying: ?*std.Io.net.Stream.Writer,
+    method: Method,
+    post: ?PostBody,
 ) !FetchResult {
     var req: std.Io.Writer.Allocating = .init(alloc);
     defer req.deinit();
     const req_target = absolute orelse target;
-    try req.writer.print("GET {s} HTTP/1.1\r\n", .{req_target});
+    switch (method) {
+        .get => try req.writer.print("GET {s} HTTP/1.1\r\n", .{req_target}),
+        .post => try req.writer.print("POST {s} HTTP/1.1\r\n", .{req_target}),
+    }
     if (port == 443 or port == 80) {
         try req.writer.print("Host: {s}\r\n", .{host});
     } else {
         try req.writer.print("Host: {s}:{d}\r\n", .{ host, port });
     }
     try req.writer.print("User-Agent: {s}\r\nAccept: */*\r\nConnection: close\r\n", .{user_agent});
+    if (method == .post) {
+        const body = if (post) |p| p.body else "";
+        const ctype = if (post) |p| p.content_type else "application/json";
+        try req.writer.print("Content-Type: {s}\r\nContent-Length: {d}\r\n", .{ ctype, body.len });
+        if (post) |p| {
+            if (p.bearer) |b| try req.writer.print("Authorization: Bearer {s}\r\n", .{b});
+        }
+    }
+    if (proxy_auth) |a| try req.writer.print("Proxy-Authorization: {s}\r\n", .{a});
+    try req.writer.writeAll("\r\n");
+    if (method == .post) {
+        const body = if (post) |p| p.body else "";
+        try req.writer.writeAll(body);
+    }
     if (proxy_auth) |a| try req.writer.print("Proxy-Authorization: {s}\r\n", .{a});
     try req.writer.writeAll("\r\n");
     writer.writeAll(req.written()) catch return error.SourceUnavailable;

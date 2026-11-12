@@ -25,12 +25,58 @@ pub const Document = struct {
 };
 
 /// Internal search request produced by the query planner.
+/// Geographic filter: documents linked to a place within `radius_km` of
+/// the point. Coordinates are decimal degrees (WGS-84).
+pub const GeoFilter = struct {
+    lat: f64,
+    lon: f64,
+    radius_km: f64,
+};
+
+/// A place linked to a document, with coordinates when known.
+pub const GeoPoint = struct {
+    location_id: []const u8,
+    name: []const u8,
+    lat: f64,
+    lon: f64,
+};
+
+/// A semantic-search hit: document id + cosine distance (0 = identical).
+pub const VectorHit = struct {
+    doc_id: []const u8,
+    distance: f64,
+};
+
+/// A clustered news event: a set of documents about the same happening.
+pub const Event = struct {
+    id: []const u8,
+    title: []const u8,
+    topic: []const u8,
+    first_seen: i64, // Unix seconds
+    last_seen: i64, // Unix seconds
+    doc_count: usize,
+};
+
+/// A single day in a timeline response.
+pub const TimelineDay = struct {
+    day_start: i64, // Unix seconds, local midnight
+    doc_count: usize,
+    event_titles: []const []const u8,
+};
+
 pub const SearchQuery = struct {
     terms: []const []const u8 = &.{},
     counties: []const []const u8 = &.{},
     organizations: []const []const u8 = &.{},
     topics: []const []const u8 = &.{},
     limit: usize = 10,
+    /// Optional half-open time window [from_ts, to_ts) in Unix seconds.
+    from_ts: ?i64 = null,
+    to_ts: ?i64 = null,
+    /// Geographic filter, when set.
+    geo: ?GeoFilter = null,
+    /// When true, also match trigram-similar terms (fuzzy search).
+    fuzzy: bool = false,
 };
 
 /// The planner's output: what the query means, in Pulse's own terms.

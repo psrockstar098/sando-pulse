@@ -17,6 +17,7 @@ pub const api_ratelimit = @import("api/ratelimit.zig");
 pub const api_server = @import("api/server.zig");
 pub const engine_entities = @import("engine/entities.zig");
 pub const engine_fuzzy = @import("engine/fuzzy.zig");
+pub const engine_geo = @import("engine/geo.zig");
 pub const engine_intent = @import("engine/intent.zig");
 pub const engine_planner = @import("engine/planner.zig");
 pub const engine_ranking = @import("engine/ranking.zig");
@@ -35,6 +36,7 @@ pub const storage_postgres = @import("storage/postgres.zig");
 pub const storage_redis = @import("storage/redis.zig");
 pub const storage_repository = @import("storage/repository.zig");
 pub const workers_worker = @import("workers/worker.zig");
+pub const ai_providers = @import("ai/providers.zig");
 
 test {
     std.testing.refAllDecls(@This());
