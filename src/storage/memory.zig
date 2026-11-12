@@ -7,6 +7,8 @@ const std = @import("std");
 const types = @import("../common/types.zig");
 const repository = @import("repository.zig");
 const entities = @import("../engine/entities.zig");
+const fuzzy = @import("../engine/fuzzy.zig");
+const geo = @import("../engine/geo.zig");
 
 pub const MemoryStore = struct {
     alloc: std.mem.Allocator,
@@ -77,8 +79,40 @@ pub const MemoryStore = struct {
         try self.docs.append(self.alloc, owned);
     }
 
+    /// True when `term` is trigram-similar (>= 0.5) to any word in `text`.
+    /// Used for fuzzy matching; exact-substring matches are checked first
+    /// by the caller, so this only runs on the typo path.
+    fn fuzzyTermMatches(alloc: std.mem.Allocator, term: []const u8, text_lower: []const u8) !bool {
+        var it = std.mem.tokenizeAny(u8, text_lower, " \t\n\r.,;:!?\"'()[]{}<>/-_");
+        while (it.next()) |word| {
+            if (word.len < 3) continue;
+            if (try fuzzy.isSimilar(alloc, term, word, 0.5)) return true;
+        }
+        return false;
+    }
+
     fn docMatches(alloc: std.mem.Allocator, doc: types.Document, q: types.SearchQuery) !bool {
-        // Term match: any term in title or text.
+        // Time window: a document's date is published_at, falling back to
+        // fetched_at for manually ingested docs (published_at null).
+        // The window is half-open [from_ts, to_ts).
+        if (q.from_ts != null or q.to_ts != null) {
+            const ts = doc.published_at orelse doc.fetched_at;
+            if (q.from_ts) |from| {
+                if (ts < from) return false;
+            }
+            if (q.to_ts) |to| {
+                if (ts >= to) return false;
+            }
+        }
+        // Geo radius: only documents with coordinates can match, and they
+        // must sit within radius_km of the filter point (haversine).
+        if (q.geo) |g| {
+            const lat = doc.lat orelse return false;
+            const lon = doc.lon orelse return false;
+            if (geo.haversineKm(g.lat, g.lon, lat, lon) > g.radius_km) return false;
+        }
+        // Term match: any term in title or text. With q.fuzzy, a term also
+        // matches a trigram-similar word (typo-tolerant, threshold 0.5).
         var term_ok = q.terms.len == 0;
         if (q.terms.len > 0) {
             const title_lower = try entities.lowerCopy(alloc, doc.title);
@@ -87,6 +121,12 @@ pub const MemoryStore = struct {
                 if (std.mem.indexOf(u8, title_lower, t) != null or std.mem.indexOf(u8, text_lower, t) != null) {
                     term_ok = true;
                     break;
+                }
+                if (q.fuzzy) {
+                    if (try fuzzyTermMatches(alloc, t, title_lower) or try fuzzyTermMatches(alloc, t, text_lower)) {
+                        term_ok = true;
+                        break;
+                    }
                 }
             }
         }
@@ -188,4 +228,63 @@ test "memory store insert is idempotent and search finds terms" {
     try std.testing.expectEqual(@as(usize, 1), counts.len);
     try std.testing.expectEqualStrings("new-dawn", counts[0].source_id);
     try std.testing.expectEqual(@as(usize, 1), counts[0].count);
+}
+
+test "memory store applies time window, geo radius, and fuzzy terms" {
+    var store = MemoryStore.init(std.testing.allocator);
+    defer store.deinit();
+    const repo = store.asRepository();
+    const base = types.Document{
+        .id = "d1",
+        .source_id = "new-dawn",
+        .source_name = "New Dawn",
+        .source_url = "https://thenewdawnliberia.com/",
+        .title = "Fuel shortage hits Monrovia",
+        .url = "https://example.com/1",
+        .text = "Fuel stations report long queues.",
+        .published_at = 1794441600 + 3600, // 2026-11-12 01:00 UTC
+        .fetched_at = 1794441600 + 7200,
+        .reliability = 0.70,
+        .topics = &.{"energy"},
+        .content_hash = "d1",
+        .lat = 6.3204,
+        .lon = -10.8060,
+    };
+    var old = base;
+    old.id = "d2";
+    old.url = "https://example.com/2";
+    old.content_hash = "d2";
+    old.title = "Budget debate in Gbarnga";
+    old.text = "The budget debate continues in Gbarnga.";
+    old.published_at = 1794441600 - 30 * 86400; // a month earlier
+    old.lat = 6.9963;
+    old.lon = -9.4709;
+    try repo.insertDocument(base);
+    try repo.insertDocument(old);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    // Time window: only the Nov 12 doc is inside [Nov 12, Nov 13).
+    const today = try repo.search(alloc, .{
+        .terms = &.{},
+        .from_ts = 1794441600,
+        .to_ts = 1794441600 + 86400,
+        .limit = 10,
+    });
+    try std.testing.expectEqual(@as(usize, 1), today.len);
+    try std.testing.expectEqualStrings("d1", today[0].id);
+    // Geo radius: 50 km around Monrovia keeps d1, drops Gbarnga (~150 km).
+    const near = try repo.search(alloc, .{
+        .terms = &.{},
+        .geo = .{ .lat = 6.3204, .lon = -10.8060, .radius_km = 50 },
+        .limit = 10,
+    });
+    try std.testing.expectEqual(@as(usize, 1), near.len);
+    try std.testing.expectEqualStrings("d1", near[0].id);
+    // Fuzzy: "monrova" (typo) finds the Monrovia doc only with fuzzy on.
+    const exact = try repo.search(alloc, .{ .terms = &.{"monrova"}, .limit = 10 });
+    try std.testing.expectEqual(@as(usize, 0), exact.len);
+    const fuzzy_q = try repo.search(alloc, .{ .terms = &.{"monrova"}, .fuzzy = true, .limit = 10 });
+    try std.testing.expectEqual(@as(usize, 1), fuzzy_q.len);
+    try std.testing.expectEqualStrings("d1", fuzzy_q[0].id);
 }

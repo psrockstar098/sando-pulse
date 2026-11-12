@@ -1197,20 +1197,72 @@ pub const PostgresStore = struct {
 
         var where: std.ArrayList(u8) = .empty;
         defer where.deinit(alloc);
-        if (q.terms.len > 0) {
-            // FTS over the joined terms, OR per-term ILIKE fallback.
-            const joined = try std.mem.join(alloc, " ", q.terms);
-            defer alloc.free(joined);
-            try where.appendSlice(alloc, "(d.search_vector @@ websearch_to_tsquery('english', ");
-            try appendEscapedLiteral(&where, alloc, joined);
-            try where.appendSlice(alloc, ")");
-            for (q.terms) |term| {
-                try where.appendSlice(alloc, " OR d.title ILIKE ");
-                try appendLikeLiteral(&where, alloc, term);
-                try where.appendSlice(alloc, " OR d.text ILIKE ");
-                try appendLikeLiteral(&where, alloc, term);
+        if (q.terms.len > 0 or q.query_embedding != null) {
+            // FTS over the joined terms, OR per-term ILIKE fallback, OR
+            // trigram similarity when fuzzy, OR pgvector closeness when a
+            // query embedding is supplied.
+            try where.appendSlice(alloc, "(");
+            var first = true;
+            if (q.terms.len > 0) {
+                const joined = try std.mem.join(alloc, " ", q.terms);
+                defer alloc.free(joined);
+                try where.appendSlice(alloc, "d.search_vector @@ websearch_to_tsquery('english', ");
+                try appendEscapedLiteral(&where, alloc, joined);
+                try where.appendSlice(alloc, ")");
+                first = false;
+                for (q.terms) |term| {
+                    try where.appendSlice(alloc, " OR d.title ILIKE ");
+                    try appendLikeLiteral(&where, alloc, term);
+                    try where.appendSlice(alloc, " OR d.text ILIKE ");
+                    try appendLikeLiteral(&where, alloc, term);
+                    if (q.fuzzy) {
+                        // word_similarity measures the term against the
+                        // most similar word in the title (pg_trgm). The
+                        // score dilutes with title length: a one-typo word
+                        // in a 4-word title scores ~0.24, unrelated titles
+                        // score 0 (verified live 2026-11-12), so the SQL
+                        // threshold is deliberately loose at 0.2 — the
+                        // engine re-scores fuzzy candidates with the strict
+                        // per-word 0.5 trigram check before ranking.
+                        try where.appendSlice(alloc, " OR word_similarity(d.title, ");
+                        try appendEscapedLiteral(&where, alloc, term);
+                        try where.appendSlice(alloc, ") > 0.2");
+                    }
+                }
+            }
+            if (q.query_embedding) |vec| {
+                if (!first) try where.appendSlice(alloc, " OR ");
+                const lit = try formatVectorLiteral(alloc, vec);
+                defer alloc.free(lit);
+                try where.appendSlice(alloc, "d.embedding <=> ");
+                try where.appendSlice(alloc, lit);
+                try where.appendSlice(alloc, " < 0.6");
             }
             try where.appendSlice(alloc, ")");
+        }
+        if (q.from_ts != null or q.to_ts != null) {
+            // A document's date is published_at, falling back to fetched_at
+            // for manually ingested docs (published_at null).
+            if (where.items.len > 0) try where.appendSlice(alloc, " AND ");
+            try where.appendSlice(alloc, "(");
+            if (q.from_ts) |from| {
+                const s = try std.fmt.allocPrint(alloc, "COALESCE(d.published_at, d.fetched_at) >= to_timestamp({d})", .{from});
+                defer alloc.free(s);
+                try where.appendSlice(alloc, s);
+            }
+            if (q.to_ts) |to| {
+                if (q.from_ts != null) try where.appendSlice(alloc, " AND ");
+                const s = try std.fmt.allocPrint(alloc, "COALESCE(d.published_at, d.fetched_at) < to_timestamp({d})", .{to});
+                defer alloc.free(s);
+                try where.appendSlice(alloc, s);
+            }
+            try where.appendSlice(alloc, ")");
+        }
+        if (q.geo) |g| {
+            if (where.items.len > 0) try where.appendSlice(alloc, " AND ");
+            const s = try std.fmt.allocPrint(alloc, "ST_DWithin(d.geom, ST_SetSRID(ST_MakePoint({d}, {d}), 4326)::geography, {d})", .{ g.lon, g.lat, g.radius_km * 1000.0 });
+            defer alloc.free(s);
+            try where.appendSlice(alloc, s);
         }
         if (q.organizations.len > 0) {
             if (where.items.len > 0) try where.appendSlice(alloc, " AND ");
@@ -1639,6 +1691,95 @@ test "postgres: live" {
         if (std.mem.eql(u8, d.id, id)) saw_it = true;
     }
     try testing.expect(saw_it);
+
+    // Hybrid-search filters: insert a geo-tagged, embedded doc and check
+    // the time window, geo radius, fuzzy term, and vector legs find it.
+    const geo_id = try types.contentHash(alloc, "new-dawn", "https://example.com/pg-geo", "Monrovia fuel queue test");
+    defer alloc.free(geo_id);
+    var emb: [128]f32 = undefined;
+    for (&emb) |*v| v.* = 0;
+    emb[0] = 1;
+    const geo_doc = types.Document{
+        .id = geo_id,
+        .source_id = "new-dawn",
+        .source_name = "New Dawn",
+        .source_url = "https://thenewdawnliberia.com/",
+        .title = "Monrovia fuel queue test",
+        .url = "https://example.com/pg-geo",
+        .text = "A hybrid-search probe document for Monrovia.",
+        .published_at = 1794441600 + 3600, // 2026-11-12 01:00 UTC
+        .fetched_at = 1794441600 + 7200,
+        .reliability = 0.70,
+        .topics = &.{"energy"},
+        .content_hash = geo_id,
+        .lat = 6.3204,
+        .lon = -10.8060,
+        .embedding = &emb,
+    };
+    try repo.insertDocument(geo_doc);
+    const geo_found = try repo.search(arena.allocator(), .{ .terms = &.{}, .limit = 10 });
+    var saw_geo = false;
+    for (geo_found) |d| {
+        if (std.mem.eql(u8, d.id, geo_id)) {
+            saw_geo = true;
+            try testing.expect(d.lat != null);
+            try testing.expectApproxEqAbs(@as(f64, 6.3204), d.lat.?, 0.001);
+            try testing.expect(d.embedding != null);
+            try testing.expectEqual(@as(usize, 128), d.embedding.?.len);
+        }
+    }
+    try testing.expect(saw_geo);
+    // Time window [Nov 12, Nov 13) keeps the geo doc, drops the Nov 2025 one.
+    const in_window = try repo.search(arena.allocator(), .{
+        .terms = &.{},
+        .from_ts = 1794441600,
+        .to_ts = 1794441600 + 86400,
+        .limit = 100,
+    });
+    var saw_geo_window = false;
+    var saw_old_window = false;
+    for (in_window) |d| {
+        if (std.mem.eql(u8, d.id, geo_id)) saw_geo_window = true;
+        if (std.mem.eql(u8, d.id, id)) saw_old_window = true;
+    }
+    try testing.expect(saw_geo_window);
+    try testing.expect(!saw_old_window);
+    // Geo radius 50 km around Monrovia keeps the geo doc.
+    const near = try repo.search(arena.allocator(), .{
+        .terms = &.{},
+        .geo = .{ .lat = 6.3204, .lon = -10.8060, .radius_km = 50 },
+        .limit = 100,
+    });
+    var saw_geo_near = false;
+    for (near) |d| {
+        if (std.mem.eql(u8, d.id, geo_id)) saw_geo_near = true;
+    }
+    try testing.expect(saw_geo_near);
+    // Fuzzy "monrova" (typo) finds the Monrovia doc only with fuzzy on.
+    const fuzzy_off = try repo.search(arena.allocator(), .{ .terms = &.{"monrova"}, .limit = 100 });
+    var saw_geo_exact = false;
+    for (fuzzy_off) |d| {
+        if (std.mem.eql(u8, d.id, geo_id)) saw_geo_exact = true;
+    }
+    try testing.expect(!saw_geo_exact);
+    const fuzzy_on = try repo.search(arena.allocator(), .{ .terms = &.{"monrova"}, .fuzzy = true, .limit = 100 });
+    var saw_geo_fuzzy = false;
+    for (fuzzy_on) |d| {
+        if (std.mem.eql(u8, d.id, geo_id)) saw_geo_fuzzy = true;
+    }
+    try testing.expect(saw_geo_fuzzy);
+    // Vector leg: the same [1,0,...] embedding retrieves the geo doc with
+    // no terms at all.
+    const vec = try repo.search(arena.allocator(), .{
+        .terms = &.{},
+        .query_embedding = &emb,
+        .limit = 100,
+    });
+    var saw_geo_vec = false;
+    for (vec) |d| {
+        if (std.mem.eql(u8, d.id, geo_id)) saw_geo_vec = true;
+    }
+    try testing.expect(saw_geo_vec);
 
     try testing.expect(repo.countDocuments() >= 1);
     const by_source = try repo.countBySource(arena.allocator());
