@@ -150,7 +150,7 @@ test "searchAndRank answers from evidence with citations" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    const p = try planner.plan(alloc, "fuel shortage in Monrovia", &.{ "new-dawn" });
+    const p = try planner.plan(alloc, "fuel shortage in Monrovia", &.{ "new-dawn" }, now, 0);
     const out = try searchAndRank(alloc, repo, p, now);
     try std.testing.expect(out.sufficient);
     try std.testing.expect(out.answer != null);
@@ -168,7 +168,7 @@ test "searchAndRank says it does not know when there is no evidence" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    const p = try planner.plan(alloc, "quantum computing breakthrough in Lofa", &.{ "new-dawn" });
+    const p = try planner.plan(alloc, "quantum computing breakthrough in Lofa", &.{ "new-dawn" }, now, 0);
     const out = try searchAndRank(alloc, repo, p, now);
     try std.testing.expect(!out.sufficient);
     try std.testing.expect(out.answer == null);

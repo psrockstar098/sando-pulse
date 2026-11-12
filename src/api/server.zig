@@ -232,11 +232,12 @@ pub const Server = struct {
             for (sources.sources) |s| {
                 if (s.enabled) try enabled.append(alloc, s.id);
             }
-            const p = planner.plan(alloc, qr.query, enabled.items) catch {
+            const now = timex.nowSeconds(self.io);
+            const p = planner.plan(alloc, qr.query, enabled.items, now, self.cfg.tz_offset_minutes) catch {
                 self.respondError(req, alloc, req_id, .internal_server_error, "planner_failed", "Query planning failed");
                 return;
             };
-            const outcome = search.searchAndRank(alloc, self.repo, p, timex.nowSeconds(self.io)) catch {
+            const outcome = search.searchAndRank(alloc, self.repo, p, now) catch {
                 self.respondError(req, alloc, req_id, .internal_server_error, "search_failed", "Search failed");
                 return;
             };

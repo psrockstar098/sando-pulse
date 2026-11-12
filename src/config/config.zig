@@ -22,6 +22,18 @@ pub const Config = struct {
     rate_limit_per_minute: u32 = 100,
     rate_limit_per_day: u32 = 10000,
     log_level: []const u8 = "info",
+    /// Minutes east of UTC for time-aware queries (Africa/Monrovia = 0).
+    tz_offset_minutes: i32 = 0,
+    /// Embedding provider for semantic search: "local" (deterministic
+    /// hashed lexical embedding, default), "external" (OpenAI-compatible
+    /// API), or "none" (keyword search only).
+    embedding_provider: []const u8 = "local",
+    embedding_api_url: ?[]const u8 = null,
+    embedding_api_key: ?[]const u8 = null,
+    embedding_model: []const u8 = "text-embedding-3-small",
+    /// Embedding dimensions. Must match the `embedding vector(N)` column
+    /// (migration 003 uses 128); change both together.
+    embedding_dims: usize = 128,
 };
 
 fn envOwned(alloc: std.mem.Allocator, env_map: *std.process.Environ.Map, name: []const u8) ?[]u8 {
@@ -41,6 +53,10 @@ pub fn parseU64(s: []const u8) ?u64 {
 
 pub fn parseU32(s: []const u8) ?u32 {
     return std.fmt.parseInt(u32, s, 10) catch null;
+}
+
+pub fn parseI32(s: []const u8) ?i32 {
+    return std.fmt.parseInt(i32, s, 10) catch null;
 }
 
 /// Load config from the process environment map (Zig 0.17.1: the runtime
@@ -87,6 +103,32 @@ pub fn load(alloc: std.mem.Allocator, env_map: *std.process.Environ.Map) !Config
         cfg.rate_limit_per_day = parseU32(v) orelse 10000;
     }
     if (envOwned(alloc, env_map, "PULSE_LOG_LEVEL")) |v| cfg.log_level = v;
+    if (envOwned(alloc, env_map, "PULSE_TZ_OFFSET_MINUTES")) |v| {
+        if (parseI32(v)) |n| {
+            if (n >= -720 and n <= 840) cfg.tz_offset_minutes = n;
+        }
+    }
+    if (envOwned(alloc, env_map, "PULSE_EMBEDDING_PROVIDER")) |v| {
+        if (std.mem.eql(u8, v, "local") or std.mem.eql(u8, v, "external") or std.mem.eql(u8, v, "none")) {
+            cfg.embedding_provider = v;
+        } else {
+            logging.warn("unknown PULSE_EMBEDDING_PROVIDER, using local", &.{.{ .key = "value", .value = v }});
+        }
+    }
+    if (envOwned(alloc, env_map, "PULSE_EMBEDDING_API_URL")) |v| {
+        if (v.len > 0) cfg.embedding_api_url = v;
+    }
+    if (envOwned(alloc, env_map, "PULSE_EMBEDDING_API_KEY")) |v| {
+        if (v.len > 0) cfg.embedding_api_key = v;
+    }
+    if (envOwned(alloc, env_map, "PULSE_EMBEDDING_MODEL")) |v| {
+        if (v.len > 0) cfg.embedding_model = v;
+    }
+    if (envOwned(alloc, env_map, "PULSE_EMBEDDING_DIMS")) |v| {
+        if (parseU64(v)) |n| {
+            if (n >= 16 and n <= 4096) cfg.embedding_dims = @intCast(n);
+        }
+    }
     return cfg;
 }
 
