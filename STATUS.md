@@ -220,3 +220,51 @@ parsing; the worker runs prove the live path.
   last command, not zig's. Check the binary timestamp after rebuilding.
 - `zig test` passing does not prove the exe compiles (lazy function-body
   analysis). Always run `zig build` too.
+
+## Roadmap 2 — COMPLETE 2026-11-12 ~21:30 GMT (commits 1abb38b, c26929e, 30f74a7, 846872b, 107eca5, 8273175, 13c7f7f)
+
+Head: `13c7f7f`. Suite: **101/101 tests pass** (unit + live Postgres + Redis legs, leak-free). `zig build` green.
+
+### 2.1 Dynamic query engine
+- `planner.plan` now takes `(now, tz)` and delegates to `intent.classify` (intent + strategy + confidence) and `temporal.resolve` (real half-open time windows) instead of its own keyword lists; radius phrases ("within 50 km of Gbarnga", "near Monrovia") become a `GeoFilter`. Plan gains `time_from`/`time_to`, `strategy`, `classification_confidence`, `geo_filter`; `time_range` stays as the human label.
+
+### 2.2 Hybrid search (pgvector + PostGIS — ALL LIVE, no substitute needed)
+- Local Postgres 16 has `vector 0.6.0`, `postgis 3.4.2`, `pg_trgm 1.6` (checked live). Migration 003 creates the extensions; documents gain `embedding vector(128)`, `lat`, `lon`, `geom geography(Point,4326)`; trigram GIN + GiST indexes.
+- Backends: memory store applies time window (published_at, fetched_at fallback), haversine geo radius, per-word trigram fuzzy at 0.5. Postgres applies the same via SQL: `COALESCE(published_at, fetched_at)` range, `ST_DWithin` geo, `word_similarity` fuzzy, pgvector `<=> < 0.6` OR branch for semantic candidate retrieval.
+- Search: two-pass retrieval (exact, then fuzzy when < 3 candidates), dedup by content hash/id/url, fused scoring (0.6 base + 0.2 fuzzy + 0.2 semantic, renormalized when a signal is absent), evidence threshold 0.25 on the fused score.
+- Live Postgres test verifies: geo-tagged + embedded probe doc round-trips (lat/lon/embedding 128-dim), time window, geo radius, fuzzy on/off, vector-only retrieval.
+
+### 2.3 Result intelligence
+- Results carry fused score + score parts (relevance/reliability/recency/context/coverage) + fuzzy/semantic scores. Event clustering (same topic OR trigram-similar titles within 72h) and tz-aware timeline buckets for timeline/historical intents. Response includes `events[]` + `timeline[]`; plan carries strategy, classification confidence, resolved time window as ISO.
+
+### 2.4 AI integration interfaces
+- `src/ai/providers.zig`: EmbeddingProvider (LocalHashEmbedding — deterministic hashed lexical, honestly labelled lexical not semantic — + ExternalEmbedding for OpenAI-compatible APIs), ExtractiveSummarizer, LocalEntityExtractor, LocalTopicClassifier, synthesizeGrounded (only quotes evidence sentences). `makeEmbeddingProvider` factory from config: local (default) / external (needs URL+key) / none.
+- Wiring: main builds the provider once; worker/pipeline embed docs at ingest (title+text, 4000-byte cap, failure never blocks insert); server embeds on POST /v1/ingest and geo-tags it; query path passes the embedder + tz into search.
+- Config: `PULSE_TZ_OFFSET_MINUTES` (default 0), `PULSE_EMBEDDING_PROVIDER`, `PULSE_EMBEDDING_API_URL/KEY/MODEL/DIMS` (default 128, matches vector(128)).
+
+### 2.5 Temporal intelligence
+- `intent.classify` + `temporal.resolve` (today/yesterday/tomorrow/this week/last week/this month/last month/this year/last year/counted windows/ISO + long dates/bare years/between ranges; timezone-aware day/month/year starts; `describe()`).
+
+### Live smoke test (2026-11-12 ~21:20-21:30, Postgres + Redis, port 9000, local embedder)
+- 3 docs ingested via POST /v1/ingest; all geo-tagged (Monrovia 6.3204/-10.806, Gbarnga 6.9963/-9.4709) and embedded (verified in Postgres).
+- "fuel shortage in Monrovia": sufficient=true, 3 results with citations [1][2][3], semantic 0.64/0.53/0, 1 event (energy, 3 docs), plan local/balanced/0.85.
+- "fuel shortage today": time window 2026-11-12T00:00 -> 2026-11-13T00:00, 3 results.
+- "Monrova" (typo): sufficient=true, 3 results, fuzzy 0.706 each, fused 0.52/0.48/0.48.
+- "news within 50 km of Gbarnga": 1 result (Budget debate in Gbarnga).
+- "fuel shortage timeline": intent timeline, 1 event (3 docs), timeline day 2026-11-12 (3 docs).
+- "quantum computing breakthrough in Lofa" (no evidence): sufficient=false, no_documents_matched (unit test).
+
+### Bugs found by the smoke test (all fixed, all with regression tests)
+1. `temporal.describe` printed `+2026-+11-+12`: Zig 0.17.1 fmt prints an explicit `+` for positive signed ints under a width spec. Fixed by casting year/month/day to u64 (same quirk is documented in common/format.zig). Regression test added.
+2. The Roadmap 1 relevance gate zeroes the base when no query term appears verbatim — which made the fuzzy second pass useless (its docs have zero exact overlap by definition; the 0.2 fuzzy blend alone cannot reach 0.25). Fixed: when the base was gated, a >= 0.5 fuzzy/semantic signal counts as effective relevance for the fusion. Docs with no signal still score 0. Regression test added.
+3. Postgres `word_similarity` dilutes with title length (measured: 4-word 0.24, 7-word 0.14, 8-word 0.12, unrelated 0.00). SQL fuzzy floor lowered 0.2 -> 0.1; the engine's strict per-word 0.5 re-score stays the real filter.
+4. Chunk-2 `providers.zig` was never compiled before wiring: fixed `std.Io.Writer.Allocating` API use, a leaked StringHashMap key set, and `std.json.stringifyAlloc` (does not exist in 0.17.1). Also fixed `freeDocument` not freeing the new `embedding` field (memory leak in tests).
+5. Two `pulse serve` processes can BOTH listen on 0.0.0.0:9000 on this VM (SO_REUSEADDR) — kill by PID and verify with `ss -ltnp` before starting a new one, or smoke tests hit a stale binary.
+
+### Roadmap 2 honest gaps
+1. Occurrence-date extraction is NOT implemented: time filtering uses `published_at` (fetched_at fallback), not dates mentioned inside article text. A story published today about an event last week is filed under today.
+2. Events are clustered in-response only; they are NOT persisted to the `events` table (the table exists from Roadmap 1 but stays empty).
+3. The local embedding is lexical (word-overlap hashing), not semantic — labelled as such everywhere. Real semantic search needs an external embedding API (PULSE_EMBEDDING_PROVIDER=external) or a model-produced vector.
+4. No vector index yet (sequential scan on `embedding <=>`) — fine at this scale; revisit past ~10k docs.
+5. `PULSE_EMBEDDING_DIMS` must match the `vector(128)` column; changing one without the other breaks inserts.
+6. External embedding provider is code-complete but NEVER called live (no API key on this VM); only the interface + error paths are tested.
