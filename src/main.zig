@@ -42,6 +42,7 @@ const auth = @import("api/auth.zig");
 const ratelimit = @import("api/ratelimit.zig");
 const metrics = @import("api/metrics.zig");
 const server = @import("api/server.zig");
+const l1cache = @import("api/l1cache.zig");
 const worker = @import("workers/worker.zig");
 const providers = @import("ai/providers.zig");
 
@@ -395,6 +396,11 @@ pub fn main(init: std.process.Init) !void {
     defer if (audit_file) |f| f.close(io);
     var audit_sink = auditlog.AuditSink.init(alloc, io, audit_pg, audit_file, audit_file_len);
 
+    // L1 in-process cache (Roadmap 6.2): process-lifetime, sits in
+    // front of the Redis (L2) query cache.
+    var l1 = l1cache.L1Cache.init(alloc, cfg.l1_max_entries, cfg.l1_max_bytes, cfg.l1_ttl_s);
+    defer l1.deinit();
+
     var srv = server.Server{
         .alloc = alloc,
         .io = io,
@@ -408,6 +414,7 @@ pub fn main(init: std.process.Init) !void {
         .knowledge = ks,
         .facebook = &fb_connector,
         .redis = redis_client,
+        .l1 = &l1,
         .usage_tracker = &usage_tracker,
         .audit_sink = &audit_sink,
     };

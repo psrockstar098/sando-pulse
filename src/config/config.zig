@@ -55,6 +55,27 @@ pub const Config = struct {
     /// single-connection design; higher values only help when store
     /// calls run concurrently.
     pg_pool_size: usize = 1,
+    /// L1 in-process cache (Roadmap 6.2): entry cap, byte cap, TTL.
+    l1_max_entries: usize = 512,
+    l1_max_bytes: usize = 8 * 1024 * 1024,
+    l1_ttl_s: u64 = 300,
+    /// Parallel query fan-out (Roadmap 6.6): run the news + knowledge
+    /// backends concurrently when the store is Postgres (pool/mutex
+    /// guarded). Sequential otherwise. 0 disables fan-out entirely.
+    parallel_query: bool = true,
+    /// Fan-out deadline in milliseconds (Roadmap 6.6): stragglers are
+    /// joined after the response; partial results are labelled.
+    fanout_timeout_ms: u64 = 100,
+    /// In-memory index (Roadmap 6.3): term cap and document cap, and
+    /// how often (seconds) the server rebuilds it when the cache epoch
+    /// moved (worker ingests bump the epoch).
+    memindex_max_terms: usize = 50000,
+    memindex_max_docs: usize = 100000,
+    reindex_interval_s: u64 = 3600,
+    /// Auto-tuning (Roadmap 6.10): off by default; opt in with
+    /// PULSE_AUTOTUNE=1. Adjusts only the safe knobs within bounds,
+    /// and logs every change.
+    autotune_enabled: bool = false,
     rate_limit_per_minute: u32 = 100,
     rate_limit_per_day: u32 = 10000,
     /// TLS termination is handled by a reverse proxy in front of Pulse
@@ -188,6 +209,33 @@ pub fn load(alloc: std.mem.Allocator, env_map: *std.process.Environ.Map) !Config
     }
     if (envOwned(alloc, env_map, "PULSE_PG_POOL_SIZE")) |v| {
         cfg.pg_pool_size = @intCast(parseU64(v) orelse 1);
+    }
+    if (envOwned(alloc, env_map, "PULSE_L1_MAX_ENTRIES")) |v| {
+        cfg.l1_max_entries = @intCast(@max(1, parseU64(v) orelse 512));
+    }
+    if (envOwned(alloc, env_map, "PULSE_L1_MAX_BYTES")) |v| {
+        cfg.l1_max_bytes = @intCast(@max(1024, parseU64(v) orelse 8 * 1024 * 1024));
+    }
+    if (envOwned(alloc, env_map, "PULSE_L1_TTL_S")) |v| {
+        cfg.l1_ttl_s = parseU64(v) orelse 300;
+    }
+    if (envOwned(alloc, env_map, "PULSE_PARALLEL_QUERY")) |v| {
+        cfg.parallel_query = std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
+    }
+    if (envOwned(alloc, env_map, "PULSE_FANOUT_TIMEOUT_MS")) |v| {
+        cfg.fanout_timeout_ms = @max(10, parseU64(v) orelse 100);
+    }
+    if (envOwned(alloc, env_map, "PULSE_MEMINDEX_MAX_TERMS")) |v| {
+        cfg.memindex_max_terms = @intCast(@max(100, parseU64(v) orelse 50000));
+    }
+    if (envOwned(alloc, env_map, "PULSE_MEMINDEX_MAX_DOCS")) |v| {
+        cfg.memindex_max_docs = @intCast(@max(10, parseU64(v) orelse 100000));
+    }
+    if (envOwned(alloc, env_map, "PULSE_REINDEX_INTERVAL_S")) |v| {
+        cfg.reindex_interval_s = @max(60, parseU64(v) orelse 3600);
+    }
+    if (envOwned(alloc, env_map, "PULSE_AUTOTUNE")) |v| {
+        cfg.autotune_enabled = std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
     }
     if (envOwned(alloc, env_map, "PULSE_RATE_LIMIT_PER_MINUTE")) |v| {
         cfg.rate_limit_per_minute = parseU32(v) orelse 100;

@@ -14,6 +14,21 @@ pub const Metrics = struct {
     queries_insufficient_total: u64 = 0,
     queries_cache_hits_total: u64 = 0,
     queries_cache_misses_total: u64 = 0,
+    /// L1 in-process cache (Roadmap 6.2). L2 is the Redis layer counted
+    /// above as queries_cache_hits/misses.
+    l1_cache_hits_total: u64 = 0,
+    l1_cache_misses_total: u64 = 0,
+    l1_cache_evictions_total: u64 = 0,
+    l1_cache_entries: u64 = 0,
+    l1_cache_bytes: u64 = 0,
+    /// Execution-path counts and latency totals (Roadmap 6.1/6.7).
+    /// Averages are derived: total / count.
+    queries_path_instant_total: u64 = 0,
+    queries_path_fast_total: u64 = 0,
+    queries_path_deep_total: u64 = 0,
+    path_latency_ms_instant_total: u64 = 0,
+    path_latency_ms_fast_total: u64 = 0,
+    path_latency_ms_deep_total: u64 = 0,
     ingest_runs_total: u64 = 0,
     ingest_errors_total: u64 = 0,
     documents_indexed_total: u64 = 0,
@@ -41,6 +56,41 @@ pub const Metrics = struct {
 
     pub fn observeCacheMiss(self: *Metrics) void {
         self.queries_cache_misses_total += 1;
+    }
+
+    pub fn observeL1Hit(self: *Metrics) void {
+        self.l1_cache_hits_total += 1;
+    }
+
+    pub fn observeL1Miss(self: *Metrics) void {
+        self.l1_cache_misses_total += 1;
+    }
+
+    pub fn observeL1Evictions(self: *Metrics, n: u64) void {
+        self.l1_cache_evictions_total += n;
+    }
+
+    pub fn setL1Stats(self: *Metrics, entries: u64, bytes: u64) void {
+        self.l1_cache_entries = entries;
+        self.l1_cache_bytes = bytes;
+    }
+
+    /// Record a query served on an execution path (Roadmap 6.1/6.7).
+    /// `latency_ms` is the measured server-side latency, truncated to
+    /// whole milliseconds for the counter (the response carries the
+    /// fractional value).
+    pub fn observePath(self: *Metrics, path: []const u8, latency_ms: f64) void {
+        const whole: u64 = @intFromFloat(@max(0, latency_ms));
+        if (std.mem.eql(u8, path, "instant")) {
+            self.queries_path_instant_total += 1;
+            self.path_latency_ms_instant_total += whole;
+        } else if (std.mem.eql(u8, path, "deep")) {
+            self.queries_path_deep_total += 1;
+            self.path_latency_ms_deep_total += whole;
+        } else {
+            self.queries_path_fast_total += 1;
+            self.path_latency_ms_fast_total += whole;
+        }
     }
 
     pub fn observeIngestRun(self: *Metrics, had_error: bool) void {
@@ -84,6 +134,39 @@ pub const Metrics = struct {
             \\# HELP pulse_queries_cache_misses_total /v1/query cache lookups that recomputed
             \\# TYPE pulse_queries_cache_misses_total counter
             \\pulse_queries_cache_misses_total {d}
+            \\# HELP pulse_l1_cache_hits_total /v1/query responses served from the in-process L1 cache
+            \\# TYPE pulse_l1_cache_hits_total counter
+            \\pulse_l1_cache_hits_total {d}
+            \\# HELP pulse_l1_cache_misses_total L1 cache lookups that missed
+            \\# TYPE pulse_l1_cache_misses_total counter
+            \\pulse_l1_cache_misses_total {d}
+            \\# HELP pulse_l1_cache_evictions_total L1 entries evicted (count or byte cap)
+            \\# TYPE pulse_l1_cache_evictions_total counter
+            \\pulse_l1_cache_evictions_total {d}
+            \\# HELP pulse_l1_cache_entries L1 entries currently held
+            \\# TYPE pulse_l1_cache_entries gauge
+            \\pulse_l1_cache_entries {d}
+            \\# HELP pulse_l1_cache_bytes L1 bytes currently held
+            \\# TYPE pulse_l1_cache_bytes gauge
+            \\pulse_l1_cache_bytes {d}
+            \\# HELP pulse_queries_path_instant_total Queries served on the instant path (L1 / precomputed)
+            \\# TYPE pulse_queries_path_instant_total counter
+            \\pulse_queries_path_instant_total {d}
+            \\# HELP pulse_queries_path_fast_total Queries served on the fast path (indexed search)
+            \\# TYPE pulse_queries_path_fast_total counter
+            \\pulse_queries_path_fast_total {d}
+            \\# HELP pulse_queries_path_deep_total Queries served on the deep path (semantic / correlation)
+            \\# TYPE pulse_queries_path_deep_total counter
+            \\pulse_queries_path_deep_total {d}
+            \\# HELP pulse_path_latency_ms_instant_total Total instant-path latency in milliseconds
+            \\# TYPE pulse_path_latency_ms_instant_total counter
+            \\pulse_path_latency_ms_instant_total {d}
+            \\# HELP pulse_path_latency_ms_fast_total Total fast-path latency in milliseconds
+            \\# TYPE pulse_path_latency_ms_fast_total counter
+            \\pulse_path_latency_ms_fast_total {d}
+            \\# HELP pulse_path_latency_ms_deep_total Total deep-path latency in milliseconds
+            \\# TYPE pulse_path_latency_ms_deep_total counter
+            \\pulse_path_latency_ms_deep_total {d}
             \\# HELP pulse_ingest_runs_total Ingestion runs completed
             \\# TYPE pulse_ingest_runs_total counter
             \\pulse_ingest_runs_total {d}
@@ -105,6 +188,17 @@ pub const Metrics = struct {
             self.queries_insufficient_total,
             self.queries_cache_hits_total,
             self.queries_cache_misses_total,
+            self.l1_cache_hits_total,
+            self.l1_cache_misses_total,
+            self.l1_cache_evictions_total,
+            self.l1_cache_entries,
+            self.l1_cache_bytes,
+            self.queries_path_instant_total,
+            self.queries_path_fast_total,
+            self.queries_path_deep_total,
+            self.path_latency_ms_instant_total,
+            self.path_latency_ms_fast_total,
+            self.path_latency_ms_deep_total,
             self.ingest_runs_total,
             self.ingest_errors_total,
             self.documents_indexed_total,

@@ -467,3 +467,17 @@ Server started with `PULSE_API_KEY=<keygen>`, `PULSE_CONSUMERS=sando:query,admin
 6. **External embedding provider never called live** (no API key) — carried from Roadmap 2; the local embedder is lexical, no vector index yet.
 7. **CI live legs are skipped** until a combined pgvector+PostGIS image is chosen (5.4).
 8. **The smoke-test server crashed once** (the `readBody` head-invalidation bug) before the fix — the fix is committed (`4bc562c`) and the exact crashing request now returns 200 with the server alive; no in-suite server-level test exists, the live smoke test is the regression check.
+
+## Roadmap 6 — Performance Core (in progress, 2026-11-13)
+
+Baseline at start: `zig build` passes, 204/204 tests, origin/main `61d186a`.
+Constraints: Zig 0.17.1, REST only, raw std.http only (NO httpz — owner's
+direct order 2026-11-13), real data only, docs in the same commits.
+
+### 6.2 L1 in-process cache — DONE (2026-11-13 ~14:20)
+
+- `src/api/l1cache.zig` (new): bounded by count (default 512, `PULSE_L1_MAX_ENTRIES`) AND bytes (default 8 MiB, `PULSE_L1_MAX_BYTES`), LRU eviction, per-entry TTL (default 300 s, `PULSE_L1_TTL_S`). Keys are consumer-scoped (`q|<consumer>|<sha256>`); entries carry tags (topics/counties/cities) for smart invalidation. Single-threaded server: no locking (documented — a mutex is needed if the server ever goes multi-threaded). A single value larger than the byte cap is refused, never stored.
+- Wired into `src/api/server.zig`: L1 is checked BEFORE the Redis (L2) cache on POST /v1/query; on a miss the storable body (empty request id) is written to L1 with the plan's tags. POST /v1/ingest invalidates only the entries tagged with the new document's topics/places — never a blind flush.
+- Metrics (Roadmap 6.7 groundwork): `pulse_l1_cache_hits_total`, `pulse_l1_cache_misses_total`, `pulse_l1_cache_evictions_total`, `pulse_l1_cache_entries`, `pulse_l1_cache_bytes`, plus per-path counters/latency totals (wired in 6.1/6.7).
+- Verified: `zig build` passes; 212/212 tests (8 new L1 unit tests); live smoke test — first identical query `cached:false`, second `cached:true`, metrics `l1_cache_hits_total 1`, `l1_cache_misses_total 1`, entries 1, bytes 1347.
+- Honest note: cached bodies are rendered before the 6.1 `path`/`latency_ms` fields exist; 6.1 adds the stamp mechanism so a served-from-cache body reports the serving path, not the original one.

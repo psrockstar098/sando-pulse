@@ -43,6 +43,7 @@ const auth = @import("auth.zig");
 const ratelimit = @import("ratelimit.zig");
 const metrics = @import("metrics.zig");
 const cache = @import("cache.zig");
+const l1cache = @import("l1cache.zig");
 const usage = @import("usage.zig");
 const auditlog = @import("auditlog.zig");
 const timex = @import("../common/time.zig");
@@ -71,6 +72,9 @@ pub const Server = struct {
     /// cache (Roadmap 4.5). Null when Redis is not configured — the
     /// endpoints recompute live instead.
     redis: ?*redis.RedisClient = null,
+    /// L1 in-process cache (Roadmap 6.2). Always present; sits in front
+    /// of the Redis (L2) query cache. Keys are consumer-scoped.
+    l1: *l1cache.L1Cache,
     /// Usage tracking (Roadmap 5.3): per-consumer counters, Redis-backed
     /// when a client is configured, in-memory otherwise. Always present.
     usage_tracker: *usage.UsageTracker,
@@ -639,6 +643,30 @@ pub const Server = struct {
             for (sources.sources) |s| {
                 if (s.enabled) try enabled.append(alloc, s.id);
             }
+            // L1 in-process cache (Roadmap 6.2): checked first, before
+            // the Redis (L2) cache. The key is consumer-scoped so a
+            // cached response can never leak across consumers. A hit
+            // serves the stored body with the current request id spliced
+            // in, exactly like the L2 hit below.
+            var l1_key: ?[]u8 = null;
+            const l1_now = timex.nowMillis(self.io);
+            if (self.cfg.l1_ttl_s > 0) {
+                l1_key = l1cache.L1Cache.queryKey(alloc, consumerOf(head), qr.query, qr.limit) catch null;
+                if (l1_key) |lk| {
+                    if (self.l1.get(lk, l1_now)) |stored| {
+                        if (cache.stampRequestId(alloc, stored, req_id) catch null) |stamped_body| {
+                            self.metrics.observeL1Hit();
+                            self.metrics.observeQuery(cachedSufficient(stamped_body) orelse true);
+                            self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+                            self.recordUsage(head, .query);
+                            self.auditCall(head, alloc, req_id, 200);
+                            try respondJsonCached(req, .ok, stamped_body, req_id, true);
+                            return;
+                        }
+                    }
+                    self.metrics.observeL1Miss();
+                }
+            }
             // Query cache (Roadmap 4.5): an identical query+limit within
             // the TTL and the same ingest epoch serves the stored body.
             // The stored body is rendered with an empty request id; the
@@ -685,12 +713,28 @@ pub const Server = struct {
             };
             // Store a copy rendered with an empty request id so a later
             // hit can splice in its own id. Oversized responses are
-            // served but never stored.
-            if (self.redis) |rc| {
-                if (cache_key) |k| {
-                    if (resp.len <= cache.max_response_bytes) {
-                        const storable = query_json.buildQueryResponse(alloc, "", qr.query, p, outcome, enabled.items.len, timex.nowSeconds(self.io)) catch null;
-                        if (storable) |s| cache.put(rc, alloc, k, cache_epoch, s, self.cfg.query_cache_ttl_s) catch {};
+            // served but never stored. The L1 entry is tagged with the
+            // plan's topics/counties/cities so ingest can invalidate
+            // only the affected entries (Roadmap 6.2).
+            if (l1_key != null or cache_key != null) {
+                if (resp.len <= cache.max_response_bytes) {
+                    const storable = query_json.buildQueryResponse(alloc, "", qr.query, p, outcome, enabled.items.len, timex.nowSeconds(self.io)) catch null;
+                    if (storable) |s| {
+                        if (l1_key) |lk| {
+                            var tags: std.ArrayList([]const u8) = .empty;
+                            for (p.topics) |t| tags.append(alloc, t) catch {};
+                            for (p.counties) |t| tags.append(alloc, t) catch {};
+                            for (p.cities) |t| tags.append(alloc, t) catch {};
+                            const before = self.l1.snapshot();
+                            self.l1.put(lk, s, tags.items, timex.nowMillis(self.io)) catch {};
+                            tags.deinit(alloc);
+                            const after = self.l1.snapshot();
+                            self.metrics.observeL1Evictions(after.evictions - before.evictions);
+                            self.metrics.setL1Stats(after.entries, after.bytes);
+                        }
+                        if (cache_key) |k| {
+                            if (self.redis) |rc| cache.put(rc, alloc, k, cache_epoch, s, self.cfg.query_cache_ttl_s) catch {};
+                        }
                     }
                 }
             }
@@ -783,6 +827,21 @@ pub const Server = struct {
             }
             if (self.sink) |s| {
                 s.publish(s.ptr, alloc, doc.id, doc.source_id) catch {};
+            }
+            // L1 invalidation (Roadmap 6.2): only entries tagged with
+            // this document's topics/places recompute; everything else
+            // stays hot. Never a blind flush.
+            {
+                var tags: std.ArrayList([]const u8) = .empty;
+                for (doc.topics) |t| tags.append(alloc, t) catch {};
+                for (ent.topics) |t| tags.append(alloc, t) catch {};
+                for (ent.cities) |t| tags.append(alloc, t) catch {};
+                for (ent.counties) |t| tags.append(alloc, t) catch {};
+                const evicted = self.l1.invalidateTags(tags.items);
+                self.metrics.observeL1Evictions(evicted);
+                const snap = self.l1.snapshot();
+                self.metrics.setL1Stats(snap.entries, snap.bytes);
+                tags.deinit(alloc);
             }
             self.metrics.setDocumentsIndexed(@intCast(self.repo.countDocuments()));
             const resp = try std.fmt.allocPrint(alloc, "{{\"id\":\"{s}\",\"source_id\":\"{s}\",\"request_id\":\"{s}\"}}", .{ doc.id, doc.source_id, req_id });

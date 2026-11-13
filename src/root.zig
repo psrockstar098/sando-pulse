@@ -58,6 +58,7 @@ pub const storage_repository = @import("storage/repository.zig");
 pub const workers_worker = @import("workers/worker.zig");
 pub const workers_realtime = @import("workers/realtime.zig");
 pub const api_cache = @import("api/cache.zig");
+pub const api_l1cache = @import("api/l1cache.zig");
 pub const api_usage = @import("api/usage.zig");
 pub const api_auditlog = @import("api/auditlog.zig");
 pub const sando_client = @import("sando/client.zig");
