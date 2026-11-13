@@ -190,6 +190,13 @@ pub fn buildQueryResponse(
     outcome: search.Outcome,
     sources_checked: usize,
     now: i64,
+    /// Execution path that served this response (Roadmap 6.1):
+    /// "instant" | "fast" | "deep".
+    path: []const u8,
+    /// Measured server-side latency in milliseconds (fractional).
+    latency_ms: f64,
+    /// Why the router chose this path.
+    routing_reason: []const u8,
 ) ![]u8 {
     var results: std.ArrayList(ResultJson) = .empty;
     const shown = @min(outcome.results.len, 10);
@@ -238,6 +245,9 @@ pub fn buildQueryResponse(
         .sufficient = outcome.sufficient,
         .insufficient_reason = outcome.insufficient_reason,
         .confidence = outcome.confidence,
+        .path = path,
+        .latency_ms = latency_ms,
+        .routing_reason = routing_reason,
         .results = results.items,
         .events = events.items,
         .timeline = timeline.items,
@@ -567,6 +577,47 @@ pub fn buildStatisticsResponse(
         .statistics = list.items,
         .request_id = req_id,
     });
+}
+
+test "buildQueryResponse carries path, latency_ms and routing_reason" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const p: planner.Plan = .{
+        .intent = "local",
+        .terms = &.{"fuel"},
+        .counties = &.{},
+        .cities = &.{},
+        .organizations = &.{},
+        .people = &.{},
+        .topics = &.{},
+        .time_range = null,
+        .sources = &.{},
+    };
+    const outcome: search.Outcome = .{
+        .answer = null,
+        .results = &.{},
+        .confidence = 0,
+        .sufficient = false,
+        .insufficient_reason = "no_documents_matched",
+        .events = &.{},
+        .timeline = &.{},
+    };
+    // The live shape: real path + measured latency.
+    const live = try buildQueryResponse(alloc, "req-1", "fuel", p, outcome, 5, 1794477600, "fast", 12.345678, "simple_indexed");
+    try std.testing.expect(std.mem.indexOf(u8, live, "\"path\":\"fast\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, live, "\"latency_ms\":12.345678") != null);
+    try std.testing.expect(std.mem.indexOf(u8, live, "\"routing_reason\":\"simple_indexed\"") != null);
+    // The storable shape: empty markers stampServed expects.
+    const stored = try buildQueryResponse(alloc, "", "fuel", p, outcome, 5, 1794477600, "", 0, "");
+    try std.testing.expect(std.mem.indexOf(u8, stored, "\"path\":\"\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "\"latency_ms\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "\"routing_reason\":\"\"") != null);
+    const cache = @import("cache.zig");
+    const stamped = try cache.stampServed(alloc, stored, "req-9", "instant", 0.5, "l1_hit");
+    try std.testing.expect(std.mem.indexOf(u8, stamped, "\"request_id\":\"req-9\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stamped, "\"path\":\"instant\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stamped, "\"routing_reason\":\"l1_hit\"") != null);
 }
 
 test "formatIso renders UTC dates" {

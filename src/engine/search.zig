@@ -29,6 +29,11 @@ const providers = @import("../ai/providers.zig");
 pub const SearchOptions = struct {
     embedder: ?providers.EmbeddingProvider = null,
     tz_offset_minutes: i32 = 0,
+    /// Pre-fetched candidates (Roadmap 6.1, fast path): when set, the
+    /// engine ranks these instead of calling repo.search. The fuzzy
+    /// second pass still runs when fewer than 3 candidates survive,
+    /// so an index miss degrades to the store search, never to nothing.
+    candidates: ?[]types.Document = null,
 };
 
 pub const RankedDoc = struct {
@@ -274,7 +279,7 @@ pub fn searchAndRank(
         .limit = 100,
         .query_embedding = query_vec,
     };
-    var candidates = try repo.search(alloc, q);
+    var candidates = if (opts.candidates) |c| c else try repo.search(alloc, q);
     var fuzzy_pass = false;
     if (candidates.len < 3 and p.terms.len > 0) {
         // Thin exact results: retry fuzzy (typo-tolerant) and merge.

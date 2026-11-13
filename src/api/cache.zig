@@ -31,14 +31,39 @@ pub const max_response_bytes: usize = 64 * 1024;
 /// caller then recomputes instead of serving a stale id).
 pub fn stampRequestId(alloc: std.mem.Allocator, stored_json: []const u8, req_id: []const u8) ![]u8 {
     const marker = "\"request_id\":\"\"";
-    const at = std.mem.indexOf(u8, stored_json, marker) orelse return error.MarkerMissing;
+    const repl = try std.fmt.allocPrint(alloc, "\"request_id\":\"{s}\"", .{req_id});
+    defer alloc.free(repl);
+    return splice(alloc, stored_json, marker, repl);
+}
+
+fn splice(alloc: std.mem.Allocator, json: []const u8, marker: []const u8, replacement: []const u8) ![]u8 {
+    const at = std.mem.indexOf(u8, json, marker) orelse return error.MarkerMissing;
     var out: std.ArrayList(u8) = .empty;
-    try out.appendSlice(alloc, stored_json[0..at]);
-    try out.appendSlice(alloc, "\"request_id\":\"");
-    try out.appendSlice(alloc, req_id);
-    try out.appendSlice(alloc, "\"");
-    try out.appendSlice(alloc, stored_json[at + marker.len ..]);
+    try out.appendSlice(alloc, json[0..at]);
+    try out.appendSlice(alloc, replacement);
+    try out.appendSlice(alloc, json[at + marker.len ..]);
     return out.toOwnedSlice(alloc);
+}
+
+/// Stamp the serving path, measured latency, and routing reason into a
+/// cached response body (Roadmap 6.1). The stored body is rendered with
+/// `"path":""`, `"latency_ms":0`, and `"routing_reason":""`, so a hit
+/// reports the path that SERVED it (instant), not the path that first
+/// computed it. Returns error when any marker is absent.
+pub fn stampServed(alloc: std.mem.Allocator, stored_json: []const u8, req_id: []const u8, path: []const u8, latency_ms: f64, reason: []const u8) ![]u8 {
+    const stamped_id = try stampRequestId(alloc, stored_json, req_id);
+    defer alloc.free(stamped_id);
+    const path_repl = try std.fmt.allocPrint(alloc, "\"path\":\"{s}\"", .{path});
+    defer alloc.free(path_repl);
+    const stamped_path = try splice(alloc, stamped_id, "\"path\":\"\"", path_repl);
+    defer alloc.free(stamped_path);
+    const lat_repl = try std.fmt.allocPrint(alloc, "\"latency_ms\":{d:.6}", .{latency_ms});
+    defer alloc.free(lat_repl);
+    const stamped_lat = try splice(alloc, stamped_path, "\"latency_ms\":0", lat_repl);
+    defer alloc.free(stamped_lat);
+    const reason_repl = try std.fmt.allocPrint(alloc, "\"routing_reason\":\"{s}\"", .{reason});
+    defer alloc.free(reason_repl);
+    return splice(alloc, stamped_lat, "\"routing_reason\":\"\"", reason_repl);
 }
 
 /// Bump the cache epoch (call on every document ingest). Returns the
@@ -99,6 +124,20 @@ test "cacheKey is stable per query+limit and differs across inputs" {
     try std.testing.expect(!std.mem.eql(u8, a, d));
     try std.testing.expect(std.mem.startsWith(u8, a, key_prefix));
     try std.testing.expectEqual(@as(usize, key_prefix.len + 64), a.len);
+}
+
+test "stampServed stamps id, path, latency and reason" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const stored = "{\"query\":\"fuel\",\"path\":\"\",\"latency_ms\":0,\"routing_reason\":\"\",\"meta\":{\"request_id\":\"\"}}";
+    const stamped = try stampServed(alloc, stored, "req-abc", "instant", 0.123456, "l1_hit");
+    try std.testing.expect(std.mem.indexOf(u8, stamped, "\"request_id\":\"req-abc\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stamped, "\"path\":\"instant\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stamped, "\"latency_ms\":0.123456") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stamped, "\"routing_reason\":\"l1_hit\"") != null);
+    // A body without the markers fails loudly instead of serving a lie.
+    try std.testing.expectError(error.MarkerMissing, stampServed(alloc, "{\"meta\":{}}", "x", "fast", 1, "y"));
 }
 
 test "stampRequestId splices the current id into the empty marker" {

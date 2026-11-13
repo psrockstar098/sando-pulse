@@ -80,6 +80,15 @@ pub const MemIndex = struct {
     }
 
     pub fn deinit(self: *MemIndex) void {
+        self.clear();
+        self.terms.deinit();
+        self.doc_terms.deinit();
+        self.doc_order.deinit(self.alloc);
+    }
+
+    /// Drop every indexed term and document but keep the maps allocated
+    /// (Roadmap 6.5 rebuilds: clear, then buildFromRepo from the store).
+    pub fn clear(self: *MemIndex) void {
         var tit = self.terms.iterator();
         while (tit.next()) |kv| {
             const te = kv.value_ptr.*;
@@ -88,16 +97,18 @@ pub const MemIndex = struct {
             self.alloc.destroy(te);
             self.alloc.free(kv.key_ptr.*);
         }
-        self.terms.deinit();
+        self.terms.clearRetainingCapacity();
         var dit = self.doc_terms.iterator();
         while (dit.next()) |kv| {
             for (kv.value_ptr.*) |t| self.alloc.free(t);
             self.alloc.free(kv.value_ptr.*);
             self.alloc.free(kv.key_ptr.*);
         }
-        self.doc_terms.deinit();
+        self.doc_terms.clearRetainingCapacity();
         for (self.doc_order.items) |id| self.alloc.free(id);
-        self.doc_order.deinit(self.alloc);
+        self.doc_order.clearRetainingCapacity();
+        self.bytes = 0;
+        self.docs_indexed = 0;
     }
 
     /// Search the index for documents matching any of `terms`

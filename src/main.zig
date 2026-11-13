@@ -43,6 +43,8 @@ const ratelimit = @import("api/ratelimit.zig");
 const metrics = @import("api/metrics.zig");
 const server = @import("api/server.zig");
 const l1cache = @import("api/l1cache.zig");
+const cache = @import("api/cache.zig");
+const memindex = @import("engine/memindex.zig");
 const worker = @import("workers/worker.zig");
 const providers = @import("ai/providers.zig");
 
@@ -181,8 +183,8 @@ pub fn main(init: std.process.Init) !void {
 
     const is_worker = std.mem.eql(u8, cmd, "worker");
     const once = is_worker and (cmd_arg != null and std.mem.eql(u8, cmd_arg.?, "--once"));
-    if (!std.mem.eql(u8, cmd, "serve") and !is_worker and !std.mem.eql(u8, cmd, "maintenance") and !std.mem.eql(u8, cmd, "seed") and !std.mem.eql(u8, cmd, "briefing") and !std.mem.eql(u8, cmd, "loadtest") and !std.mem.eql(u8, cmd, "audit") and !std.mem.eql(u8, cmd, "backup") and !std.mem.eql(u8, cmd, "restore") and !std.mem.eql(u8, cmd, "mock-sando")) {
-        logging.err("unknown command (serve | worker [--once] | migrate | status | keygen | maintenance | seed | briefing | loadtest | audit | backup | restore | mock-sando)", &.{});
+    if (!std.mem.eql(u8, cmd, "serve") and !is_worker and !std.mem.eql(u8, cmd, "maintenance") and !std.mem.eql(u8, cmd, "seed") and !std.mem.eql(u8, cmd, "briefing") and !std.mem.eql(u8, cmd, "loadtest") and !std.mem.eql(u8, cmd, "audit") and !std.mem.eql(u8, cmd, "backup") and !std.mem.eql(u8, cmd, "restore") and !std.mem.eql(u8, cmd, "mock-sando") and !std.mem.eql(u8, cmd, "reindex")) {
+        logging.err("unknown command (serve | worker [--once] | migrate | status | keygen | maintenance | seed | briefing | loadtest | audit | backup | restore | mock-sando | reindex)", &.{});
         std.process.exit(2);
     }
 
@@ -342,6 +344,24 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, cmd, "reindex")) {
+        // Roadmap 6.5: rebuild the in-memory index from the store and
+        // report the measured result. The server does this at boot and
+        // on epoch change; this command rebuilds it on demand.
+        var idx = memindex.MemIndex.init(alloc, cfg.memindex_max_terms, cfg.memindex_max_docs, 64 * 1024 * 1024);
+        defer idx.deinit();
+        const start_ms = timex.nowMillis(io);
+        const report = try idx.buildFromRepo(alloc, repo, timex.nowMillis(io), start_ms);
+        std.debug.print("reindex: docs_seen={d} docs_added={d} docs_evicted={d} terms={d} duration_ms={d}\n", .{
+            report.docs_seen,
+            report.docs_added,
+            report.docs_evicted,
+            report.terms,
+            report.duration_ms,
+        });
+        return;
+    }
+
     if (is_worker) {
         if (once) {
             const report = try worker.runOnce(alloc, io, repo, sink, if (archiver) |*a| a else null, &m, init.environ_map, embedder, ks, cfg.ingest_interval_s, cfg.max_concurrent_sources, &fb_connector);
@@ -401,6 +421,31 @@ pub fn main(init: std.process.Init) !void {
     var l1 = l1cache.L1Cache.init(alloc, cfg.l1_max_entries, cfg.l1_max_bytes, cfg.l1_ttl_s);
     defer l1.deinit();
 
+    // In-memory index (Roadmap 6.3/6.5): built from the store at boot.
+    // A build failure is a warning, not a boot failure — queries fall
+    // back to the store search.
+    var mem_index = memindex.MemIndex.init(alloc, cfg.memindex_max_terms, cfg.memindex_max_docs, 64 * 1024 * 1024);
+    defer mem_index.deinit();
+    var index_ptr: ?*memindex.MemIndex = null;
+    var index_epoch: i64 = 0;
+    var index_built_ms: i64 = 0;
+    {
+        const start_ms = timex.nowMillis(io);
+        const report = mem_index.buildFromRepo(alloc, repo, timex.nowMillis(io), start_ms) catch null;
+        if (report) |r| {
+            index_ptr = &mem_index;
+            if (redis_client) |rc| index_epoch = cache.currentEpoch(rc, alloc);
+            index_built_ms = timex.nowMillis(io);
+            logging.info("memindex built", &.{
+                .{ .key = "docs_added", .value = std.fmt.allocPrint(alloc, "{d}", .{r.docs_added}) catch "?" },
+                .{ .key = "terms", .value = std.fmt.allocPrint(alloc, "{d}", .{r.terms}) catch "?" },
+                .{ .key = "duration_ms", .value = std.fmt.allocPrint(alloc, "{d}", .{r.duration_ms}) catch "?" },
+            });
+        } else {
+            logging.warn("memindex build failed, queries use the store search", &.{});
+        }
+    }
+
     var srv = server.Server{
         .alloc = alloc,
         .io = io,
@@ -415,6 +460,9 @@ pub fn main(init: std.process.Init) !void {
         .facebook = &fb_connector,
         .redis = redis_client,
         .l1 = &l1,
+        .index = index_ptr,
+        .index_epoch = index_epoch,
+        .index_built_ms = index_built_ms,
         .usage_tracker = &usage_tracker,
         .audit_sink = &audit_sink,
     };

@@ -508,3 +508,59 @@ direct order 2026-11-13), real data only, docs in the same commits.
   (freq-map keys; term-map keys in `deinit`).
 - Not yet wired into the query path: the index is built and tested but
   no endpoint reads it — that is 6.1/6.7 (router + Path A), next.
+
+### 6.1 + 6.7 Three execution paths + adaptive routing — DONE (2026-11-13 ~14:55)
+
+- `src/engine/router.zig` (new): pure router. `instant` = L1 hit only;
+  `deep` = research/compare/historical intents, `strategy:deep`, or no
+  lexical terms (semantic-only); `fast` = everything else (geo-indexed,
+  simple_indexed for short confident queries, default_fast). Every
+  response carries `path`, measured server-side `latency_ms` (fractional,
+  from `timex.latencyMsF64`), and `routing_reason`.
+- `src/api/cache.zig`: `stampServed` splices request id + serving path
+  + measured latency + routing reason into a cached body, so a hit
+  reports the path that SERVED it (instant/l1_hit or instant/l2_hit),
+  not the path that first computed it. Stored bodies are rendered with
+  empty markers (`"path":""`, `"latency_ms":0`, `"routing_reason":""`);
+  a missing marker fails loudly instead of serving a lie.
+- `src/engine/search.zig`: `SearchOptions.candidates` — the fast path
+  passes index-resolved documents; the fuzzy second pass still runs
+  when fewer than 3 candidates survive, so an index miss degrades to
+  the store search, never to nothing.
+- Metrics: per-path counters + latency totals (`pulse_queries_path_*`,
+  `pulse_path_latency_ms_*`), `pulse_memindex_lookups_total` /
+  `pulse_memindex_hits_total`.
+- Verified: `zig build` passes; 227/227 tests (9 new: 7 router, 1
+  stampServed, 1 buildQueryResponse shape incl. the renderer<->stamp
+  marker contract). Live smoke test (3-doc store): "fuel shortage in
+  Monrovia" -> path fast, latency 89.17 ms, reason default_fast,
+  sufficient true; identical repeat -> path instant, latency 0.169 ms,
+  reason l1_hit, `x-pulse-cached: true`; research query -> path deep,
+  reason strategy_deep. memindex lookups 1, hits 0 (only 3 docs in the
+  store — the <3-candidate fallback to the store search worked).
+- Honest note: precomputed instant for *queries* is NOT wired — the
+  trends/briefing payload shape differs from the query response, so
+  `/v1/trends` and `/v1/briefing` serve those directly (Redis-cached).
+  The router's instant path is L1 hits only.
+
+### 6.5 Incremental indexing — DONE (2026-11-13 ~14:55)
+
+- Server boot builds the index from the store (`pulse serve` logs
+  `memindex built`: 3 docs, 17 terms, 0 ms on the test store). A build
+  failure is a warning, not a boot failure — queries fall back to the
+  store search.
+- `pulse reindex` CLI: rebuilds on demand, prints the measured report
+  (`reindex: docs_seen=3 docs_added=3 docs_evicted=0 terms=17
+  duration_ms=0`).
+- In-process ingest: POST /v1/ingest calls `index.addDocument` right
+  after storing, so the fast path can serve the new document at once.
+  A failure is a warning only — the store search still finds it.
+- Epoch-triggered rebuild: on each query, when the Redis epoch moved
+  since the index was built (worker ingests bump it) AND the rebuild
+  interval elapsed (`PULSE_REINDEX_INTERVAL_S`, default 3600), the
+  server clears and rebuilds the index from the store. Bounded by the
+  index caps; a rebuild failure keeps the old index.
+- Honest note: the rebuild is a full clear + rescan (cheap at current
+  scale — 0 ms for 3 docs); a timestamp-filtered incremental refresh
+  needs a `scanDocuments(after_ts)` extension and is recorded as a
+  future optimization, not done here.

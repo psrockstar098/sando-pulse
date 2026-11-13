@@ -29,6 +29,9 @@ pub const Metrics = struct {
     path_latency_ms_instant_total: u64 = 0,
     path_latency_ms_fast_total: u64 = 0,
     path_latency_ms_deep_total: u64 = 0,
+    /// In-memory index (Roadmap 6.3): lookups and usable shortlists.
+    memindex_lookups_total: u64 = 0,
+    memindex_hits_total: u64 = 0,
     ingest_runs_total: u64 = 0,
     ingest_errors_total: u64 = 0,
     documents_indexed_total: u64 = 0,
@@ -91,6 +94,14 @@ pub const Metrics = struct {
             self.queries_path_fast_total += 1;
             self.path_latency_ms_fast_total += whole;
         }
+    }
+
+    pub fn observeMemindexLookup(self: *Metrics) void {
+        self.memindex_lookups_total += 1;
+    }
+
+    pub fn observeMemindexHit(self: *Metrics) void {
+        self.memindex_hits_total += 1;
     }
 
     pub fn observeIngestRun(self: *Metrics, had_error: bool) void {
@@ -167,6 +178,12 @@ pub const Metrics = struct {
             \\# HELP pulse_path_latency_ms_deep_total Total deep-path latency in milliseconds
             \\# TYPE pulse_path_latency_ms_deep_total counter
             \\pulse_path_latency_ms_deep_total {d}
+            \\# HELP pulse_memindex_lookups_total In-memory index lookups on the fast path
+            \\# TYPE pulse_memindex_lookups_total counter
+            \\pulse_memindex_lookups_total {d}
+            \\# HELP pulse_memindex_hits_total Index lookups that returned enough candidates to rank
+            \\# TYPE pulse_memindex_hits_total counter
+            \\pulse_memindex_hits_total {d}
             \\# HELP pulse_ingest_runs_total Ingestion runs completed
             \\# TYPE pulse_ingest_runs_total counter
             \\pulse_ingest_runs_total {d}
@@ -199,6 +216,8 @@ pub const Metrics = struct {
             self.path_latency_ms_instant_total,
             self.path_latency_ms_fast_total,
             self.path_latency_ms_deep_total,
+            self.memindex_lookups_total,
+            self.memindex_hits_total,
             self.ingest_runs_total,
             self.ingest_errors_total,
             self.documents_indexed_total,

@@ -44,6 +44,8 @@ const ratelimit = @import("ratelimit.zig");
 const metrics = @import("metrics.zig");
 const cache = @import("cache.zig");
 const l1cache = @import("l1cache.zig");
+const memindex = @import("../engine/memindex.zig");
+const router = @import("../engine/router.zig");
 const usage = @import("usage.zig");
 const auditlog = @import("auditlog.zig");
 const timex = @import("../common/time.zig");
@@ -75,6 +77,13 @@ pub const Server = struct {
     /// L1 in-process cache (Roadmap 6.2). Always present; sits in front
     /// of the Redis (L2) query cache. Keys are consumer-scoped.
     l1: *l1cache.L1Cache,
+    /// In-memory inverted index (Roadmap 6.3/6.5). Null when the boot
+    /// build failed — queries then always use the store search.
+    /// `index_epoch` is the Redis cache epoch the index was built from;
+    /// `index_built_ms` gates the epoch-triggered rebuild interval.
+    index: ?*memindex.MemIndex = null,
+    index_epoch: i64 = 0,
+    index_built_ms: i64 = 0,
     /// Usage tracking (Roadmap 5.3): per-consumer counters, Redis-backed
     /// when a client is configured, in-memory otherwise. Always present.
     usage_tracker: *usage.UsageTracker,
@@ -243,6 +252,33 @@ pub const Server = struct {
     /// validated the name.
     fn consumerOf(head: HeadCapture) []const u8 {
         return head.consumer_header orelse usage.default_consumer_name;
+    }
+
+    /// Epoch-triggered index rebuild (Roadmap 6.5). When Redis is
+    /// present and the cache epoch moved since the index was built —
+    /// worker ingests bump it — and the rebuild interval elapsed,
+    /// clear and rebuild the index from the store. A rebuild failure
+    /// keeps the old index; this never fails a query.
+    fn maybeRebuildIndex(self: *Server, alloc: std.mem.Allocator) void {
+        const idx = self.index orelse return;
+        const rc = self.redis orelse return;
+        const epoch = cache.currentEpoch(rc, alloc);
+        if (epoch == self.index_epoch) return;
+        const now_ms = timex.nowMillis(self.io);
+        if (now_ms - self.index_built_ms < @as(i64, @intCast(self.cfg.reindex_interval_s)) * 1000) return;
+        idx.clear();
+        const start_ms = now_ms;
+        const report = idx.buildFromRepo(alloc, self.repo, timex.nowMillis(self.io), start_ms) catch {
+            logging.warn("memindex rebuild failed, keeping old index", &.{});
+            return;
+        };
+        self.index_epoch = epoch;
+        self.index_built_ms = timex.nowMillis(self.io);
+        logging.info("memindex rebuilt on epoch change", &.{
+            .{ .key = "docs_added", .value = std.fmt.allocPrint(alloc, "{d}", .{report.docs_added}) catch "?" },
+            .{ .key = "terms", .value = std.fmt.allocPrint(alloc, "{d}", .{report.terms}) catch "?" },
+            .{ .key = "duration_ms", .value = std.fmt.allocPrint(alloc, "{d}", .{report.duration_ms}) catch "?" },
+        });
     }
 
     fn keyFpOf(head: HeadCapture, arena: std.mem.Allocator) []const u8 {
@@ -631,6 +667,7 @@ pub const Server = struct {
 
         if (method == .POST and std.mem.eql(u8, path, "/v1/query")) {
             if (!self.checkAuthAndRate(req, head, alloc, req_id, .query)) return;
+            const query_start_ns = timex.nowNanos(self.io);
             const body = readBody(req, alloc) catch {
                 self.respondError(req, alloc, req_id, .bad_request, "invalid_request", "Request body too large or unreadable");
                 return;
@@ -643,10 +680,17 @@ pub const Server = struct {
             for (sources.sources) |s| {
                 if (s.enabled) try enabled.append(alloc, s.id);
             }
+            // Epoch-triggered index rebuild (Roadmap 6.5): worker ingests
+            // bump the Redis epoch; when it moved since the index was
+            // built (and the rebuild interval elapsed), rebuild from the
+            // store. Bounded by the index caps; a rebuild failure keeps
+            // the old index rather than failing the query.
+            self.maybeRebuildIndex(alloc);
             // L1 in-process cache (Roadmap 6.2): checked first, before
             // the Redis (L2) cache. The key is consumer-scoped so a
             // cached response can never leak across consumers. A hit
-            // serves the stored body with the current request id spliced
+            // serves the stored body with the current request id, the
+            // serving path (instant), and the measured latency spliced
             // in, exactly like the L2 hit below.
             var l1_key: ?[]u8 = null;
             const l1_now = timex.nowMillis(self.io);
@@ -654,9 +698,11 @@ pub const Server = struct {
                 l1_key = l1cache.L1Cache.queryKey(alloc, consumerOf(head), qr.query, qr.limit) catch null;
                 if (l1_key) |lk| {
                     if (self.l1.get(lk, l1_now)) |stored| {
-                        if (cache.stampRequestId(alloc, stored, req_id) catch null) |stamped_body| {
+                        const latency_ms = timex.latencyMsF64(query_start_ns, timex.nowNanos(self.io));
+                        if (cache.stampServed(alloc, stored, req_id, "instant", latency_ms, "l1_hit") catch null) |stamped_body| {
                             self.metrics.observeL1Hit();
                             self.metrics.observeQuery(cachedSufficient(stamped_body) orelse true);
+                            self.metrics.observePath("instant", latency_ms);
                             self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
                             self.recordUsage(head, .query);
                             self.auditCall(head, alloc, req_id, 200);
@@ -680,9 +726,11 @@ pub const Server = struct {
                     if (cache_key) |k| {
                         cache_epoch = cache.currentEpoch(rc, alloc);
                         if (cache.get(rc, alloc, k, cache_epoch) catch null) |stored| {
-                            if (cache.stampRequestId(alloc, stored, req_id) catch null) |stamped_body| {
+                            const latency_ms = timex.latencyMsF64(query_start_ns, timex.nowNanos(self.io));
+                            if (cache.stampServed(alloc, stored, req_id, "instant", latency_ms, "l2_hit") catch null) |stamped_body| {
                                 self.metrics.observeCacheHit();
                                 self.metrics.observeQuery(cachedSufficient(stamped_body) orelse true);
+                                self.metrics.observePath("instant", latency_ms);
                                 self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
                                 self.recordUsage(head, .query);
                                 self.auditCall(head, alloc, req_id, 200);
@@ -699,26 +747,56 @@ pub const Server = struct {
                 self.respondError(req, alloc, req_id, .internal_server_error, "planner_failed", "Query planning failed");
                 return;
             };
+            // Three-path router (Roadmap 6.1/6.7): instant is served
+            // above (L1/L2 hits); here we choose fast vs deep.
+            const decision = router.route(p, .{});
+            // Fast path: shortlist candidates from the in-memory index
+            // (Roadmap 6.3) and resolve them via getDocument. Fewer than
+            // 3 usable candidates falls back to the store search — the
+            // deep path skips the index entirely.
+            var index_docs: ?[]types.Document = null;
+            if (decision.path == .fast) {
+                if (self.index) |idx| {
+                    if (idx.search(alloc, p.terms, timex.nowMillis(self.io), 50) catch null) |cands| {
+                        self.metrics.observeMemindexLookup();
+                        if (cands.len >= 3) {
+                            var docs: std.ArrayList(types.Document) = .empty;
+                            for (cands) |c| {
+                                if (self.repo.getDocument(alloc, c.doc_id) catch null) |d| {
+                                    docs.append(alloc, d) catch {};
+                                }
+                            }
+                            if (docs.items.len >= 3) {
+                                index_docs = docs.items;
+                                self.metrics.observeMemindexHit();
+                            } else docs.deinit(alloc);
+                        }
+                    }
+                }
+            }
             const outcome = search.searchAndRank(alloc, self.repo, p, now, .{
                 .embedder = self.embedder,
                 .tz_offset_minutes = self.cfg.tz_offset_minutes,
+                .candidates = index_docs,
             }) catch {
                 self.respondError(req, alloc, req_id, .internal_server_error, "search_failed", "Search failed");
                 return;
             };
             self.metrics.observeQuery(outcome.sufficient);
-            const resp = query_json.buildQueryResponse(alloc, req_id, qr.query, p, outcome, enabled.items.len, timex.nowSeconds(self.io)) catch {
+            const latency_ms = timex.latencyMsF64(query_start_ns, timex.nowNanos(self.io));
+            const resp = query_json.buildQueryResponse(alloc, req_id, qr.query, p, outcome, enabled.items.len, timex.nowSeconds(self.io), decision.path.name(), latency_ms, decision.reason) catch {
                 self.respondError(req, alloc, req_id, .internal_server_error, "response_failed", "Failed to render response");
                 return;
             };
-            // Store a copy rendered with an empty request id so a later
-            // hit can splice in its own id. Oversized responses are
-            // served but never stored. The L1 entry is tagged with the
-            // plan's topics/counties/cities so ingest can invalidate
-            // only the affected entries (Roadmap 6.2).
+            self.metrics.observePath(decision.path.name(), latency_ms);
+            // Store a copy rendered with empty markers so a later hit
+            // can splice in its own id, serving path, and latency.
+            // Oversized responses are served but never stored. The L1
+            // entry is tagged with the plan's topics/counties/cities so
+            // ingest can invalidate only the affected entries (6.2).
             if (l1_key != null or cache_key != null) {
                 if (resp.len <= cache.max_response_bytes) {
-                    const storable = query_json.buildQueryResponse(alloc, "", qr.query, p, outcome, enabled.items.len, timex.nowSeconds(self.io)) catch null;
+                    const storable = query_json.buildQueryResponse(alloc, "", qr.query, p, outcome, enabled.items.len, timex.nowSeconds(self.io), "", 0, "") catch null;
                     if (storable) |s| {
                         if (l1_key) |lk| {
                             var tags: std.ArrayList([]const u8) = .empty;
@@ -842,6 +920,15 @@ pub const Server = struct {
                 const snap = self.l1.snapshot();
                 self.metrics.setL1Stats(snap.entries, snap.bytes);
                 tags.deinit(alloc);
+            }
+            // In-memory index update (Roadmap 6.5): the new document is
+            // indexed in-process so the fast path can serve it at once.
+            // A failure is a warning only — the store search still finds
+            // it, and the next epoch-triggered rebuild re-indexes it.
+            if (self.index) |idx| {
+                idx.addDocument(doc, timex.nowMillis(self.io)) catch {
+                    logging.warn("memindex addDocument failed on ingest", &.{.{ .key = "doc_id", .value = doc.id }});
+                };
             }
             self.metrics.setDocumentsIndexed(@intCast(self.repo.countDocuments()));
             const resp = try std.fmt.allocPrint(alloc, "{{\"id\":\"{s}\",\"source_id\":\"{s}\",\"request_id\":\"{s}\"}}", .{ doc.id, doc.source_id, req_id });
