@@ -189,10 +189,13 @@ const TimelineDayJson = struct {
 /// `fanout_complete` is false when a backend was still running when the
 /// deadline passed — its section is then empty (partial results,
 /// labelled, never silently stale).
+/// `stat_answer` (Roadmap 7.2) is set when the query is a count/stat
+/// question answered (or honestly refused) from the knowledge store.
 pub const Enrichment = struct {
     locations: []const knowledge.LocationRow = &.{},
     statistics: []const knowledge.StatisticRow = &.{},
     fanout_complete: bool = true,
+    stat_answer: ?statanswer.StatAnswer = null,
 };
 
 pub fn buildQueryResponse(
@@ -269,6 +272,7 @@ pub fn buildQueryResponse(
         .locations = enrich.locations,
         .statistics = enrich.statistics,
         .fanout_complete = enrich.fanout_complete,
+        .stat_answer = enrich.stat_answer,
         .results = results.items,
         .events = events.items,
         .timeline = timeline.items,
@@ -481,6 +485,7 @@ pub fn buildEventDetailResponse(
 
 const trending = @import("../intelligence/trending.zig");
 const forecast_mod = @import("../intelligence/forecast.zig");
+const statanswer = @import("../intelligence/statanswer.zig");
 
 /// GET /v1/forecast — predictive trends (Roadmap 7.1): linear
 /// extrapolations + z-score anomalies from monthly aggregates.

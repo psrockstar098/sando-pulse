@@ -17,6 +17,9 @@ pub const Intent = enum {
     timeline,
     compare,
     historical,
+    /// A count/stat question answerable from the knowledge store
+    /// (Roadmap 7.2): "how many schools...", "population of...".
+    stat,
 
     pub fn toString(self: Intent) []const u8 {
         return switch (self) {
@@ -28,6 +31,7 @@ pub const Intent = enum {
             .timeline => "timeline",
             .compare => "compare",
             .historical => "historical",
+            .stat => "stat",
         };
     }
 
@@ -40,6 +44,7 @@ pub const Intent = enum {
         if (std.mem.eql(u8, s, "timeline")) return .timeline;
         if (std.mem.eql(u8, s, "compare")) return .compare;
         if (std.mem.eql(u8, s, "historical")) return .historical;
+        if (std.mem.eql(u8, s, "stat")) return .stat;
         return null;
     }
 };
@@ -98,6 +103,12 @@ const compare_words = [_][]const u8{ "compare", "versus", " vs ", "difference be
 const historical_words = [_][]const u8{ "last year", "in 20", "history", "years ago", "decade", "in the past" };
 const deep_words = [_][]const u8{ "comprehensive", "in depth", "in-depth", "thorough", "all about", "everything about" };
 const fast_words = [_][]const u8{ "quick", "brief", "short answer", "just tell me" };
+/// Stat questions (Roadmap 7.2): a count or a population. Scored
+/// x4 so the stat intent beats the local intent a place name
+/// would otherwise trigger ("How many schools are in Montserrado
+/// County?" scores local 3 — county +2, the word "county" +1 — so
+/// one stat phrase must outscore that).
+const stat_words = [_][]const u8{ "how many", "population of", "number of" };
 
 /// Classify a natural-language query. `now` is Unix seconds; the timezone
 /// offset is minutes east of UTC. No allocation.
@@ -116,6 +127,7 @@ pub fn classify(query: []const u8, now: i64, tz_offset_minutes: i32) Classificat
     const research_score = scorePhrases(s, &research_words);
     const compare_score = scorePhrases(s, &compare_words);
     var historical_score = scorePhrases(s, &historical_words);
+    const stat_score = scorePhrases(s, &stat_words) * 4;
 
     // A known Liberian place name in the query strongly suggests local intent.
     // Location names are stored capitalized; lowercase them to match the
@@ -151,6 +163,7 @@ pub fn classify(query: []const u8, now: i64, tz_offset_minutes: i32) Classificat
     var intent: Intent = .search;
     var best: usize = 0;
     const candidates = [_]struct { intent: Intent, score: usize }{
+        .{ .intent = .stat, .score = stat_score },
         .{ .intent = .live, .score = live_score },
         .{ .intent = .timeline, .score = timeline_score },
         .{ .intent = .trends, .score = trends_score },
@@ -222,4 +235,22 @@ test "intent: strategy words" {
     try std.testing.expectEqual(Strategy.fast, quick.strategy);
     const deep = classify("comprehensive report on mining", now, 0);
     try std.testing.expectEqual(Strategy.deep, deep.strategy);
+}
+
+test "intent: stat questions beat the local intent" {
+    const now: i64 = 1794484800;
+    const q1 = classify("How many schools are in Montserrado County?", now, 0);
+    try std.testing.expectEqual(Intent.stat, q1.intent);
+    const q2 = classify("What is the population of Nimba?", now, 0);
+    try std.testing.expectEqual(Intent.stat, q2.intent);
+    // "How many people attended the rally" names no facility or
+    // population phrase, so it is NOT a stat question — but the
+    // intent classifier only sees the "how many" phrase and still
+    // tags it .stat. That is fine: the strict gate is
+    // statanswer.detectStatQuestion (facility word or population
+    // required), which rejects it and the query falls through to
+    // the normal search. A query with no stat phrase at all
+    // classifies local, not stat.
+    const q3 = classify("Who attended the rally in Monrovia?", now, 0);
+    try std.testing.expect(q3.intent != .stat);
 }

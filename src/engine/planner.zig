@@ -67,6 +67,7 @@ fn intentString(i: intent_mod.Intent) []const u8 {
         .timeline => "timeline",
         .compare => "compare",
         .historical => "historical",
+        .stat => "stat",
     };
 }
 

@@ -75,11 +75,17 @@ const facility_words: []const struct { word: []const u8, kind: []const u8 } = &.
     .{ .word = "institute", .kind = "institute" },
 };
 
+/// A known Liberian place named in a query, canonical case.
+pub const PlaceMatch = struct {
+    name: []const u8,
+    kind: []const u8, // "county" | "city" | "country"
+};
+
 /// Find a known Liberian place (county first, then city) named in
 /// the lowercased query. Returns the canonical name + kind, or null.
 /// Longest match wins ("Grand Cape Mount" before "Grand").
-fn findPlace(lower: []const u8) ?struct { name: []const u8, kind: []const u8 } {
-    var best: ?struct { name: []const u8, kind: []const u8 } = null;
+fn findPlace(lower: []const u8) ?PlaceMatch {
+    var best: ?PlaceMatch = null;
     var best_len: usize = 0;
     for (entities_mod.counties) |c| {
         if (c.len <= best_len) continue;

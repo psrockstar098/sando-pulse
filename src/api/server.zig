@@ -38,6 +38,7 @@ const facebook = @import("../ingestion/connectors/facebook/facebook.zig");
 const fb_webhooks = @import("../ingestion/connectors/facebook/webhooks.zig");
 const trending = @import("../intelligence/trending.zig");
 const forecast_mod = @import("../intelligence/forecast.zig");
+const statanswer = @import("../intelligence/statanswer.zig");
 const precomputed = @import("../intelligence/precomputed.zig");
 const quality = @import("../intelligence/quality.zig");
 const redis = @import("../storage/redis.zig");
@@ -654,7 +655,36 @@ pub const Server = struct {
         const p = planner.plan(alloc, query_text, enabled, now, self.cfg.tz_offset_minutes) catch return error.PlannerFailed;
         // Three-path router (Roadmap 6.1/6.7): instant is served by the
         // caches above; here we choose fast vs deep.
-        const decision = router.route(p, .{});
+        var decision = router.route(p, .{});
+        // Stat answers (Roadmap 7.2): a count/stat question is
+        // answered from the knowledge store instead of the news
+        // search — no search, no fan-out, just the store, with an
+        // honest refusal when the store cannot answer. The response
+        // still renders through the shared tail below, so caching
+        // and metrics behave exactly like a normal query.
+        var enrich = query_json.Enrichment{};
+        var outcome: search.Outcome = undefined;
+        var stat_answered = false;
+        if (statanswer.detectStatQuestion(alloc, query_text) catch null) |sq| {
+            if (self.knowledge) |k| {
+                if (statanswer.answerStat(alloc, k, sq, query_text) catch null) |ans| {
+                    enrich.stat_answer = ans;
+                    outcome = .{
+                        .answer = ans.answer_text,
+                        .results = &.{},
+                        .confidence = if (ans.sufficient) 0.9 else 0,
+                        .sufficient = ans.sufficient,
+                        .insufficient_reason = ans.insufficient_reason,
+                        .events = &.{},
+                        .timeline = &.{},
+                    };
+                    decision = .{ .path = .fast, .reason = "stat_answer" };
+                    stat_answered = true;
+                }
+            }
+        }
+        var fo: ?fanout.Fanout = null;
+        if (!stat_answered) {
         // Fast path: shortlist candidates from the in-memory index
         // (Roadmap 6.3) and resolve them via getDocument. Fewer than
         // 3 usable candidates falls back to the store search — the
@@ -689,7 +719,6 @@ pub const Server = struct {
         // task list live in the caller's arena, NOT on this stack:
         // the threads may still be running when computeQuery returns,
         // and the caller joins them after the response is sent.
-        var fo: ?fanout.Fanout = null;
         var loc_task: ?*LocationsTask = null;
         var stat_task: ?*StatisticsTask = null;
         if ((p.counties.len > 0 or p.cities.len > 0 or p.topics.len > 0) and self.knowledge != null) {
@@ -706,7 +735,7 @@ pub const Server = struct {
             fo = fanout.Fanout.start(alloc, tasks, parallel) catch null;
             if (fo == null) fanout.runSequential(alloc, tasks);
         }
-        const outcome = search.searchAndRank(alloc, self.repo, p, now, .{
+        outcome = search.searchAndRank(alloc, self.repo, p, now, .{
             .embedder = self.embedder,
             .tz_offset_minutes = self.cfg.tz_offset_minutes,
             .candidates = index_docs,
@@ -719,13 +748,13 @@ pub const Server = struct {
         // until the deadline, then take whatever completed. A task
         // still running leaves its section empty and
         // fanout_complete false (partial results, labelled).
-        var enrich = query_json.Enrichment{};
         if (fo) |*f| {
             f.wait(self.fanout_timeout_ms);
             enrich.fanout_complete = f.allDone();
             self.metrics.observeFanout(enrich.fanout_complete);
             if (f.completed("locations")) enrich.locations = loc_task.?.out;
             if (f.completed("statistics")) enrich.statistics = stat_task.?.out;
+        }
         }
         self.metrics.observeQuery(outcome.sufficient);
         const latency_ms = timex.latencyMsF64(query_start_ns, timex.nowNanos(self.io));
