@@ -28,9 +28,23 @@ echo "== 1. pulse binary (zig 0.17.1, ReleaseSafe) =="
 cp /tmp/pulse-build-out/bin/pulse "$AIO/pulse"
 
 echo "== 2. vendored .debs (archive candidate versions) =="
+# Prefer Ubuntu-archive versions for everything: the build host may
+# carry a third-party repo (the GitHub runner ships PostgreSQL from
+# PGDG), and those versions are not in the Ubuntu archive, so they
+# cannot be downloaded. Pinning the Ubuntu origin above all others
+# makes the candidate the Ubuntu version. Non-fatal if sudo is
+# unavailable — the Python below falls back to reading the Packages
+# lists directly for any package whose candidate is still third-party.
+if command -v sudo >/dev/null 2>&1; then
+    printf 'Package: *\nPin: release o=Ubuntu\nPin-Priority: 1001\n' \
+        | sudo tee /etc/apt/preferences.d/ubuntu-archive-first >/dev/null 2>&1 \
+        || echo "  NOTE: could not write apt pin, continuing without it"
+    echo "  apt pin (Ubuntu origin first) in place; candidate check:"
+    apt-cache policy libpq5 postgresql-common 2>/dev/null | grep -E '^(libpq5|postgresql-common):|Candidate:' || true
+fi
 mkdir -p "$AIO/debs"
 python3 - "$AIO" <<'EOF'
-import subprocess, re, sys, glob
+import subprocess, re, sys, glob, os
 aio = sys.argv[1]
 roots = ["postgresql-16", "postgresql-16-postgis-3", "postgresql-16-pgvector",
          "redis-server", "postgresql-client-16", "curl", "ca-certificates"]
@@ -54,10 +68,12 @@ def ubuntu_archive_version(pkg):
     # madison / showpkg all see only installed versions, while
     # apt-get download sees the full archive), so this bypasses it.
     # Prefer noble-updates, then security, then backports, then noble.
+    matched = 0
     for suite in ["noble-updates", "noble-security", "noble-backports", "noble"]:
         pattern = ("/var/lib/apt/lists/*archive.ubuntu.com_ubuntu_dists_"
                    f"{suite}_*_binary-amd64_Packages")
         for path in sorted(glob.glob(pattern)):
+            matched += 1
             try:
                 text = open(path, errors="ignore").read()
             except OSError:
@@ -69,6 +85,14 @@ def ubuntu_archive_version(pkg):
                 for ln in lines:
                     if ln.startswith("Version: "):
                         return ln.split(None, 1)[1].strip()
+    if matched == 0:
+        # Diagnostic: the lists are not where the glob expects them.
+        print(f"  DIAG {pkg}: no *archive.ubuntu.com Packages files matched in /var/lib/apt/lists")
+        try:
+            names = sorted(os.listdir("/var/lib/apt/lists"))[:20]
+            print(f"  DIAG lists dir first 20: {names}")
+        except OSError as e:
+            print(f"  DIAG cannot list /var/lib/apt/lists: {e}")
     return None
 
 
