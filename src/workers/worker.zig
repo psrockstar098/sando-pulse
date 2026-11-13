@@ -177,7 +177,8 @@ pub fn runLoop(
         if (precompute_due) {
             last_precompute = now2;
             if (redis_client) |rc| {
-                if (precomputed.refreshBriefing(arena.allocator(), rc, repo, ks, now2, cfg.precompute_ttl_s)) {
+                const social_available = fb != null and fb.?.validate() == null;
+                if (precomputed.refreshBriefing(arena.allocator(), rc, repo, ks, now2, cfg.precompute_ttl_s, social_available)) {
                     logging.info("briefing refreshed", &.{});
                 } else {
                     logging.warn("briefing refresh failed", &.{});

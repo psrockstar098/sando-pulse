@@ -1,6 +1,6 @@
 //! Pulse CLI: `pulse serve` | `pulse worker [--once]` | `pulse migrate` |
 //! `pulse status` | `pulse keygen` | `pulse maintenance` | `pulse seed` |
-//! `pulse briefing` | `pulse alerts` | `pulse loadtest [--url ...] [--threads N] [--requests N] [--query ...]` |
+//! `pulse briefing [--scope weekly] [--kind political|economic] [--county <name>]` | `pulse alerts` | `pulse loadtest [--url ...] [--threads N] [--requests N] [--query ...]` |
 //! `pulse audit` | `pulse backup [--out <path>] [--keep N]` | `pulse restore --in <path>`.
 //!
 //! Zig 0.17.1 entry point: main takes `std.process.Init`, which carries the
@@ -341,8 +341,59 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, cmd, "briefing")) {
+        // Roadmap 7.4: report variants. Defaults are the daily
+        // general briefing; --scope weekly, --kind political|economic,
+        // --county <name> compute the variant live (never cached).
         const precomputed = @import("intelligence/precomputed.zig");
-        const b = try precomputed.computeBriefing(alloc, repo, ks, timex.nowSeconds(io));
+        const entities = @import("engine/entities.zig");
+        var opts = precomputed.ReportOptions{};
+        var flag_args: std.ArrayList([]const u8) = .empty;
+        if (cmd_arg) |a| try flag_args.append(alloc, a);
+        while (args_it.next()) |a| try flag_args.append(alloc, a);
+        var i: usize = 0;
+        while (i < flag_args.items.len) : (i += 1) {
+            const a = flag_args.items[i];
+            if (std.mem.eql(u8, a, "--scope") and i + 1 < flag_args.items.len) {
+                const v = flag_args.items[i + 1];
+                if (std.mem.eql(u8, v, "weekly")) {
+                    opts.scope = .weekly;
+                } else if (!std.mem.eql(u8, v, "daily")) {
+                    logging.err("briefing --scope must be daily or weekly", &.{});
+                    std.process.exit(2);
+                }
+                i += 1;
+            } else if (std.mem.eql(u8, a, "--kind") and i + 1 < flag_args.items.len) {
+                const v = flag_args.items[i + 1];
+                if (std.mem.eql(u8, v, "political")) {
+                    opts.kind = .political;
+                } else if (std.mem.eql(u8, v, "economic")) {
+                    opts.kind = .economic;
+                } else if (!std.mem.eql(u8, v, "general")) {
+                    logging.err("briefing --kind must be general, political, or economic", &.{});
+                    std.process.exit(2);
+                }
+                i += 1;
+            } else if (std.mem.eql(u8, a, "--county") and i + 1 < flag_args.items.len) {
+                const v = flag_args.items[i + 1];
+                var known = false;
+                for (entities.counties) |name| {
+                    if (std.mem.eql(u8, name, v)) {
+                        known = true;
+                        break;
+                    }
+                }
+                if (!known) {
+                    logging.err("briefing --county: unknown county", &.{});
+                    std.process.exit(2);
+                }
+                opts.county = v;
+                i += 1;
+            } else {
+                logging.err("unknown briefing flag (briefing [--scope weekly] [--kind political|economic] [--county <name>])", &.{});
+                std.process.exit(2);
+            }
+        }
+        const b = try precomputed.computeReport(alloc, repo, ks, timex.nowSeconds(io), opts);
         const payload = try precomputed.renderBriefing(alloc, b);
         std.debug.print("{s}\n", .{payload});
         return;

@@ -56,6 +56,16 @@ pub const EventRef = struct {
 
 pub const Briefing = struct {
     computed_at: i64,
+    /// Report variant (Roadmap 7.4): "daily" | "weekly", "general" |
+    /// "political" | "economic", and the county filter when set.
+    scope: []const u8 = "daily",
+    kind: []const u8 = "general",
+    county: ?[]const u8 = null,
+    /// Social section (Roadmap 7.4): true only when an authorized
+    /// social connector is configured. False means the section is
+    /// honestly empty — nothing is scraped or invented to fill it.
+    social_available: bool = false,
+    social_note: []const u8 = "No authorized social data is connected — the social section is empty by design. Connect an authorized source to fill it; nothing here is scraped or invented.",
     top_stories: []EventRef,
     top_geez_today: []trending.TopicTrend,
     top_geez_week: []trending.TopicTrend,
@@ -67,6 +77,55 @@ pub const Briefing = struct {
     popular_entertainment: []EventRef,
     breaking: []EventRef,
 };
+
+/// Report variants (Roadmap 7.4): a briefing is daily or weekly,
+/// general or filtered to one kind, optionally restricted to one
+/// county. Every variant is computed from the same live store —
+/// nothing is pre-written, and an empty variant is a real answer.
+pub const ReportScope = enum { daily, weekly };
+pub const ReportKind = enum { general, political, economic };
+
+pub const ReportOptions = struct {
+    scope: ReportScope = .daily,
+    kind: ReportKind = .general,
+    county: ?[]const u8 = null,
+    social_available: bool = false,
+};
+
+fn kindMatchesTopic(kind: ReportKind, topic: []const u8) bool {
+    return switch (kind) {
+        .general => true,
+        .political => std.mem.eql(u8, topic, "politics"),
+        .economic => std.mem.eql(u8, topic, "economy") or std.mem.eql(u8, topic, "business"),
+    };
+}
+
+fn countiesContain(counties: []const []const u8, name: []const u8) bool {
+    for (counties) |c| {
+        if (std.mem.eql(u8, c, name)) return true;
+    }
+    return false;
+}
+
+/// A place matches a county filter when the text names the county
+/// itself, or names a city in that county (a Monrovia story is a
+/// Montserrado story). `county_cities` is the county's city list
+/// from the knowledge store; empty without a store, which falls
+/// back to strict county-name matching.
+fn placeMatchesCounty(
+    counties: []const []const u8,
+    cities: []const []const u8,
+    filter_county: []const u8,
+    county_cities: []const []const u8,
+) bool {
+    if (countiesContain(counties, filter_county)) return true;
+    for (cities) |city| {
+        for (county_cities) |cc| {
+            if (std.mem.eql(u8, city, cc)) return true;
+        }
+    }
+    return false;
+}
 
 fn eventRef(alloc: std.mem.Allocator, event: knowledge.KnowledgeEvent, now: i64) !EventRef {
     return .{
@@ -116,14 +175,49 @@ fn sortDocsNewest(refs: []DocRef) void {
 
 /// Compute the full briefing from the live store. `ks` may be null
 /// (memory/dev without a knowledge store) — the event-based sections
-/// are then empty and the doc-based sections still work.
+/// are then empty and the doc-based sections still work. The daily
+/// general briefing; variants go through computeReport.
 pub fn computeBriefing(
     alloc: std.mem.Allocator,
     repo: repository.Repository,
     ks: ?knowledge.KnowledgeStore,
     now: i64,
 ) !Briefing {
+    return computeReport(alloc, repo, ks, now, .{});
+}
+
+/// Compute a report variant (Roadmap 7.4): scope daily (calendar
+/// day) or weekly (rolling 7 days), kind general / political /
+/// economic, optionally restricted to one county. The kind filter
+/// applies to every news section; the Geez sections are
+/// entertainment by definition, so a political or economic report
+/// leaves them empty. A county filter applies to events (title
+/// names the county) and to documents (title or text names it).
+pub fn computeReport(
+    alloc: std.mem.Allocator,
+    repo: repository.Repository,
+    ks: ?knowledge.KnowledgeStore,
+    now: i64,
+    opts: ReportOptions,
+) !Briefing {
     const day_start = now - @mod(now, 86400);
+    const window_start = if (opts.scope == .weekly) now - 7 * 86400 else day_start;
+    // County filter expansion (Roadmap 7.4): cities in the filter
+    // county, from the knowledge store's seeded locations, so a
+    // Monrovia story counts for Montserrado. Empty without a store.
+    var county_cities: []const []const u8 = &.{};
+    if (opts.county) |c| {
+        if (ks) |k| {
+            const locs = try k.listLocations(alloc, "city", 200);
+            var names: std.ArrayList([]const u8) = .empty;
+            for (locs) |loc| {
+                if (loc.county != null and std.mem.eql(u8, loc.county.?, c)) {
+                    try names.append(alloc, loc.name);
+                }
+            }
+            county_cities = try names.toOwnedSlice(alloc);
+        }
+    }
     var events: []knowledge.KnowledgeEvent = &.{};
     if (ks) |k| {
         events = try k.listEvents(alloc, 100);
@@ -133,8 +227,14 @@ pub fn computeBriefing(
     var entertainment: std.ArrayList(EventRef) = .empty;
     var breaking: std.ArrayList(EventRef) = .empty;
     for (events) |e| {
+        if (!kindMatchesTopic(opts.kind, e.topic)) continue;
+        if (opts.county) |c| {
+            const title_ent = try entities_mod.extract(alloc, e.title);
+            defer entities_mod.freeEntities(alloc, title_ent);
+            if (!placeMatchesCounty(title_ent.counties, title_ent.cities, c, county_cities)) continue;
+        }
         const ref = try eventRef(alloc, e, now);
-        if (e.last_seen >= day_start) try stories.append(alloc, ref);
+        if (e.last_seen >= window_start) try stories.append(alloc, ref);
         if (std.mem.eql(u8, e.topic, "politics")) try political.append(alloc, ref);
         if (std.mem.eql(u8, e.topic, "culture")) try entertainment.append(alloc, ref);
         if (ref.importance >= breaking_importance and now - e.last_seen <= breaking_window_s and
@@ -149,18 +249,41 @@ pub fn computeBriefing(
     sortEventsByImportance(breaking.items);
 
     const docs = try repo.scanDocuments(alloc, now, 5000);
-    const trends_today = try trending.computeTrends(alloc, docs, now, 86400);
-    const trends_week = try trending.computeTrends(alloc, docs, now, 7 * 86400);
+    // Geez sections are entertainment by definition: a political or
+    // economic report leaves them empty instead of padding the
+    // report with off-topic trends.
+    var trends_today: []trending.TopicTrend = &.{};
+    var trends_week: []trending.TopicTrend = &.{};
+    if (opts.kind == .general) {
+        trends_today = try trending.computeTrends(alloc, docs, now, 86400);
+        trends_week = try trending.computeTrends(alloc, docs, now, 7 * 86400);
+    }
     var latest_liberia: std.ArrayList(DocRef) = .empty;
     var latest_lofa: std.ArrayList(DocRef) = .empty;
     var latest_montserrado: std.ArrayList(DocRef) = .empty;
     for (docs) |doc| {
         const ref = docRef(doc);
-        try latest_liberia.append(alloc, ref);
+        // Kind filter on documents too: a political report's latest
+        // section lists politics docs only (the doc's own topic
+        // list), not every recent document regardless of topic.
+        if (opts.kind != .general) {
+            var topic_ok = false;
+            for (doc.topics) |t| {
+                if (kindMatchesTopic(opts.kind, t)) {
+                    topic_ok = true;
+                    break;
+                }
+            }
+            if (!topic_ok) continue;
+        }
         const combined = try std.mem.concat(alloc, u8, &.{ doc.title, " ", doc.text });
         defer alloc.free(combined);
         const ent = try entities_mod.extract(alloc, combined);
         defer entities_mod.freeEntities(alloc, ent);
+        if (opts.county) |c| {
+            if (!placeMatchesCounty(ent.counties, ent.cities, c, county_cities)) continue;
+        }
+        try latest_liberia.append(alloc, ref);
         for (ent.counties) |county| {
             if (std.mem.eql(u8, county, "Lofa")) try latest_lofa.append(alloc, ref);
             if (std.mem.eql(u8, county, "Montserrado")) try latest_montserrado.append(alloc, ref);
@@ -171,28 +294,46 @@ pub fn computeBriefing(
     sortDocsNewest(latest_montserrado.items);
 
     // Top Geez last month: the latest month in the aggregates, culture
-    // topic only. Empty when no aggregates exist yet.
+    // topic only. Empty when no aggregates exist yet — and empty for
+    // political/economic reports, like the other Geez sections.
     var geez_month: []trending.TopicCount = &.{};
-    if (ks) |k| {
-        const aggs = try k.listMonthlyAggregates(alloc, 200);
-        var latest_month: ?[]const u8 = null;
-        for (aggs) |row| {
-            if (latest_month == null or std.mem.lessThan(u8, latest_month.?, row.year_month)) {
-                latest_month = row.year_month;
+    if (opts.kind == .general) {
+        if (ks) |k| {
+            const aggs = try k.listMonthlyAggregates(alloc, 200);
+            var latest_month: ?[]const u8 = null;
+            for (aggs) |row| {
+                if (latest_month == null or std.mem.lessThan(u8, latest_month.?, row.year_month)) {
+                    latest_month = row.year_month;
+                }
             }
-        }
-        if (latest_month) |m| {
-            const snap = try trending.snapshotFromAggregates(alloc, aggs, m);
-            var kept: std.ArrayList(trending.TopicCount) = .empty;
-            for (snap.topics) |t| {
-                if (std.mem.eql(u8, t.topic, "culture")) try kept.append(alloc, t);
+            if (latest_month) |m| {
+                const snap = try trending.snapshotFromAggregates(alloc, aggs, m);
+                var kept: std.ArrayList(trending.TopicCount) = .empty;
+                for (snap.topics) |t| {
+                    if (std.mem.eql(u8, t.topic, "culture")) try kept.append(alloc, t);
+                }
+                geez_month = try kept.toOwnedSlice(alloc);
             }
-            geez_month = try kept.toOwnedSlice(alloc);
         }
     }
 
     return .{
         .computed_at = now,
+        .scope = switch (opts.scope) {
+            .daily => "daily",
+            .weekly => "weekly",
+        },
+        .kind = switch (opts.kind) {
+            .general => "general",
+            .political => "political",
+            .economic => "economic",
+        },
+        .county = opts.county,
+        .social_available = opts.social_available,
+        .social_note = if (opts.social_available)
+            "Social trends come from authorized connectors only (Facebook Pages with an approved Meta app; see /v1/connectors/facebook)."
+        else
+            "No authorized social data is connected — the social section is empty by design. Connect an authorized source to fill it; nothing here is scraped or invented.",
         .top_stories = try stories.toOwnedSlice(alloc),
         .top_geez_today = try trending.topGeez(alloc, trends_today, 5),
         .top_geez_week = try trending.topGeez(alloc, trends_week, 5),
@@ -274,6 +415,11 @@ pub fn renderBriefing(alloc: std.mem.Allocator, b: Briefing) ![]u8 {
     });
     return stringifyAlloc(alloc, .{
         .computed_at = b.computed_at,
+        .scope = b.scope,
+        .kind = b.kind,
+        .county = b.county,
+        .social_available = b.social_available,
+        .social_note = b.social_note,
         .top_stories = stories.items,
         .top_geez_today = trend_list.items,
         .top_geez_week = trend_week.items,
@@ -300,6 +446,9 @@ fn stringifyAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
 /// Breaking alerts computed from the same briefing (Roadmap 7.3)
 /// are also published to the `pulse:alerts` stream; a publish
 /// failure never fails the refresh — the stream is best-effort.
+/// `social_available` is the worker's view of whether an authorized
+/// social connector is configured (Roadmap 7.4); the cached payload
+/// carries it so the endpoint reports the same state.
 pub fn refreshBriefing(
     alloc: std.mem.Allocator,
     client: ?*redis.RedisClient,
@@ -307,9 +456,10 @@ pub fn refreshBriefing(
     ks: ?knowledge.KnowledgeStore,
     now: i64,
     ttl_s: u64,
+    social_available: bool,
 ) bool {
     const c = client orelse return false;
-    const b = computeBriefing(alloc, repo, ks, now) catch return false;
+    const b = computeReport(alloc, repo, ks, now, .{ .social_available = social_available }) catch return false;
     const payload = renderBriefing(alloc, b) catch return false;
     c.setex(briefing_key, ttl_s, payload) catch return false;
     if (ks) |k| {
@@ -473,4 +623,62 @@ test "renderBriefing produces parseable JSON with all sections" {
         try testing.expect(parsed.object.get(key) != null);
     }
     try testing.expectEqual(@as(usize, 2), parsed.object.get("top_stories").?.array.items.len);
+}
+
+test "computeReport: weekly scope, kind filter, county filter, social flag" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const now: i64 = 1795040000;
+    const seeded = try seedStore(alloc, now);
+    // Weekly scope: the 3-day-old sports event joins top stories.
+    const weekly = try computeReport(alloc, seeded.repo, seeded.ks, now, .{ .scope = .weekly });
+    try testing.expectEqualStrings("weekly", weekly.scope);
+    try testing.expectEqual(@as(usize, 3), weekly.top_stories.len);
+    // Political kind: only the politics event; Geez sections empty.
+    const pol = try computeReport(alloc, seeded.repo, seeded.ks, now, .{ .kind = .political });
+    try testing.expectEqualStrings("political", pol.kind);
+    try testing.expectEqual(@as(usize, 1), pol.top_stories.len);
+    try testing.expectEqualStrings("politics", pol.top_stories[0].topic);
+    try testing.expectEqual(@as(usize, 1), pol.popular_political.len);
+    try testing.expectEqual(@as(usize, 0), pol.popular_entertainment.len);
+    try testing.expectEqual(@as(usize, 0), pol.top_geez_today.len);
+    try testing.expectEqual(@as(usize, 0), pol.top_geez_month.len);
+    // The kind filter applies to documents too: a political report
+    // lists only the two politics docs as latest.
+    try testing.expectEqual(@as(usize, 2), pol.latest_liberia.len);
+    // Economic kind: no economy/business events in the fixture.
+    const eco = try computeReport(alloc, seeded.repo, seeded.ks, now, .{ .kind = .economic });
+    try testing.expectEqual(@as(usize, 0), eco.top_stories.len);
+    try testing.expectEqual(@as(usize, 0), eco.latest_liberia.len);
+    // County Lofa: only the culture event and the Lofa doc.
+    const lofa = try computeReport(alloc, seeded.repo, seeded.ks, now, .{ .county = "Lofa" });
+    try testing.expectEqualStrings("Lofa", lofa.county.?);
+    try testing.expectEqual(@as(usize, 1), lofa.top_stories.len);
+    try testing.expectEqual(@as(usize, 1), lofa.latest_liberia.len);
+    try testing.expectEqualStrings("d3", lofa.latest_liberia[0].id);
+    try testing.expectEqual(@as(usize, 1), lofa.latest_lofa.len);
+    try testing.expectEqual(@as(usize, 0), lofa.latest_montserrado.len);
+    // County Montserrado: the politics event and its two docs.
+    const mont = try computeReport(alloc, seeded.repo, seeded.ks, now, .{ .county = "Montserrado" });
+    try testing.expectEqual(@as(usize, 1), mont.top_stories.len);
+    try testing.expectEqual(@as(usize, 2), mont.latest_liberia.len);
+    try testing.expectEqual(@as(usize, 2), mont.latest_montserrado.len);
+    try testing.expectEqual(@as(usize, 0), mont.latest_lofa.len);
+    // County expansion: a city in the county counts. Seed Monrovia
+    // as a Montserrado city, then a Monrovia-only doc matches a
+    // Montserrado report even though it never names the county.
+    try seeded.ks.upsertLocation(alloc, .{ .name = "Monrovia", .kind = "city", .county = "Montserrado" });
+    const crash = testDoc("d5", "Fuel shortage hits Monrovia", &.{ "energy" }, now - 3600);
+    try seeded.repo.insertDocument(crash);
+    const mont2 = try computeReport(alloc, seeded.repo, seeded.ks, now, .{ .county = "Montserrado" });
+    try testing.expectEqual(@as(usize, 3), mont2.latest_liberia.len);
+    try testing.expectEqualStrings("d5", mont2.latest_liberia[0].id);
+    // Social: honestly empty by default; the flag only flips the note.
+    const def = try computeBriefing(alloc, seeded.repo, seeded.ks, now);
+    try testing.expect(!def.social_available);
+    try testing.expect(std.mem.indexOf(u8, def.social_note, "empty by design") != null);
+    const soc = try computeReport(alloc, seeded.repo, seeded.ks, now, .{ .social_available = true });
+    try testing.expect(soc.social_available);
+    try testing.expect(std.mem.indexOf(u8, soc.social_note, "authorized connectors") != null);
 }

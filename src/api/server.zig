@@ -483,6 +483,15 @@ pub const Server = struct {
 
     /// Write one audit record for this request (best-effort, never fails
     /// the request). `status` is the final HTTP status.
+    /// Social availability (Roadmap 7.4): true only when the Facebook
+    /// connector is configured and usable (an approved Meta app with
+    /// registered Pages). False today — no Meta app exists — so every
+    /// social section reports honestly-empty.
+    fn socialAvailable(self: *Server) bool {
+        const fb = self.facebook orelse return false;
+        return fb.validate() == null;
+    }
+
     fn auditCall(self: *Server, head: HeadCapture, arena: std.mem.Allocator, req_id: []const u8, status: u16) void {
         self.audit_sink.record(.{
             .ts = timex.nowSeconds(self.io),
@@ -1260,6 +1269,60 @@ pub const Server = struct {
 
         if (method == .GET and std.mem.eql(u8, path, "/v1/briefing")) {
             const now = timex.nowSeconds(self.io);
+            // Report variants (Roadmap 7.4): ?scope=weekly,
+            // ?kind=political|economic, ?county=<name>. A variant is
+            // computed live and never cached — the cache holds only
+            // the daily general briefing the worker refreshes. An
+            // unknown scope/kind/county is a 400, never a silent
+            // empty report.
+            const q = head.query;
+            const scope_s = queryParam(q, "scope") orelse "daily";
+            const kind_s = queryParam(q, "kind") orelse "general";
+            const county_s = queryParam(q, "county");
+            var opts = precomputed.ReportOptions{ .social_available = self.socialAvailable() };
+            if (std.mem.eql(u8, scope_s, "weekly")) {
+                opts.scope = .weekly;
+            } else if (!std.mem.eql(u8, scope_s, "daily")) {
+                self.respondError(req, alloc, req_id, .bad_request, "invalid_request", "scope must be daily or weekly");
+                return;
+            }
+            if (std.mem.eql(u8, kind_s, "political")) {
+                opts.kind = .political;
+            } else if (std.mem.eql(u8, kind_s, "economic")) {
+                opts.kind = .economic;
+            } else if (!std.mem.eql(u8, kind_s, "general")) {
+                self.respondError(req, alloc, req_id, .bad_request, "invalid_request", "kind must be general, political, or economic");
+                return;
+            }
+            if (county_s) |c| {
+                var known = false;
+                for (entities.counties) |name| {
+                    if (std.mem.eql(u8, name, c)) {
+                        known = true;
+                        break;
+                    }
+                }
+                if (!known) {
+                    self.respondError(req, alloc, req_id, .bad_request, "invalid_request", "unknown county");
+                    return;
+                }
+                opts.county = c;
+            }
+            const is_variant = opts.scope != .daily or opts.kind != .general or opts.county != null;
+            if (is_variant) {
+                const b = precomputed.computeReport(alloc, self.repo, self.knowledge, now, opts) catch {
+                    self.respondError(req, alloc, req_id, .internal_server_error, "briefing_failed", "Failed to compute briefing");
+                    return;
+                };
+                const rendered = precomputed.renderBriefing(alloc, b) catch {
+                    self.respondError(req, alloc, req_id, .internal_server_error, "briefing_failed", "Failed to render briefing");
+                    return;
+                };
+                const body = try std.fmt.allocPrint(alloc, "{{\"briefing\":{s},\"cached\":false,\"stale\":false,\"request_id\":\"{s}\"}}", .{ rendered, req_id });
+                self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+                try respondJson(req, .ok, body, req_id);
+                return;
+            }
             // Serve the worker's cached payload when fresh; otherwise
             // compute live (and refresh the cache best-effort). The
             // cached flag tells the caller which path served the read.
@@ -1268,7 +1331,7 @@ pub const Server = struct {
                 cached_payload = rc.get(alloc, precomputed.briefing_key) catch null;
             }
             const payload: []const u8 = cached_payload orelse blk: {
-                const b = precomputed.computeBriefing(alloc, self.repo, self.knowledge, now) catch {
+                const b = precomputed.computeReport(alloc, self.repo, self.knowledge, now, opts) catch {
                     self.respondError(req, alloc, req_id, .internal_server_error, "briefing_failed", "Failed to compute briefing");
                     return;
                 };
