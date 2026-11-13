@@ -50,6 +50,7 @@ const memindex = @import("../engine/memindex.zig");
 const router = @import("../engine/router.zig");
 const fanout = @import("../engine/fanout.zig");
 const autotune = @import("../engine/autotune.zig");
+const breaker = @import("../engine/breaker.zig");
 const usage = @import("usage.zig");
 
 /// Fan-out task: knowledge-store locations matching the query's
@@ -168,6 +169,18 @@ pub const Server = struct {
     /// cfg, moved by the tuner. Read here instead of cfg so an
     /// adjustment takes effect on the next query.
     fanout_timeout_ms: u64,
+    /// Circuit breakers (Roadmap 6.11). `redis_breaker` guards the L2
+    /// cache lookups (value — owned by the server). `embed_breaker`
+    /// points at the breaker inside the wrapped embedding provider
+    /// (main.zig creates it; null when no external embedder is
+    /// configured — the local provider never fails, so it is never
+    /// wrapped). Both are read by the /metrics handler.
+    redis_breaker: breaker.CircuitBreaker,
+    embed_breaker: ?*breaker.CircuitBreaker = null,
+    /// Live reindex interval in seconds (Roadmap 6.11): initialised
+    /// from cfg, movable by POST /v1/admin/config. Read here instead
+    /// of cfg so a hot reload takes effect on the next query.
+    reindex_interval_s: u64,
 
     pub fn serve(self: *Server) !void {
         const addr = std.Io.net.IpAddress.parse(self.cfg.host, self.cfg.port) catch |e| {
@@ -342,7 +355,7 @@ pub const Server = struct {
         const epoch = cache.currentEpoch(rc, alloc);
         if (epoch == self.index_epoch) return;
         const now_ms = timex.nowMillis(self.io);
-        if (now_ms - self.index_built_ms < @as(i64, @intCast(self.cfg.reindex_interval_s)) * 1000) return;
+        if (now_ms - self.index_built_ms < @as(i64, @intCast(self.reindex_interval_s)) * 1000) return;
         idx.clear();
         const start_ms = now_ms;
         const report = idx.buildFromRepo(alloc, self.repo, timex.nowMillis(self.io), start_ms) catch {
@@ -736,9 +749,20 @@ pub const Server = struct {
                             self.metrics.setL1Stats(after.entries, after.bytes);
                         }
                     }
+                    // Breaker (Roadmap 6.11): no writes to a dead
+                    // Redis either; a successful put proves it alive.
                     if (self.redis) |rc| {
-                        const k = cache.cacheKey(alloc, row.query, 10) catch null;
-                        if (k) |ck| cache.put(rc, alloc, ck, epoch, s, self.cfg.query_cache_ttl_s) catch {};
+                        const put_now_ms = timex.nowMillis(self.io);
+                        if (self.redis_breaker.allow(put_now_ms)) {
+                            const k = cache.cacheKey(alloc, row.query, 10) catch null;
+                            if (k) |ck| {
+                                if (cache.put(rc, alloc, ck, epoch, s, self.cfg.query_cache_ttl_s)) {
+                                    self.redis_breaker.recordSuccess(put_now_ms);
+                                } else |_| {
+                                    self.redis_breaker.recordFailure(put_now_ms);
+                                }
+                            }
+                        }
                     }
                     warmed += 1;
                 }
@@ -813,6 +837,83 @@ pub const Server = struct {
                 try items.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{{\"knob\":\"{s}\",\"old\":{d},\"new\":{d}}}", .{ @tagName(a.knob), a.old_value, a.new_value }));
             }
             const body = try std.fmt.allocPrint(alloc, "{{\"request_id\":\"{s}\",\"reset\":true,\"changed\":[{s}]}}", .{ req_id, items.items });
+            self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+            try respondJson(req, .ok, body, req_id);
+            return;
+        }
+
+        if (method == .POST and std.mem.eql(u8, path, "/v1/admin/config")) {
+            // Hot reload for SAFE settings only (Roadmap 6.11): L1 TTL,
+            // fan-out timeout, reindex interval. Secrets, auth, rate
+            // limits, and retention are never accepted here — they need
+            // a restart. API-key auth, no usage accounting (kind null,
+            // the admin pattern). A manual value becomes the tuner's
+            // new baseline, so the next auto-tuning adjustment moves
+            // from it; to hold a manual value, disable autotune
+            // (PULSE_AUTOTUNE=0). The reindex interval is not tuned,
+            // so it holds until the next restart.
+            if (!self.checkAuthAndRate(req, head, alloc, req_id, null)) return;
+            const raw = readBody(req, alloc) catch {
+                self.respondError(req, alloc, req_id, .bad_request, "bad_body", "Request body required");
+                return;
+            };
+            const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch {
+                self.respondError(req, alloc, req_id, .bad_request, "bad_json", "Request body is not valid JSON");
+                return;
+            };
+            defer parsed.deinit();
+            if (parsed.value != .object) {
+                self.respondError(req, alloc, req_id, .bad_request, "bad_json", "Request body must be a JSON object");
+                return;
+            }
+            var applied: std.ArrayList(u8) = .empty;
+            defer applied.deinit(alloc);
+            var n_applied: usize = 0;
+            var it = parsed.value.object.iterator();
+            while (it.next()) |entry| {
+                const key = entry.key_ptr.*;
+                const val = entry.value_ptr.*;
+                if (val != .integer) {
+                    self.respondError(req, alloc, req_id, .bad_request, "bad_value", "All config values must be integers");
+                    return;
+                }
+                const v = val.integer;
+                if (std.mem.eql(u8, key, "l1_ttl_s")) {
+                    if (v < 60 or v > 900) {
+                        self.respondError(req, alloc, req_id, .bad_request, "out_of_range", "l1_ttl_s must be 60..900");
+                        return;
+                    }
+                    self.l1.ttl_s = @intCast(v);
+                    self.autotuner.l1_ttl_s = @intCast(v);
+                } else if (std.mem.eql(u8, key, "fanout_timeout_ms")) {
+                    if (v < 50 or v > 500) {
+                        self.respondError(req, alloc, req_id, .bad_request, "out_of_range", "fanout_timeout_ms must be 50..500");
+                        return;
+                    }
+                    self.fanout_timeout_ms = @intCast(v);
+                    self.autotuner.fanout_timeout_ms = @intCast(v);
+                } else if (std.mem.eql(u8, key, "reindex_interval_s")) {
+                    if (v < 60 or v > 86400) {
+                        self.respondError(req, alloc, req_id, .bad_request, "out_of_range", "reindex_interval_s must be 60..86400");
+                        return;
+                    }
+                    self.reindex_interval_s = @intCast(v);
+                } else {
+                    const msg = std.fmt.allocPrint(alloc, "unknown setting: {s}", .{key}) catch "unknown setting";
+                    self.respondError(req, alloc, req_id, .bad_request, "unknown_setting", msg);
+                    return;
+                }
+                if (n_applied > 0) try applied.appendSlice(alloc, ",");
+                try applied.appendSlice(alloc, try std.fmt.allocPrint(alloc, "\\\"{s}\\\":{d}", .{ key, v }));
+                n_applied += 1;
+            }
+            if (n_applied == 0) {
+                self.respondError(req, alloc, req_id, .bad_request, "no_settings", "No recognised settings in body (l1_ttl_s, fanout_timeout_ms, reindex_interval_s)");
+                return;
+            }
+            self.metrics.setAutotuneValues(self.autotuner.l1_ttl_s, self.autotuner.fanout_timeout_ms, self.autotuner.max_concurrent_sources);
+            logging.info("admin config reloaded", &.{.{ .key = "applied", .value = std.fmt.allocPrint(alloc, "{d}", .{n_applied}) catch "?" }});
+            const body = try std.fmt.allocPrint(alloc, "{{\\\"request_id\\\":\\\"{s}\\\",\\\"applied\\\":{{{s}}}}}", .{ req_id, applied.items });
             self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
             try respondJson(req, .ok, body, req_id);
             return;
@@ -1045,9 +1146,15 @@ pub const Server = struct {
 
         if (method == .GET and std.mem.eql(u8, path, "/metrics")) {
             // Refresh the point-in-time gauges (Roadmap 6.10/6.12):
-            // process RSS and the tuner's live knob values.
+            // process RSS, the tuner's live knob values, and the
+            // circuit breakers' state (Roadmap 6.11).
             self.metrics.setProcessRss(self.processRssBytes());
             self.metrics.setAutotuneValues(self.autotuner.l1_ttl_s, self.autotuner.fanout_timeout_ms, self.autotuner.max_concurrent_sources);
+            if (self.embed_breaker) |eb| {
+                self.metrics.setBreakerStats(breaker.stateCode(self.redis_breaker.state), self.redis_breaker.trips, self.redis_breaker.skipped_total, breaker.stateCode(eb.state), eb.trips, eb.skipped_total);
+            } else {
+                self.metrics.setBreakerStats(breaker.stateCode(self.redis_breaker.state), self.redis_breaker.trips, self.redis_breaker.skipped_total, 0, 0, 0);
+            }
             const body = try self.metrics.render(alloc);
             self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
             try req.respond(body, .{
@@ -1128,18 +1235,37 @@ pub const Server = struct {
                 if (self.cfg.query_cache_ttl_s > 0) {
                     cache_key = cache.cacheKey(alloc, qr.query, qr.limit) catch null;
                     if (cache_key) |k| {
-                        cache_epoch = cache.currentEpoch(rc, alloc);
-                        if (cache.get(rc, alloc, k, cache_epoch) catch null) |stored| {
-                            const latency_ms = timex.latencyMsF64(query_start_ns, timex.nowNanos(self.io));
-                            if (cache.stampServed(alloc, stored, req_id, "instant", latency_ms, "l2_hit") catch null) |stamped_body| {
-                                self.metrics.observeCacheHit();
-                                self.metrics.observeQuery(cachedSufficient(stamped_body) orelse true);
-                                self.metrics.observePath("instant", latency_ms);
-                                self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
-                                self.recordUsage(head, .query);
-                                self.auditCall(head, alloc, req_id, 200);
-                                try respondJsonCached(req, .ok, stamped_body, req_id, true);
-                                return;
+                        // Circuit breaker (Roadmap 6.11): while open,
+                        // skip the L2 lookup entirely and compute fresh
+                        // — the degraded path a miss already takes. A
+                        // clean answer (hit or miss) is a success for
+                        // the breaker; only a Redis error counts as a
+                        // failure.
+                        const l2_now_ms = timex.nowMillis(self.io);
+                        if (self.redis_breaker.allow(l2_now_ms)) {
+                            cache_epoch = cache.currentEpoch(rc, alloc);
+                            var l2_failed = false;
+                            const stored = cache.get(rc, alloc, k, cache_epoch) catch blk: {
+                                l2_failed = true;
+                                break :blk null;
+                            };
+                            if (l2_failed) {
+                                self.redis_breaker.recordFailure(l2_now_ms);
+                            } else {
+                                self.redis_breaker.recordSuccess(l2_now_ms);
+                            }
+                            if (stored) |stored_body| {
+                                const latency_ms = timex.latencyMsF64(query_start_ns, timex.nowNanos(self.io));
+                                if (cache.stampServed(alloc, stored_body, req_id, "instant", latency_ms, "l2_hit") catch null) |stamped_body| {
+                                    self.metrics.observeCacheHit();
+                                    self.metrics.observeQuery(cachedSufficient(stamped_body) orelse true);
+                                    self.metrics.observePath("instant", latency_ms);
+                                    self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+                                    self.recordUsage(head, .query);
+                                    self.auditCall(head, alloc, req_id, 200);
+                                    try respondJsonCached(req, .ok, stamped_body, req_id, true);
+                                    return;
+                                }
                             }
                         }
                         self.metrics.observeCacheMiss();
@@ -1182,7 +1308,18 @@ pub const Server = struct {
                             self.metrics.setL1Stats(after.entries, after.bytes);
                         }
                         if (cache_key) |k| {
-                            if (self.redis) |rc| cache.put(rc, alloc, k, cache_epoch, s, self.cfg.query_cache_ttl_s) catch {};
+                            // Breaker (Roadmap 6.11): skip the write
+                            // while the Redis breaker is open.
+                            if (self.redis) |rc| {
+                                const put_now_ms = timex.nowMillis(self.io);
+                                if (self.redis_breaker.allow(put_now_ms)) {
+                                    if (cache.put(rc, alloc, k, cache_epoch, s, self.cfg.query_cache_ttl_s)) {
+                                        self.redis_breaker.recordSuccess(put_now_ms);
+                                    } else |_| {
+                                        self.redis_breaker.recordFailure(put_now_ms);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1454,6 +1591,7 @@ pub const Server = struct {
                 std.mem.eql(u8, path, "/metrics") or std.mem.eql(u8, path, "/v1/query") or
                 std.mem.eql(u8, path, "/v1/usage") or
                 std.mem.eql(u8, path, "/v1/autotune") or std.mem.eql(u8, path, "/v1/admin/autotune/reset") or
+                std.mem.eql(u8, path, "/v1/admin/config") or
                 std.mem.eql(u8, path, "/v1/ingest")))
         {
             self.respondError(req, alloc, req_id, .method_not_allowed, "method_not_allowed", "Method not allowed on this route");

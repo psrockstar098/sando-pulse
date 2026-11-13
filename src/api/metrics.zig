@@ -49,6 +49,32 @@ pub const Metrics = struct {
     /// by the server from /proc/self/statm before rendering; 0 when
     /// the platform cannot report it.
     process_rss_bytes: u64 = 0,
+    /// Circuit breakers (Roadmap 6.11): state gauges (0 closed,
+    /// 1 half-open, 2 open) + trips + calls refused while open. Set
+    /// by the server from the live breakers before rendering.
+    breaker_redis_state: u8 = 0,
+    breaker_redis_trips: u64 = 0,
+    breaker_redis_skipped: u64 = 0,
+    breaker_embedding_state: u8 = 0,
+    breaker_embedding_trips: u64 = 0,
+    breaker_embedding_skipped: u64 = 0,
+
+    pub fn setBreakerStats(
+        self: *Metrics,
+        redis_state: u8,
+        redis_trips: u64,
+        redis_skipped: u64,
+        embedding_state: u8,
+        embedding_trips: u64,
+        embedding_skipped: u64,
+    ) void {
+        self.breaker_redis_state = redis_state;
+        self.breaker_redis_trips = redis_trips;
+        self.breaker_redis_skipped = redis_skipped;
+        self.breaker_embedding_state = embedding_state;
+        self.breaker_embedding_trips = embedding_trips;
+        self.breaker_embedding_skipped = embedding_skipped;
+    }
 
     pub fn observeFanout(self: *Metrics, complete: bool) void {
         self.fanout_total += 1;
@@ -290,8 +316,39 @@ pub const Metrics = struct {
             self.process_rss_bytes,
         });
         defer alloc.free(extra);
+        // Third format call (Roadmap 6.11): breaker state + trips +
+        // skipped calls, same 32-argument cap reason as above.
+        const breakers = try std.fmt.allocPrint(alloc,
+            \\\\# HELP pulse_breaker_redis_state Circuit breaker state for the Redis L2 cache (0 closed, 1 half-open, 2 open)
+            \\\\# TYPE pulse_breaker_redis_state gauge
+            \\\\pulse_breaker_redis_state {d}
+            \\\\# HELP pulse_breaker_redis_trips_total Times the Redis breaker tripped open
+            \\\\# TYPE pulse_breaker_redis_trips_total counter
+            \\\\pulse_breaker_redis_trips_total {d}
+            \\\\# HELP pulse_breaker_redis_skipped_total L2 lookups refused while the Redis breaker was open
+            \\\\# TYPE pulse_breaker_redis_skipped_total counter
+            \\\\pulse_breaker_redis_skipped_total {d}
+            \\\\# HELP pulse_breaker_embedding_state Circuit breaker state for the external embedder (0 closed, 1 half-open, 2 open)
+            \\\\# TYPE pulse_breaker_embedding_state gauge
+            \\\\pulse_breaker_embedding_state {d}
+            \\\\# HELP pulse_breaker_embedding_trips_total Times the embedding breaker tripped open
+            \\\\# TYPE pulse_breaker_embedding_trips_total counter
+            \\\\pulse_breaker_embedding_trips_total {d}
+            \\\\# HELP pulse_breaker_embedding_skipped_total Embed calls refused while the embedding breaker was open
+            \\\\# TYPE pulse_breaker_embedding_skipped_total counter
+            \\\\pulse_breaker_embedding_skipped_total {d}
+            \\\\
+        , .{
+            self.breaker_redis_state,
+            self.breaker_redis_trips,
+            self.breaker_redis_skipped,
+            self.breaker_embedding_state,
+            self.breaker_embedding_trips,
+            self.breaker_embedding_skipped,
+        });
+        defer alloc.free(breakers);
         defer alloc.free(base);
-        return std.mem.concat(alloc, u8, &.{ base, extra });
+        return std.mem.concat(alloc, u8, &.{ base, extra, breakers });
     }
 };
 

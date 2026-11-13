@@ -1406,6 +1406,7 @@ pub const PostgresStore = struct {
         .scanDocuments = repoScanDocuments,
         .getDocument = repoGetDocument,
         .deleteDocuments = repoDeleteDocuments,
+        .analyze = repoAnalyze,
         .deinit = repoDeinit,
     };
 
@@ -1447,6 +1448,18 @@ pub const PostgresStore = struct {
     fn repoDeinit(ptr: *anyopaque) void {
         const self: *PostgresStore = @ptrCast(@alignCast(ptr));
         self.deinit();
+    }
+
+    /// Refresh planner statistics for every table (Roadmap 6.11).
+    /// Bare ANALYZE (no table) covers the whole database. VACUUM is
+    /// deliberately NOT run here — Postgres autovacuum owns dead-tuple
+    /// reclamation; ANALYZE is the maintenance-visible part.
+    fn repoAnalyze(ptr: *anyopaque, alloc: Allocator) anyerror!void {
+        const self: *PostgresStore = @ptrCast(@alignCast(ptr));
+        const client = try self.checkout();
+        errdefer self.pool.drop(client);
+        defer self.pool.checkin(client);
+        try client.exec(alloc, "ANALYZE");
     }
 
     /// Check a client out of the pool. A dead slot reconnects lazily;

@@ -24,6 +24,7 @@ pub const engine_memindex = @import("engine/memindex.zig");
 pub const engine_router = @import("engine/router.zig");
 pub const engine_fanout = @import("engine/fanout.zig");
 pub const engine_autotune = @import("engine/autotune.zig");
+pub const engine_breaker = @import("engine/breaker.zig");
 pub const engine_planner = @import("engine/planner.zig");
 pub const engine_ranking = @import("engine/ranking.zig");
 pub const engine_search = @import("engine/search.zig");

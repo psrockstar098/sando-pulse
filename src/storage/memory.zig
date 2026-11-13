@@ -35,6 +35,7 @@ pub const MemoryStore = struct {
         .scanDocuments = scanDocuments,
         .getDocument = getDocument,
         .deleteDocuments = deleteDocuments,
+        .analyze = analyze,
         .deinit = deinitErased,
     };
 
@@ -248,6 +249,9 @@ pub const MemoryStore = struct {
         }
         return removed;
     }
+
+    /// No planner statistics to refresh on the memory store.
+    fn analyze(_: *anyopaque, _: std.mem.Allocator) anyerror!void {}
 
     fn deinitErased(ptr: *anyopaque) void {
         const self: *MemoryStore = @ptrCast(@alignCast(ptr));

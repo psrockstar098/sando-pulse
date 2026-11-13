@@ -156,3 +156,48 @@ text is extractive: it is built only from the cited `results`.
   the live knob values, `pulse_fanout_total` /
   `pulse_fanout_incomplete_total`, and `pulse_process_rss_bytes`
   (process RSS from /proc/self/statm; 0 when unreported).
+
+## Circuit breakers and hot config reload (Roadmap 6.11)
+
+- Two circuit breakers stop the server hammering a dead dependency;
+  both fall back to the degraded path that already exists, so an open
+  breaker never changes what a query returns — only how much work is
+  wasted getting there. A breaker trips open after N consecutive
+  failures (default 5, `PULSE_BREAKER_*_FAILURES`), refuses calls
+  while open (counted as skipped), and allows one trial call after
+  the cooldown (default 60s, `PULSE_BREAKER_*_COOLDOWN_S`); a trial
+  success closes it, a trial failure re-opens it.
+- Embedding breaker: guards the external HTTP embedder — there is no
+  per-request timeout in Zig 0.17.1's `std.http.Client`, so a dead
+  provider would hang every query and every ingest. While open, embed
+  calls fail fast with `BreakerOpen` and both call sites fall back to
+  lexical (the behaviour they already had on embed failure). The
+  local hashed provider is never wrapped: it cannot fail and does no
+  I/O. Only `PULSE_EMBEDDING_PROVIDER=external` gets a breaker.
+- Redis breaker: guards the L2 cache lookups and puts. While open,
+  the query path skips L2 entirely and computes fresh (the path a
+  miss already takes); a clean answer — hit or miss — counts as a
+  breaker success, only a Redis error counts as a failure.
+- `/metrics` carries `pulse_breaker_redis_state` /
+  `pulse_breaker_embedding_state` (0 closed, 1 half-open, 2 open),
+  `pulse_breaker_*_trips_total`, and
+  `pulse_breaker_*_skipped_total`.
+- `POST /v1/admin/config` (API-key auth) hot-reloads SAFE settings
+  only: `l1_ttl_s` (60–900), `fanout_timeout_ms` (50–500),
+  `reindex_interval_s` (60–86400). All values must be integers;
+  unknown keys and out-of-range values are rejected with 400.
+  Secrets, auth, rate limits, and retention are never accepted here
+  — they need a restart. A manual `l1_ttl_s` / `fanout_timeout_ms`
+  becomes the tuner's new baseline (the next auto-tuning adjustment
+  moves from it); to hold a manual value, disable autotune
+  (`PULSE_AUTOTUNE=0`). The reindex interval is not tuned, so it
+  holds until the next restart. `POST /v1/admin/autotune/reset`
+  restores only the tuner's knobs, not the reindex interval.
+- Index maintenance: `pulse maintenance` now runs a bare `ANALYZE`
+  (all tables) after retention, so the planner sees the
+  post-deletion shape; a failed ANALYZE warns but never fails
+  maintenance. VACUUM is deliberately not run — Postgres autovacuum
+  owns dead-tuple reclamation. `pulse audit` gains an `indexes`
+  check: index counts, never-scanned indexes, and when `documents`
+  was last ANALYZEd (WARN when there are no indexes, or when
+  `documents` has never been ANALYZEd).

@@ -550,6 +550,32 @@ paths:
                 type: object
         "401":
           description: Missing or invalid API key.
+  /v1/admin/config:
+    post:
+      tags: [admin]
+      summary: Hot-reload safe settings (auth; Roadmap 6.11)
+      description: >
+        Applies live values for L1 TTL (60-900s), fan-out timeout
+        (50-500ms), and reindex interval (60-86400s). All values must
+        be integers; unknown keys and out-of-range values are rejected
+        with 400. Secrets, auth, rate limits, and retention are never
+        accepted here. A manual L1 TTL / fan-out timeout becomes the
+        auto-tuner's new baseline; the reindex interval is not tuned
+        and holds until restart. API-key auth, no usage accounting.
+        Returns the applied values.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Settings applied, with the applied values.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          description: Unknown setting, non-integer value, out-of-range value, or no recognised settings.
+        "401":
+          description: Missing or invalid API key.
   /v1/quality:
     get:
       tags: [intelligence]

@@ -38,6 +38,10 @@ pub const MaintenanceReport = struct {
     duplicates_near: usize = 0,
     aggregates_recorded: usize = 0,
     archive_path: ?[]const u8 = null,
+    /// Whether the planner-statistics refresh ran (Roadmap 6.11).
+    /// False on the memory store (no-op) or when ANALYZE fails —
+    /// a failed ANALYZE warns but never fails maintenance.
+    analyzed: bool = false,
 };
 
 /// "YYYY-MM" (UTC) for a Unix timestamp. Civil-from-days algorithm
@@ -318,6 +322,16 @@ pub fn runMaintenance(
         .{ .key = "archived", .value = try std.fmt.allocPrint(alloc, "{d}", .{ret.archived}) },
         .{ .key = "deleted", .value = try std.fmt.allocPrint(alloc, "{d}", .{ret.deleted}) },
     });
+    // Planner statistics (Roadmap 6.11): ANALYZE after retention, so
+    // the planner sees the post-deletion shape. A failure warns but
+    // never fails maintenance — stale stats are a slowdown, not data
+    // loss. VACUUM is autovacuum's job, not maintenance's.
+    repo.analyze(alloc) catch |e| {
+        logging.warn("maintenance: ANALYZE failed", &.{.{ .key = "error", .value = @errorName(e) }});
+        return report;
+    };
+    report.analyzed = true;
+    logging.info("maintenance: ANALYZE done", &.{});
     return report;
 }
 

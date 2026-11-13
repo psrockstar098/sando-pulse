@@ -147,6 +147,52 @@ pub fn checkPostgres(alloc: std.mem.Allocator, io: std.Io, url: []const u8) Chec
     return check("postgres", .pass, "server version ok, required extensions present");
 }
 
+/// Live index-health check (Roadmap 6.11): counts the indexes on the
+/// public schema, names the ones never scanned, and reports when the
+/// documents table was last ANALYZEd. WARN when there are no indexes
+/// at all (search would scan) or when documents has never been
+/// ANALYZEd (run `pulse maintenance`). Never-scanned indexes on a
+/// fresh install are reported, not warned — a new table has no scans
+/// yet, and dropping an index is an operator decision.
+pub fn checkIndexes(alloc: std.mem.Allocator, io: std.Io, url: []const u8) Check {
+    var client = postgres.PgClient.connect(alloc, io, url) catch {
+        return check("indexes", .fail, "cannot connect to DATABASE_URL");
+    };
+    defer client.close();
+    const ires = client.query(alloc, "SELECT indexrelname, idx_scan FROM pg_stat_user_indexes WHERE schemaname = 'public' ORDER BY indexrelname") catch {
+        return check("indexes", .fail, "index query failed");
+    };
+    var total: usize = 0;
+    var never_scanned: usize = 0;
+    var never_names: std.ArrayList(u8) = .empty;
+    defer never_names.deinit(alloc);
+    for (ires.rows) |row| {
+        if (row.cols.len < 2 or row.cols[0] == null) continue;
+        total += 1;
+        const scans = if (row.cols[1]) |s| std.fmt.parseInt(i64, s, 10) catch -1 else -1;
+        if (scans == 0) {
+            never_scanned += 1;
+            if (never_names.items.len > 0) never_names.appendSlice(alloc, ", ") catch {};
+            never_names.appendSlice(alloc, row.cols[0].?) catch {};
+        }
+    }
+    const ares = client.query(alloc, "SELECT last_analyze FROM pg_stat_user_tables WHERE schemaname = 'public' AND relname = 'documents'") catch {
+        return check("indexes", .fail, "last_analyze query failed");
+    };
+    const last_analyze: ?[]const u8 = if (ares.rows.len > 0 and ares.rows[0].cols.len > 0) ares.rows[0].cols[0] else null;
+    if (total == 0) {
+        return check("indexes", .warn, "no indexes on the public schema — search scans");
+    }
+    const detail = if (never_scanned > 0)
+        std.fmt.allocPrint(alloc, "{d} indexes, {d} never scanned ({s}); documents last ANALYZE: {s}", .{ total, never_scanned, never_names.items, last_analyze orelse "never" }) catch "index summary unavailable"
+    else
+        std.fmt.allocPrint(alloc, "{d} indexes, none never scanned; documents last ANALYZE: {s}", .{ total, last_analyze orelse "never" }) catch "index summary unavailable";
+    if (last_analyze == null) {
+        return check("indexes", .warn, detail);
+    }
+    return check("indexes", .pass, detail);
+}
+
 fn redisConfigGet(alloc: std.mem.Allocator, client: *redis.RedisClient, param: []const u8) ?[]const u8 {
     const res = client.command(alloc, &.{ "CONFIG", "GET", param }) catch return null;
     if (res != .array) return null;
@@ -216,8 +262,21 @@ pub fn run(alloc: std.mem.Allocator, io: std.Io, cfg: config.Config) u8 {
             .fail => fails += 1,
             .skip => skips += 1,
         }
+        // Index health (Roadmap 6.11): same connection target as the
+        // Postgres check above; a second connect is cheap and keeps
+        // each check independent.
+        const ic = checkIndexes(a, io, url);
+        printCheck(ic);
+        switch (ic.status) {
+            .pass => passes += 1,
+            .warn => warns += 1,
+            .fail => fails += 1,
+            .skip => skips += 1,
+        }
     } else {
         printCheck(check("postgres", .skip, "no DATABASE_URL configured"));
+        skips += 1;
+        printCheck(check("indexes", .skip, "no DATABASE_URL configured"));
         skips += 1;
     }
     if (cfg.redis_url) |url| {

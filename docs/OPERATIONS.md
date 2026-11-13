@@ -92,12 +92,25 @@ backup instead.
 - `/metrics` — Prometheus text: request counts by class, latency
   total, query counts, cache hits/misses, ingest runs/errors,
   documents indexed, fan-out outcomes, auto-tuning adjustments +
-  live knob values, process RSS.
+  live knob values, process RSS, circuit-breaker state/trips/skipped.
 - Auto-tuning (Roadmap 6.10): off by default (`PULSE_AUTOTUNE=1`
   enables). It moves only safe knobs within bounds (L1 TTL,
   fan-out timeout, worker concurrency) and logs every adjustment.
   Check `GET /v1/autotune`; restore the configured defaults with
   `POST /v1/admin/autotune/reset` (API key) or a restart.
+- Circuit breakers (Roadmap 6.11): watch `pulse_breaker_redis_state`
+  / `pulse_breaker_embedding_state` (0 closed, 1 half-open, 2 open)
+  and the `*_trips_total` / `*_skipped_total` counters. A breaker
+  stuck open means the dependency is down, not the breaker — fix
+  the dependency (Redis, or the external embedding provider); the
+  breaker closes itself on the next successful trial call after the
+  cooldown. Hot-reload safe settings with `POST /v1/admin/config`
+  (API key): `l1_ttl_s`, `fanout_timeout_ms`, `reindex_interval_s`.
+- Index maintenance (Roadmap 6.11): `pulse maintenance` runs a bare
+  `ANALYZE` after retention; `pulse audit` reports an `indexes`
+  check (index counts, never-scanned indexes, `documents` last
+  ANALYZE). A WARN there means: run `pulse maintenance`, or review
+  an index that has never been scanned.
 - Prometheus scrapes the API, postgres-exporter, redis-exporter and
   node-exporter every 15s; rules live in
   `docker/prometheus/alerts.yml` (API down, 5xx rate, slow responses,

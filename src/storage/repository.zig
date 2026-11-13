@@ -33,6 +33,9 @@ pub const Repository = struct {
         /// rows were actually removed. Never deletes events, entities, or
         /// aggregates — only the document rows themselves.
         deleteDocuments: *const fn (ptr: *anyopaque, ids: []const []const u8) anyerror!usize,
+        /// Refresh planner statistics (Roadmap 6.11): bare ANALYZE on
+        /// Postgres; a no-op on the memory store. Called by maintenance.
+        analyze: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror!void,
         deinit: *const fn (ptr: *anyopaque) void,
     };
 
@@ -62,6 +65,10 @@ pub const Repository = struct {
 
     pub fn deleteDocuments(self: Repository, ids: []const []const u8) !usize {
         return self.vtable.deleteDocuments(self.ptr, ids);
+    }
+
+    pub fn analyze(self: Repository, alloc: std.mem.Allocator) !void {
+        return self.vtable.analyze(self.ptr, alloc);
     }
 
     pub fn deinit(self: Repository) void {

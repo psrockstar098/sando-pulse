@@ -819,3 +819,81 @@ direct order 2026-11-13), real data only, docs in the same commits.
   is NOT syntax-checked here (no nginx on the VM).
 - Verified: `zig build` passes; 244/244 tests (no code changed in
   this section — compose + docs only).
+
+### 6.11 Advanced features — DONE (2026-11-13 ~17:45)
+
+- Circuit breakers (`src/engine/breaker.zig`, new, pure state
+  machine — no I/O, callers pass `now_ms` so it is unit-testable
+  with fake times): closed -> open after N consecutive failures,
+  refusals counted as skipped, one trial call after the cooldown
+  (half-open), success closes, trial failure re-opens. State gauge
+  codes 0 closed / 1 half-open / 2 open.
+- Embedding breaker: `BreakerEmbedding` wraps the provider vtable;
+  only the EXTERNAL provider is wrapped (main.zig, after
+  `makeEmbeddingProvider` — the local hashed provider cannot fail
+  and does no I/O). While open, embed calls fail fast with
+  `BreakerOpen`; both call sites (query search + ingest) already
+  fall back to lexical on embed failure. This matters because
+  `std.http.Client.fetch` has no per-request timeout in 0.17.1 —
+  a dead provider would otherwise hang every query and ingest.
+  The worker's embedder is the same wrapped value, so the worker
+  gets the breaker too; the server keeps the breaker pointer for
+  /metrics.
+- Redis breaker: the server owns one (`redis_breaker`). The L2
+  lookup is skipped entirely while open (compute fresh — the path
+  a miss already takes); a clean answer (hit or miss) counts as
+  success, only a Redis error as failure. Both L2 puts (query
+  path + cache warming) are also skipped while open, and a
+  successful put counts as success. Config: `PULSE_BREAKER_*`
+  (failures default 5, cooldown default 60s, min 5s).
+- Metrics: `pulse_breaker_{redis,embedding}_state` gauges,
+  `*_trips_total`, `*_skipped_total` (third format call in
+  `render` — same 32-argument cap reason as the 6.10 split).
+  Refreshed by the /metrics handler from the live breakers.
+- Hot config reload: `POST /v1/admin/config` (API-key auth, kind
+  null — the admin pattern). Safe settings only: `l1_ttl_s`
+  60–900, `fanout_timeout_ms` 50–500, `reindex_interval_s`
+  60–86400; all values must be integers, unknown keys and
+  out-of-range values return 400 naming the problem, empty body
+  returns 400. A manual L1 TTL / fan-out timeout becomes the
+  tuner's new baseline (the next adjustment moves from it); the
+  reindex interval is not tuned and holds until restart; the
+  autotune reset restores only the tuner's knobs. Secrets, auth,
+  rate limits, retention are never accepted here.
+- Index maintenance: `analyze` added to the Repository vtable
+  (memory store: no-op; Postgres: bare `ANALYZE` — all tables).
+  `runMaintenance` calls it after retention; a failed ANALYZE
+  warns but never fails maintenance (`report.analyzed`). VACUUM
+  is deliberately NOT run — Postgres autovacuum owns dead-tuple
+  reclamation. `pulse audit` gains a `checkIndexes` check
+  (index counts, never-scanned names, `documents` last ANALYZE;
+  WARN on zero indexes or never-analyzed documents).
+- Measured-first decisions recorded in `docs/PERFORMANCE.md`
+  (new): SIMD not built (no hot loop at this scale), zero-copy
+  not built as a separate change (cached bodies already served
+  without re-rendering; the remaining copy is a few KB),
+  memory pooling exists (arenas + PgPool), lock-free queues not
+  applicable (single-threaded server + external streams), async
+  I/O exists (std.Io threaded), adaptive batching exists
+  (runOnce batches + Streams for urgent updates), backpressure
+  exists (rate-limit 429 + PgPool bounds) with one recorded gap
+  (head-of-line blocking in the single-threaded accept loop —
+  needs a threaded accept loop, out of scope), multi-region
+  documented in 6.9.
+- Bugs found during the run: (1) `catch { ... } else { ... }` does
+  NOT parse as a statement in Zig 0.17.1 ("expected ';' after
+  statement") — both L2 put sites rewritten to `if (put) {} else
+  |_| {}` on the error union. (2) A format-string arg-count
+  mismatch in the audit detail (6 args, 5 placeholders) — fixed
+  by splitting into two format strings. (3) `embedder` in main.zig
+  was `const` — changed to `var` for the wrapping.
+- Verified: `zig build` passes; **249/249 tests pass** (5 new
+  breaker unit tests: closed/success-reset, threshold trip +
+  skipped count, cooldown trial + close, half-open re-trip,
+  threshold-1). Live smoke still to run in the verification pass
+  (breaker trip on a dead Redis + admin-config endpoint probes).
+  Note: the test binary exits 1 with "36 errors were logged" even
+  though all 249 tests pass — whether that is pre-existing is
+  being checked against the 6.9 tree (worktree verification was
+  interrupted by a VM restart; redo it before reporting 6.11
+  complete).

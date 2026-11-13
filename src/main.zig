@@ -47,6 +47,7 @@ const popular = @import("api/popular.zig");
 const cache = @import("api/cache.zig");
 const memindex = @import("engine/memindex.zig");
 const autotune = @import("engine/autotune.zig");
+const breaker = @import("engine/breaker.zig");
 const worker = @import("workers/worker.zig");
 const providers = @import("ai/providers.zig");
 
@@ -272,7 +273,9 @@ pub fn main(init: std.process.Init) !void {
     // Embedding provider for semantic search + ingest-time embeddings.
     // "local" (default) is a deterministic hashed lexical embedding;
     // "external" needs PULSE_EMBEDDING_API_URL + KEY; "none" disables it.
-    const embedder = try providers.makeEmbeddingProvider(
+    // `var`: the external provider is wrapped in a circuit breaker
+    // (Roadmap 6.11) just below.
+    var embedder = try providers.makeEmbeddingProvider(
         alloc,
         io,
         cfg.embedding_provider,
@@ -284,6 +287,22 @@ pub fn main(init: std.process.Init) !void {
     );
     if (embedder == null and std.mem.eql(u8, cfg.embedding_provider, "external")) {
         logging.warn("PULSE_EMBEDDING_PROVIDER=external but no URL/key set: semantic search disabled", &.{});
+    }
+
+    // Circuit breaker for the external embedder (Roadmap 6.11): the
+    // wrapper short-circuits to an error while open, and both call
+    // sites (query search + ingest) already fall back to lexical on
+    // embed failure. The local provider is never wrapped — it cannot
+    // fail and does no I/O. The breaker lives in the process arena
+    // (never deinited); the server keeps the pointer for /metrics.
+    var embed_breaker: ?*breaker.CircuitBreaker = null;
+    if (embedder != null and std.mem.eql(u8, cfg.embedding_provider, "external")) {
+        const eb = try alloc.create(breaker.CircuitBreaker);
+        eb.* = breaker.CircuitBreaker.init(cfg.embed_breaker_failures, cfg.embed_breaker_cooldown_s * 1000);
+        const wrapped = try alloc.create(breaker.BreakerEmbedding);
+        wrapped.* = .{ .inner = embedder.?, .breaker = eb, .io = io };
+        embedder = wrapped.provider();
+        embed_breaker = eb;
     }
 
     // --- facebook connector (Roadmap 3.2) ---
@@ -481,6 +500,9 @@ pub fn main(init: std.process.Init) !void {
         .audit_sink = &audit_sink,
         .autotuner = autotune.Autotuner.init(cfg.autotune_enabled, cfg.l1_ttl_s, cfg.fanout_timeout_ms, cfg.max_concurrent_sources),
         .fanout_timeout_ms = cfg.fanout_timeout_ms,
+        .redis_breaker = breaker.CircuitBreaker.init(cfg.redis_breaker_failures, cfg.redis_breaker_cooldown_s * 1000),
+        .embed_breaker = embed_breaker,
+        .reindex_interval_s = cfg.reindex_interval_s,
     };
     // Cache warming (Roadmap 6.4): run the most popular queries
     // through the pipeline and store the answers in L1/L2, so the

@@ -83,6 +83,17 @@ pub const Config = struct {
     /// PULSE_AUTOTUNE=1. Adjusts only the safe knobs within bounds,
     /// and logs every change.
     autotune_enabled: bool = false,
+    /// Circuit breakers (Roadmap 6.11): consecutive failures that trip
+    /// the breaker open, and the cooldown (seconds) before a trial call
+    /// is allowed. The embedding breaker guards the external HTTP
+    /// embedder (no per-request timeout exists in std.http.Client);
+    /// the Redis breaker guards the L2 cache lookups. Both fall back
+    /// to the degraded path that already exists (lexical / compute
+    /// fresh) while open.
+    embed_breaker_failures: u32 = 5,
+    embed_breaker_cooldown_s: u64 = 60,
+    redis_breaker_failures: u32 = 5,
+    redis_breaker_cooldown_s: u64 = 60,
     rate_limit_per_minute: u32 = 100,
     rate_limit_per_day: u32 = 10000,
     /// TLS termination is handled by a reverse proxy in front of Pulse
@@ -255,6 +266,18 @@ pub fn load(alloc: std.mem.Allocator, env_map: *std.process.Environ.Map) !Config
     }
     if (envOwned(alloc, env_map, "PULSE_AUTOTUNE")) |v| {
         cfg.autotune_enabled = std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
+    }
+    if (envOwned(alloc, env_map, "PULSE_BREAKER_EMBED_FAILURES")) |v| {
+        cfg.embed_breaker_failures = @intCast(@max(1, @min(parseU64(v) orelse 5, 100)));
+    }
+    if (envOwned(alloc, env_map, "PULSE_BREAKER_EMBED_COOLDOWN_S")) |v| {
+        cfg.embed_breaker_cooldown_s = @max(5, parseU64(v) orelse 60);
+    }
+    if (envOwned(alloc, env_map, "PULSE_BREAKER_REDIS_FAILURES")) |v| {
+        cfg.redis_breaker_failures = @intCast(@max(1, @min(parseU64(v) orelse 5, 100)));
+    }
+    if (envOwned(alloc, env_map, "PULSE_BREAKER_REDIS_COOLDOWN_S")) |v| {
+        cfg.redis_breaker_cooldown_s = @max(5, parseU64(v) orelse 60);
     }
     if (envOwned(alloc, env_map, "PULSE_RATE_LIMIT_PER_MINUTE")) |v| {
         cfg.rate_limit_per_minute = parseU32(v) orelse 100;
