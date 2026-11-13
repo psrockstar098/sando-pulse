@@ -20,6 +20,7 @@ const facebook = @import("connectors/facebook/facebook.zig");
 const normalizer = @import("normalizer.zig");
 const validate = @import("validate.zig");
 const entities = @import("../engine/entities.zig");
+const events_intel = @import("../intelligence/events.zig");
 const object_store = @import("../storage/object_store.zig");
 const providers = @import("../ai/providers.zig");
 
@@ -60,6 +61,45 @@ test "archive key is a compressed object key" {
     const key = try archiveKey(std.testing.allocator, "new-dawn", 1794441600);
     defer std.testing.allocator.free(key);
     try std.testing.expectEqualStrings("raw/new-dawn/1794441600.xml.zst", key);
+}
+
+test "pipeline retraction: publisher marker flips the event to retracted" {
+    const memory = @import("../storage/memory.zig");
+    const alloc = std.testing.allocator;
+    var store = memory.MemoryStore.init(alloc);
+    defer store.deinit();
+    var k = knowledge.MemoryKnowledge.init(alloc);
+    defer k.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const now: i64 = 1794484800;
+    var doc = types.Document{
+        .id = "retract-1",
+        .source_id = "new-dawn",
+        .source_name = "New Dawn",
+        .source_url = "https://thenewdawnliberia.com/",
+        .title = "Fuel shortage hits Monrovia",
+        .url = "https://example.com/r1",
+        .text = "Fuel stations in Monrovia report long queues.",
+        .published_at = now - 3600,
+        .fetched_at = now,
+        .reliability = 0.70,
+        .topics = &.{},
+        .content_hash = "retract-1",
+    };
+    try std.testing.expect(storeDocument(a, store.asRepository(), null, null, k.asKnowledge(), &doc));
+    var doc2 = doc;
+    doc2.id = "retract-2";
+    doc2.url = "https://example.com/r2";
+    doc2.content_hash = "retract-2";
+    doc2.title = "RETRACTION: Fuel shortage hits Monrovia";
+    doc2.text = "We retract our earlier report: there was no fuel shortage.";
+    doc2.published_at = now - 1800;
+    try std.testing.expect(storeDocument(a, store.asRepository(), null, null, k.asKnowledge(), &doc2));
+    const ev = (try k.asKnowledge().getEvent(a, "retract-1")).?;
+    try std.testing.expectEqualStrings("retracted", ev.status);
+    try std.testing.expectEqual(@as(usize, 2), ev.doc_count);
 }
 
 /// Record one source's fetch outcome in the knowledge store (Roadmap
@@ -131,6 +171,17 @@ fn storeDocument(
                     logging.warn("knowledge entities failed", &.{ .{ .key = "source", .value = doc.source_id }, .{ .key = "error", .value = @errorName(e) } });
                 };
                 if (k.upsertEventForDoc(alloc, doc.*, ent)) |ev| {
+                    // Correction/retraction tracking (4.1): the
+                    // publisher's own markers persist on the event.
+                    // Only escalates (reported -> corrected ->
+                    // retracted); a failure here is a warning, the
+                    // document is already stored.
+                    if (events_intel.scanRetraction(alloc, doc.title) catch null orelse
+                        (events_intel.scanRetraction(alloc, doc.text) catch null)) |st| {
+                        k.markEventStatus(alloc, ev, st) catch |e| {
+                            logging.warn("knowledge event status failed", &.{ .{ .key = "error", .value = @errorName(e) } });
+                        };
+                    }
                     alloc.free(ev);
                 } else |e| {
                     logging.warn("knowledge event failed", &.{ .{ .key = "source", .value = doc.source_id }, .{ .key = "error", .value = @errorName(e) } });

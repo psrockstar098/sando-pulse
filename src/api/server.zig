@@ -248,11 +248,31 @@ pub const Server = struct {
 
         if (method == .GET and std.mem.eql(u8, path, "/v1/events")) {
             if (self.knowledge) |k| {
+                // Detail: /v1/events?id=<event_id> — the event plus
+                // its documents, corroboration, status, conflicts and
+                // timeline (4.1).
+                if (queryParam(queryOf(req.head.target), "id")) |ev_id| {
+                    const ev = (k.getEvent(alloc, ev_id) catch {
+                        self.respondError(req, alloc, req_id, .internal_server_error, "event_failed", "Failed to load event");
+                        return;
+                    }) orelse {
+                        self.respondError(req, alloc, req_id, .not_found, "event_not_found", "No such event");
+                        return;
+                    };
+                    const docs = k.eventDocs(alloc, ev_id) catch {
+                        self.respondError(req, alloc, req_id, .internal_server_error, "event_docs_failed", "Failed to list event documents");
+                        return;
+                    };
+                    const body = try query_json.buildEventDetailResponse(alloc, req_id, ev, docs, timex.nowSeconds(self.io));
+                    self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+                    try respondJson(req, .ok, body, req_id);
+                    return;
+                }
                 const events = k.listEvents(alloc, 20) catch {
                     self.respondError(req, alloc, req_id, .internal_server_error, "events_failed", "Failed to list events");
                     return;
                 };
-                const body = try query_json.buildEventsResponse(alloc, req_id, events);
+                const body = try query_json.buildEventsResponse(alloc, req_id, events, timex.nowSeconds(self.io));
                 self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
                 try respondJson(req, .ok, body, req_id);
                 return;

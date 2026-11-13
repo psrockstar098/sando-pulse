@@ -60,6 +60,9 @@ pub const PostgresKnowledge = struct {
         .recordEntities = recordEntities,
         .upsertEventForDoc = upsertEventForDoc,
         .listEvents = listEvents,
+        .getEvent = getEvent,
+        .eventDocs = eventDocs,
+        .markEventStatus = markEventStatus,
         .recordSourceHealth = recordSourceHealth,
         .getSourceHealth = getSourceHealth,
         .upsertLocation = upsertLocation,
@@ -300,7 +303,7 @@ pub const PostgresKnowledge = struct {
             \\SELECT id, title, topic,
             \\  extract(epoch from first_seen_at)::bigint,
             \\  extract(epoch from last_seen_at)::bigint,
-            \\  doc_count, summary FROM events
+            \\  doc_count, summary, source_count, status FROM events
             \\ORDER BY last_seen_at DESC LIMIT {d}
         , .{@min(limit, 100)});
         defer alloc.free(sql);
@@ -308,7 +311,7 @@ pub const PostgresKnowledge = struct {
         defer res.deinit(alloc);
         var out: std.ArrayList(knowledge.KnowledgeEvent) = .empty;
         for (res.rows) |row| {
-            if (row.cols.len != 7) return error.ProtocolError;
+            if (row.cols.len != 9) return error.ProtocolError;
             const c = row.cols;
             try out.append(alloc, .{
                 .id = try alloc.dupe(u8, c[0] orelse return error.ProtocolError),
@@ -318,9 +321,105 @@ pub const PostgresKnowledge = struct {
                 .last_seen = try std.fmt.parseInt(i64, c[4] orelse return error.ProtocolError, 10),
                 .doc_count = try std.fmt.parseInt(usize, c[5] orelse return error.ProtocolError, 10),
                 .summary = if (c[6]) |s| try alloc.dupe(u8, s) else null,
+                .distinct_sources = try std.fmt.parseInt(usize, c[7] orelse "0", 10),
+                .status = try alloc.dupe(u8, c[8] orelse "reported"),
             });
         }
         return out.toOwnedSlice(alloc);
+    }
+
+    /// One event by id, or null.
+    fn getEvent(ptr: *anyopaque, alloc: Allocator, event_id: []const u8) anyerror!?knowledge.KnowledgeEvent {
+        const self: *PostgresKnowledge = @ptrCast(@alignCast(ptr));
+        self.lock();
+        defer self.unlock();
+        const esc_ev = try pg.escapeLiteral(alloc, event_id);
+        defer alloc.free(esc_ev);
+        const sql = try std.fmt.allocPrint(alloc,
+            \\SELECT id, title, topic,
+            \\  extract(epoch from first_seen_at)::bigint,
+            \\  extract(epoch from last_seen_at)::bigint,
+            \\  doc_count, summary, source_count, status FROM events
+            \\WHERE id = {s}
+        , .{esc_ev});
+        defer alloc.free(sql);
+        var res = try self.queryLocked(alloc, sql);
+        defer res.deinit(alloc);
+        if (res.rows.len == 0) return null;
+        const row = res.rows[0];
+        if (row.cols.len != 9) return error.ProtocolError;
+        const c = row.cols;
+        return .{
+            .id = try alloc.dupe(u8, c[0] orelse return error.ProtocolError),
+            .title = try alloc.dupe(u8, c[1] orelse return error.ProtocolError),
+            .topic = try alloc.dupe(u8, c[2] orelse ""),
+            .first_seen = try std.fmt.parseInt(i64, c[3] orelse return error.ProtocolError, 10),
+            .last_seen = try std.fmt.parseInt(i64, c[4] orelse return error.ProtocolError, 10),
+            .doc_count = try std.fmt.parseInt(usize, c[5] orelse return error.ProtocolError, 10),
+            .summary = if (c[6]) |s| try alloc.dupe(u8, s) else null,
+            .distinct_sources = try std.fmt.parseInt(usize, c[7] orelse "0", 10),
+            .status = try alloc.dupe(u8, c[8] orelse "reported"),
+        };
+    }
+
+    /// The event's documents, newest first. Text is capped at 4000
+    /// chars (enough for the retraction scan; the full text lives in
+    /// the documents table).
+    fn eventDocs(ptr: *anyopaque, alloc: Allocator, event_id: []const u8) anyerror![]knowledge.EventDoc {
+        const self: *PostgresKnowledge = @ptrCast(@alignCast(ptr));
+        self.lock();
+        defer self.unlock();
+        const esc_ev = try pg.escapeLiteral(alloc, event_id);
+        defer alloc.free(esc_ev);
+        const sql = try std.fmt.allocPrint(alloc,
+            \\SELECT d.id, d.title, d.source_id, s.name,
+            \\  extract(epoch from COALESCE(d.published_at, d.fetched_at))::bigint,
+            \\  left(d.text, 4000)
+            \\FROM event_sources es JOIN documents d ON d.id = es.document_id
+            \\  LEFT JOIN sources s ON s.id = d.source_id
+            \\WHERE es.event_id = {s}
+            \\ORDER BY COALESCE(d.published_at, d.fetched_at) DESC
+        , .{esc_ev});
+        defer alloc.free(sql);
+        var res = try self.queryLocked(alloc, sql);
+        defer res.deinit(alloc);
+        var out: std.ArrayList(knowledge.EventDoc) = .empty;
+        for (res.rows) |row| {
+            if (row.cols.len != 6) return error.ProtocolError;
+            const c = row.cols;
+            try out.append(alloc, .{
+                .id = try alloc.dupe(u8, c[0] orelse return error.ProtocolError),
+                .title = try alloc.dupe(u8, c[1] orelse return error.ProtocolError),
+                .source_id = try alloc.dupe(u8, c[2] orelse return error.ProtocolError),
+                .source_name = try alloc.dupe(u8, c[3] orelse ""),
+                .published_at = try std.fmt.parseInt(i64, c[4] orelse return error.ProtocolError, 10),
+                .text = try alloc.dupe(u8, c[5] orelse ""),
+            });
+        }
+        return out.toOwnedSlice(alloc);
+    }
+
+    /// Only escalates: reported -> corrected -> retracted. The CASE
+    /// keeps 'retracted' sticky and lets 'retracted' override
+    /// 'corrected'; the pipeline only ever passes those two values.
+    fn markEventStatus(ptr: *anyopaque, alloc: Allocator, event_id: []const u8, status: []const u8) anyerror!void {
+        const self: *PostgresKnowledge = @ptrCast(@alignCast(ptr));
+        self.lock();
+        defer self.unlock();
+        const esc_ev = try pg.escapeLiteral(alloc, event_id);
+        defer alloc.free(esc_ev);
+        const esc_st = try pg.escapeLiteral(alloc, status);
+        defer alloc.free(esc_st);
+        const sql = try std.fmt.allocPrint(alloc,
+            \\UPDATE events SET status = CASE
+            \\  WHEN status = 'retracted' THEN 'retracted'
+            \\  WHEN {s} = 'retracted' THEN 'retracted'
+            \\  WHEN status = 'corrected' AND {s} = 'reported' THEN 'corrected'
+            \\  ELSE {s} END
+            \\WHERE id = {s}
+        , .{ esc_st, esc_st, esc_st, esc_ev });
+        defer alloc.free(sql);
+        try self.execLocked(alloc, sql);
     }
 
     fn recordSourceHealth(ptr: *anyopaque, alloc: Allocator, health: knowledge.SourceHealth) anyerror!void {
@@ -763,6 +862,26 @@ test "postgres knowledge: live" {
         if (std.mem.eql(u8, l.name, "Testville")) saw_testville = true;
     }
     try std.testing.expect(saw_testville);
+    // 4.1: event docs + status escalation + getEvent (live Postgres).
+    // Uses the kt1 event, which this test cleans up at the end of
+    // every run — so the sticky "retracted" state never leaks into
+    // the next run.
+    const kt_docs = try ks.eventDocs(a, "kt1-hash-test");
+    try std.testing.expectEqual(@as(usize, 2), kt_docs.len);
+    try std.testing.expectEqualStrings("kt2", kt_docs[0].id); // newest first
+    try std.testing.expectEqualStrings("kt1", kt_docs[1].id);
+    const kt_ev = (try ks.getEvent(a, "kt1-hash-test")).?;
+    try std.testing.expectEqual(@as(usize, 1), kt_ev.distinct_sources);
+    try std.testing.expectEqualStrings("reported", kt_ev.status);
+    try ks.markEventStatus(a, "kt1-hash-test", "corrected");
+    try std.testing.expectEqualStrings("corrected", (try ks.getEvent(a, "kt1-hash-test")).?.status);
+    try ks.markEventStatus(a, "kt1-hash-test", "reported"); // never downgrades
+    try std.testing.expectEqualStrings("corrected", (try ks.getEvent(a, "kt1-hash-test")).?.status);
+    try ks.markEventStatus(a, "kt1-hash-test", "retracted");
+    try std.testing.expectEqualStrings("retracted", (try ks.getEvent(a, "kt1-hash-test")).?.status);
+    try ks.markEventStatus(a, "kt1-hash-test", "corrected"); // retracted is sticky
+    try std.testing.expectEqualStrings("retracted", (try ks.getEvent(a, "kt1-hash-test")).?.status);
+    try std.testing.expect(try ks.getEvent(a, "no-such-event") == null);
     const stats = try ks.listStatistics(a);
     var saw_stat = false;
     for (stats) |s| {

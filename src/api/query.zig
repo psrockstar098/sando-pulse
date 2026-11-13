@@ -5,6 +5,7 @@ const std = @import("std");
 const format = @import("../common/format.zig");
 const types = @import("../common/types.zig");
 const knowledge = @import("../storage/knowledge.zig");
+const events_intel = @import("../intelligence/events.zig");
 const planner = @import("../engine/planner.zig");
 const search = @import("../engine/search.zig");
 const temporal = @import("../engine/temporal.zig");
@@ -331,6 +332,7 @@ pub fn buildEventsResponse(
     alloc: std.mem.Allocator,
     req_id: []const u8,
     events: []const knowledge.KnowledgeEvent,
+    now: i64,
 ) ![]u8 {
     var list: std.ArrayList(struct {
         id: []const u8,
@@ -340,6 +342,9 @@ pub fn buildEventsResponse(
         last_seen: []const u8,
         doc_count: usize,
         summary: ?[]const u8,
+        distinct_sources: usize,
+        status: []const u8,
+        importance: f64,
     }) = .empty;
     for (events) |e| {
         try list.append(alloc, .{
@@ -350,10 +355,76 @@ pub fn buildEventsResponse(
             .last_seen = try formatIso(alloc, e.last_seen),
             .doc_count = e.doc_count,
             .summary = e.summary,
+            .distinct_sources = e.distinct_sources,
+            .status = e.status,
+            .importance = events_intel.importanceScore(e.doc_count, e.distinct_sources, now - e.last_seen),
         });
     }
     return stringifyAlloc(alloc, .{
         .events = list.items,
+        .request_id = req_id,
+    });
+}
+
+/// One event in full (4.1): its documents, corroboration, status,
+/// conflict report and day timeline. `docs` are newest-first.
+pub fn buildEventDetailResponse(
+    alloc: std.mem.Allocator,
+    req_id: []const u8,
+    event: knowledge.KnowledgeEvent,
+    docs: []const knowledge.EventDoc,
+    now: i64,
+) ![]u8 {
+    const status = try events_intel.eventStatus(alloc, docs);
+    const conflicts = try events_intel.detectConflicts(alloc, docs);
+    const timeline = try events_intel.timelineBuckets(alloc, docs);
+    const corroboration = try events_intel.corroboration(alloc, docs);
+    var doc_list: std.ArrayList(struct {
+        id: []const u8,
+        title: []const u8,
+        source_id: []const u8,
+        source_name: []const u8,
+        published_at: []const u8,
+    }) = .empty;
+    for (docs) |d| {
+        try doc_list.append(alloc, .{
+            .id = d.id,
+            .title = d.title,
+            .source_id = d.source_id,
+            .source_name = d.source_name,
+            .published_at = try formatIso(alloc, d.published_at),
+        });
+    }
+    var day_list: std.ArrayList(struct {
+        day: []const u8,
+        doc_count: usize,
+    }) = .empty;
+    for (timeline) |t| {
+        try day_list.append(alloc, .{ .day = t.day, .doc_count = t.doc_count });
+    }
+    return stringifyAlloc(alloc, .{
+        .event = .{
+            .id = event.id,
+            .title = event.title,
+            .topic = event.topic,
+            .first_seen = try formatIso(alloc, event.first_seen),
+            .last_seen = try formatIso(alloc, event.last_seen),
+            .doc_count = event.doc_count,
+            .summary = event.summary,
+            .distinct_sources = corroboration,
+            .status = status,
+            .importance = events_intel.importanceScore(event.doc_count, corroboration, now - event.last_seen),
+        },
+        .corroboration = corroboration,
+        .status = status,
+        .conflicts = .{
+            .divergent = conflicts.divergent,
+            .min_similarity = conflicts.min_similarity,
+            .a_title = conflicts.a_title,
+            .b_title = conflicts.b_title,
+        },
+        .timeline = day_list.items,
+        .documents = doc_list.items,
         .request_id = req_id,
     });
 }

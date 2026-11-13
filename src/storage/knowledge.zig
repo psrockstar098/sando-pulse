@@ -23,6 +23,24 @@ pub const KnowledgeEvent = struct {
     last_seen: i64,
     doc_count: usize,
     summary: ?[]const u8 = null,
+    /// Distinct source ids among the event's documents (corroboration).
+    distinct_sources: usize = 0,
+    /// "reported" | "corrected" | "retracted" — the publisher's own
+    /// markers, persisted at ingest; never downgraded.
+    status: []const u8 = "reported",
+};
+
+/// One document belonging to an event, for the intelligence layer
+/// (4.1): conflict detection, retraction scanning, timelines.
+/// `text` is the document text (Postgres selects it capped at 4000
+/// chars; the memory store keeps a copy per event doc).
+pub const EventDoc = struct {
+    id: []const u8,
+    title: []const u8,
+    source_id: []const u8,
+    source_name: []const u8,
+    published_at: i64,
+    text: []const u8,
 };
 
 pub const EntityRow = struct {
@@ -116,6 +134,13 @@ pub const KnowledgeStore = struct {
         /// Find-or-create the event for this document; returns the event id.
         upsertEventForDoc: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, doc: types.Document, ent: entities_mod.Entities) anyerror![]u8,
         listEvents: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, limit: usize) anyerror![]KnowledgeEvent,
+        /// One event by id, or null (4.1 detail endpoint).
+        getEvent: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, event_id: []const u8) anyerror!?KnowledgeEvent,
+        /// The event's documents, newest first (4.1 detail/conflicts).
+        eventDocs: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, event_id: []const u8) anyerror![]EventDoc,
+        /// Persist a correction/retraction status. Only escalates
+        /// (reported -> corrected -> retracted), never downgrades.
+        markEventStatus: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, event_id: []const u8, status: []const u8) anyerror!void,
         recordSourceHealth: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, health: SourceHealth) anyerror!void,
         getSourceHealth: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, source_id: []const u8) anyerror!?SourceHealth,
         upsertLocation: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, row: LocationRow) anyerror!void,
@@ -146,6 +171,18 @@ pub const KnowledgeStore = struct {
 
     pub fn listEvents(self: KnowledgeStore, alloc: std.mem.Allocator, limit: usize) ![]KnowledgeEvent {
         return self.vtable.listEvents(self.ptr, alloc, limit);
+    }
+
+    pub fn getEvent(self: KnowledgeStore, alloc: std.mem.Allocator, event_id: []const u8) !?KnowledgeEvent {
+        return self.vtable.getEvent(self.ptr, alloc, event_id);
+    }
+
+    pub fn eventDocs(self: KnowledgeStore, alloc: std.mem.Allocator, event_id: []const u8) ![]EventDoc {
+        return self.vtable.eventDocs(self.ptr, alloc, event_id);
+    }
+
+    pub fn markEventStatus(self: KnowledgeStore, alloc: std.mem.Allocator, event_id: []const u8, status: []const u8) !void {
+        return self.vtable.markEventStatus(self.ptr, alloc, event_id, status);
     }
 
     pub fn recordSourceHealth(self: KnowledgeStore, alloc: std.mem.Allocator, health: SourceHealth) !void {
@@ -209,6 +246,9 @@ pub const MemoryKnowledge = struct {
     alloc: std.mem.Allocator,
     events: std.ArrayList(KnowledgeEvent),
     event_sources: std.ArrayList(struct { event_id: []const u8, source_id: []const u8, doc_count: usize }),
+    /// One row per (event, document) — the event's docs for 4.1
+    /// detail/conflict/retraction work. Owned copies.
+    event_docs: std.ArrayList(struct { event_id: []const u8, doc: EventDoc }),
     entities: std.ArrayList(EntityRow),
     topics: std.ArrayList(TopicRow),
     locations: std.ArrayList(LocationRow),
@@ -222,6 +262,7 @@ pub const MemoryKnowledge = struct {
             .alloc = alloc,
             .events = .empty,
             .event_sources = .empty,
+            .event_docs = .empty,
             .entities = .empty,
             .topics = .empty,
             .locations = .empty,
@@ -246,6 +287,15 @@ pub const MemoryKnowledge = struct {
             a.free(es.source_id);
         }
         self.event_sources.deinit(a);
+        for (self.event_docs.items) |ed| {
+            a.free(ed.event_id);
+            a.free(ed.doc.id);
+            a.free(ed.doc.title);
+            a.free(ed.doc.source_id);
+            a.free(ed.doc.source_name);
+            a.free(ed.doc.text);
+        }
+        self.event_docs.deinit(a);
         for (self.entities.items) |e| {
             a.free(e.name);
             a.free(e.kind);
@@ -298,6 +348,9 @@ pub const MemoryKnowledge = struct {
         .recordEntities = recordEntities,
         .upsertEventForDoc = upsertEventForDoc,
         .listEvents = listEvents,
+        .getEvent = getEvent,
+        .eventDocs = eventDocs,
+        .markEventStatus = markEventStatus,
         .recordSourceHealth = recordSourceHealth,
         .getSourceHealth = getSourceHealth,
         .upsertLocation = upsertLocation,
@@ -380,6 +433,7 @@ pub const MemoryKnowledge = struct {
                     }
                 }
                 try self.bumpEventSource(e.id, doc.source_id);
+                try self.recordEventDoc(e.id, doc);
                 return alloc.dupe(u8, e.id);
             }
         }
@@ -394,6 +448,7 @@ pub const MemoryKnowledge = struct {
             .summary = if (doc.summary) |s| try self.alloc.dupe(u8, s) else null,
         });
         try self.bumpEventSource(id, doc.source_id);
+        try self.recordEventDoc(id, doc);
         return id;
     }
 
@@ -420,6 +475,10 @@ pub const MemoryKnowledge = struct {
         while (i > 0 and out.items.len < n) {
             i -= 1;
             const e = self.events.items[i];
+            var distinct: usize = 0;
+            for (self.event_sources.items) |es| {
+                if (std.mem.eql(u8, es.event_id, e.id)) distinct += 1;
+            }
             try out.append(alloc, .{
                 .id = try alloc.dupe(u8, e.id),
                 .title = try alloc.dupe(u8, e.title),
@@ -428,9 +487,93 @@ pub const MemoryKnowledge = struct {
                 .last_seen = e.last_seen,
                 .doc_count = e.doc_count,
                 .summary = if (e.summary) |s| try alloc.dupe(u8, s) else null,
+                .distinct_sources = distinct,
+                .status = try alloc.dupe(u8, e.status),
             });
         }
         return out.toOwnedSlice(alloc);
+    }
+
+    fn getEvent(ptr: *anyopaque, alloc: std.mem.Allocator, event_id: []const u8) anyerror!?KnowledgeEvent {
+        const self: *MemoryKnowledge = @ptrCast(@alignCast(ptr));
+        for (self.events.items) |e| {
+            if (!std.mem.eql(u8, e.id, event_id)) continue;
+            var distinct: usize = 0;
+            for (self.event_sources.items) |es| {
+                if (std.mem.eql(u8, es.event_id, e.id)) distinct += 1;
+            }
+            return .{
+                .id = try alloc.dupe(u8, e.id),
+                .title = try alloc.dupe(u8, e.title),
+                .topic = try alloc.dupe(u8, e.topic),
+                .first_seen = e.first_seen,
+                .last_seen = e.last_seen,
+                .doc_count = e.doc_count,
+                .summary = if (e.summary) |s| try alloc.dupe(u8, s) else null,
+                .distinct_sources = distinct,
+                .status = try alloc.dupe(u8, e.status),
+            };
+        }
+        return null;
+    }
+
+    fn eventDocs(ptr: *anyopaque, alloc: std.mem.Allocator, event_id: []const u8) anyerror![]EventDoc {
+        const self: *MemoryKnowledge = @ptrCast(@alignCast(ptr));
+        var out: std.ArrayList(EventDoc) = .empty;
+        // Newest first (insertion order is oldest-first).
+        var i: usize = self.event_docs.items.len;
+        while (i > 0) {
+            i -= 1;
+            const ed = self.event_docs.items[i];
+            if (!std.mem.eql(u8, ed.event_id, event_id)) continue;
+            try out.append(alloc, .{
+                .id = try alloc.dupe(u8, ed.doc.id),
+                .title = try alloc.dupe(u8, ed.doc.title),
+                .source_id = try alloc.dupe(u8, ed.doc.source_id),
+                .source_name = try alloc.dupe(u8, ed.doc.source_name),
+                .published_at = ed.doc.published_at,
+                .text = try alloc.dupe(u8, ed.doc.text),
+            });
+        }
+        return out.toOwnedSlice(alloc);
+    }
+
+    /// Only escalates: reported -> corrected -> retracted. The stored
+    /// value is always one of the static literals from the
+    /// intelligence module ("reported"/"corrected"/"retracted"), so
+    /// it is kept by reference, never duped or freed (deinit does not
+    /// free e.status, matching the other literal-held fields).
+    fn markEventStatus(ptr: *anyopaque, alloc: std.mem.Allocator, event_id: []const u8, status: []const u8) anyerror!void {
+        _ = alloc;
+        const self: *MemoryKnowledge = @ptrCast(@alignCast(ptr));
+        const rank = struct {
+            fn of(s: []const u8) usize {
+                if (std.mem.eql(u8, s, "retracted")) return 2;
+                if (std.mem.eql(u8, s, "corrected")) return 1;
+                return 0;
+            }
+        }.of;
+        for (self.events.items) |*e| {
+            if (std.mem.eql(u8, e.id, event_id) and rank(status) > rank(e.status)) {
+                e.status = status;
+                return;
+            }
+        }
+    }
+
+    /// Record one (event, document) row for 4.1 detail work.
+    fn recordEventDoc(self: *MemoryKnowledge, event_id: []const u8, doc: types.Document) !void {
+        try self.event_docs.append(self.alloc, .{
+            .event_id = try self.alloc.dupe(u8, event_id),
+            .doc = .{
+                .id = try self.alloc.dupe(u8, doc.id),
+                .title = try self.alloc.dupe(u8, doc.title),
+                .source_id = try self.alloc.dupe(u8, doc.source_id),
+                .source_name = try self.alloc.dupe(u8, doc.source_name),
+                .published_at = docTs(doc),
+                .text = try self.alloc.dupe(u8, doc.text),
+            },
+        });
     }
 
     fn recordSourceHealth(ptr: *anyopaque, alloc: std.mem.Allocator, health: SourceHealth) anyerror!void {
@@ -757,6 +900,27 @@ test "memory knowledge: entities, events, health, seed rows" {
     defer alloc.free(ev3);
     try std.testing.expectEqualStrings("d3", ev3);
     try std.testing.expectEqual(@as(usize, 2), (try ks.listEvents(alloc, 10)).len);
+    // 4.1: event docs, corroboration, status escalation, getEvent.
+    const ev_docs = try ks.eventDocs(alloc, "d1");
+    try std.testing.expectEqual(@as(usize, 2), ev_docs.len);
+    try std.testing.expectEqualStrings("d2", ev_docs[0].id); // newest first
+    try std.testing.expectEqualStrings("d1", ev_docs[1].id);
+    const ev_list = try ks.listEvents(alloc, 10);
+    var fuel_ev: ?KnowledgeEvent = null;
+    for (ev_list) |e| {
+        if (std.mem.eql(u8, e.id, "d1")) fuel_ev = e;
+    }
+    try std.testing.expectEqual(@as(usize, 1), fuel_ev.?.distinct_sources);
+    try std.testing.expectEqualStrings("reported", fuel_ev.?.status);
+    try ks.markEventStatus(alloc, "d1", "corrected");
+    try std.testing.expectEqualStrings("corrected", (try ks.getEvent(alloc, "d1")).?.status);
+    try ks.markEventStatus(alloc, "d1", "reported"); // never downgrades
+    try std.testing.expectEqualStrings("corrected", (try ks.getEvent(alloc, "d1")).?.status);
+    try ks.markEventStatus(alloc, "d1", "retracted");
+    try std.testing.expectEqualStrings("retracted", (try ks.getEvent(alloc, "d1")).?.status);
+    try ks.markEventStatus(alloc, "d1", "corrected"); // retracted is sticky
+    try std.testing.expectEqualStrings("retracted", (try ks.getEvent(alloc, "d1")).?.status);
+    try std.testing.expect(try ks.getEvent(alloc, "no-such-event") == null);
     // Health + seed rows + counts. Fixture values are synthetic (test
     // only) — real seeded data lives in src/seed/ with provenance.
     try ks.recordSourceHealth(alloc, .{ .source_id = "new-dawn", .last_run_at = now, .last_success_at = now, .docs_total = 2 });
