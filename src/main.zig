@@ -112,8 +112,11 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
 
-    if (cfg.api_key == null) {
+    if (cfg.api_key == null and cfg.api_key_previous == null) {
         logging.warn("PULSE_API_KEY is not set: API runs in open dev mode (no auth on /v1/query and /v1/ingest)", &.{});
+    }
+    if (cfg.api_key_previous != null) {
+        logging.info("API key rotation active: previous key still accepted (remove PULSE_API_KEY_PREVIOUS once clients migrate)", &.{});
     }
 
     // --- storage ---

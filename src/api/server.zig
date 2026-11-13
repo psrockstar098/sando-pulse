@@ -88,7 +88,7 @@ pub const Server = struct {
             .{ .key = "host", .value = self.cfg.host },
             .{ .key = "port", .value = try std.fmt.allocPrint(self.alloc, "{d}", .{self.cfg.port}) },
             .{ .key = "store", .value = self.store_name },
-            .{ .key = "auth", .value = if (self.cfg.api_key != null) "api-key" else "open-dev-mode" },
+            .{ .key = "auth", .value = if (self.cfg.api_key != null) (if (self.cfg.api_key_previous != null) "api-key+rotation" else "api-key") else if (self.cfg.api_key_previous != null) "api-key(previous-only)" else "open-dev-mode" },
         });
         while (true) {
             var stream = listener.accept(self.io) catch |e| {
@@ -195,7 +195,7 @@ pub const Server = struct {
 
     fn checkAuthAndRate(self: *Server, req: *std.http.Server.Request, arena: std.mem.Allocator, req_id: []const u8) bool {
         const auth_header = headerValue(req.head_buffer, "authorization");
-        switch (auth.authenticate(self.cfg.api_key, auth_header)) {
+        switch (auth.authenticateRotated(self.cfg.api_key, self.cfg.api_key_previous, auth_header)) {
             .open, .ok => {},
             .missing => {
                 self.respondError(req, arena, req_id, .unauthorized, "auth_required", "Missing Authorization: Bearer <api-key> header");
@@ -206,7 +206,9 @@ pub const Server = struct {
                 return false;
             },
         }
-        const key = self.cfg.api_key orelse "anonymous";
+        // Rate-limit bucket: the presented token (each key gets its own
+        // budget during rotation); "anonymous" in open dev mode.
+        const key = auth.presentedToken(auth_header) orelse "anonymous";
         const check = self.limiter.check(key, timex.nowMillis(self.io)) catch {
             self.respondError(req, arena, req_id, .too_many_requests, "rate_limited", "Rate limit exceeded");
             return false;

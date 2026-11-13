@@ -22,14 +22,42 @@ fn constantTimeEqual(a: []const u8, b: []const u8) bool {
 /// Check one request's Authorization header against the configured key.
 /// `api_key` is null when the server runs in open dev mode.
 pub fn authenticate(api_key: ?[]const u8, auth_header: ?[]const u8) AuthResult {
-    const key = api_key orelse return .open;
+    return authenticateRotated(api_key, null, auth_header);
+}
+
+/// Key rotation (Roadmap 5.1): accept the current key AND the previous
+/// one. Rotation procedure: generate a fresh key (`pulse keygen`), put it
+/// in PULSE_API_KEY, move the old key to PULSE_API_KEY_PREVIOUS, restart,
+/// let clients migrate, then remove PULSE_API_KEY_PREVIOUS and restart
+/// again. Open mode only when BOTH are null.
+pub fn authenticateRotated(api_key: ?[]const u8, previous_key: ?[]const u8, auth_header: ?[]const u8) AuthResult {
+    if (api_key == null and previous_key == null) return .open;
     const header = auth_header orelse return .missing;
     if (header.len < 8) return .invalid;
     if (!std.ascii.eqlIgnoreCase(header[0..6], "bearer")) return .invalid;
     if (header[6] != ' ') return .invalid;
     const presented = std.mem.trim(u8, header[7..], " ");
     if (presented.len == 0) return .invalid;
-    return if (constantTimeEqual(presented, key)) .ok else .invalid;
+    if (api_key) |k| {
+        if (constantTimeEqual(presented, k)) return .ok;
+    }
+    if (previous_key) |k| {
+        if (constantTimeEqual(presented, k)) return .ok;
+    }
+    return .invalid;
+}
+
+/// The presented Bearer token, or null when the header is absent or
+/// malformed. Used as the rate-limiter bucket key so each API key gets
+/// its own budget during rotation (the token itself is never logged).
+pub fn presentedToken(auth_header: ?[]const u8) ?[]const u8 {
+    const header = auth_header orelse return null;
+    if (header.len < 8) return null;
+    if (!std.ascii.eqlIgnoreCase(header[0..6], "bearer")) return null;
+    if (header[6] != ' ') return null;
+    const presented = std.mem.trim(u8, header[7..], " ");
+    if (presented.len == 0) return null;
+    return presented;
 }
 
 /// Generate a fresh 32-byte (64 hex char) API key. The caller prints it once
@@ -63,6 +91,17 @@ test "authenticate checks bearer keys" {
     try std.testing.expectEqual(AuthResult.invalid, authenticate(key, "Bearer"));
     try std.testing.expectEqual(AuthResult.invalid, authenticate(key, "Bearer "));
     try std.testing.expectEqual(AuthResult.invalid, authenticate(key, "test-key-123"));
+}
+
+test "authenticateRotated accepts current and previous keys" {
+    try std.testing.expectEqual(AuthResult.open, authenticateRotated(null, null, null));
+    try std.testing.expectEqual(AuthResult.open, authenticateRotated(null, null, "Bearer anything"));
+    try std.testing.expectEqual(AuthResult.ok, authenticateRotated("new-key", "old-key", "Bearer new-key"));
+    try std.testing.expectEqual(AuthResult.ok, authenticateRotated("new-key", "old-key", "Bearer old-key"));
+    try std.testing.expectEqual(AuthResult.ok, authenticateRotated(null, "old-key", "Bearer old-key"));
+    try std.testing.expectEqual(AuthResult.missing, authenticateRotated("new-key", "old-key", null));
+    try std.testing.expectEqual(AuthResult.invalid, authenticateRotated("new-key", "old-key", "Bearer wrong"));
+    try std.testing.expectEqual(AuthResult.invalid, authenticateRotated("new-key", null, "Bearer old-key"));
 }
 
 test "generateKey produces 64 hex chars" {

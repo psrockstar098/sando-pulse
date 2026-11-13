@@ -12,6 +12,9 @@ pub const Config = struct {
     /// If null, the API runs in open dev mode and logs a warning on boot.
     /// Set PULSE_API_KEY to require Bearer auth on /v1/query and /v1/ingest.
     api_key: ?[]const u8 = null,
+    /// Previous key, accepted alongside api_key during rotation
+    /// (Roadmap 5.1). Remove it once clients have migrated.
+    api_key_previous: ?[]const u8 = null,
     database_url: ?[]const u8 = null,
     redis_url: ?[]const u8 = null,
     minio_endpoint: ?[]const u8 = null,
@@ -96,6 +99,9 @@ pub fn load(alloc: std.mem.Allocator, env_map: *std.process.Environ.Map) !Config
     }
     if (envOwned(alloc, env_map, "PULSE_API_KEY")) |v| {
         if (v.len > 0) cfg.api_key = v;
+    }
+    if (envOwned(alloc, env_map, "PULSE_API_KEY_PREVIOUS")) |v| {
+        if (v.len > 0) cfg.api_key_previous = v;
     }
     if (envOwned(alloc, env_map, "DATABASE_URL")) |v| {
         if (v.len > 0) cfg.database_url = v;
