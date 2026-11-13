@@ -132,8 +132,6 @@ for pkg in needed:
         skipped.append(pkg)
 open(f"{aio}/download-specs.txt", "w").write("\n".join(specs))
 print(f"  {len(specs)} packages, {len(skipped)} skipped: {skipped}")
-open(f"{aio}/download-specs.txt", "w").write("\n".join(specs))
-print(f"  {len(specs)} packages, {len(skipped)} skipped: {skipped}")
 EOF
 cd "$AIO/debs"
 rm -f ./*.deb
