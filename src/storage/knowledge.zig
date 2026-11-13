@@ -95,6 +95,15 @@ pub fn primaryTopic(ent: entities_mod.Entities) []const u8 {
     return if (ent.topics.len > 0) ent.topics[0] else "";
 }
 
+/// One historical rollup row: how many documents about `topic` were
+/// collected in `year_month` ("YYYY-MM"). Written by maintenance
+/// aggregation (Roadmap 3.5); read by the trending engine (Roadmap 4.2).
+pub const MonthlyAggregate = struct {
+    year_month: []const u8,
+    topic: []const u8,
+    doc_count: usize,
+};
+
 pub const KnowledgeStore = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -113,6 +122,13 @@ pub const KnowledgeStore = struct {
         listFacilities: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, kind: ?[]const u8, limit: usize) anyerror![]FacilityRow,
         listStatistics: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]StatisticRow,
         recordMonthlyAggregate: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, year_month: []const u8, topic: []const u8, count: usize) anyerror!void,
+        /// Read monthly rollups, newest month first, most documents first.
+        listMonthlyAggregates: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, limit: usize) anyerror![]MonthlyAggregate,
+        /// Recompute every event's doc_count from its linked documents
+        /// (run after retention deletes documents). Events that lost
+        /// all their documents keep their row and summary — the
+        /// historical record survives — with doc_count 0.
+        recomputeEventCounts: *const fn (ptr: *anyopaque) anyerror!void,
         counts: *const fn (ptr: *anyopaque) KnowledgeCounts,
         deinit: *const fn (ptr: *anyopaque) void,
     };
@@ -163,6 +179,14 @@ pub const KnowledgeStore = struct {
 
     pub fn recordMonthlyAggregate(self: KnowledgeStore, alloc: std.mem.Allocator, year_month: []const u8, topic: []const u8, count: usize) !void {
         return self.vtable.recordMonthlyAggregate(self.ptr, alloc, year_month, topic, count);
+    }
+
+    pub fn listMonthlyAggregates(self: KnowledgeStore, alloc: std.mem.Allocator, limit: usize) ![]MonthlyAggregate {
+        return self.vtable.listMonthlyAggregates(self.ptr, alloc, limit);
+    }
+
+    pub fn recomputeEventCounts(self: KnowledgeStore) !void {
+        return self.vtable.recomputeEventCounts(self.ptr);
     }
 
     pub fn counts(self: KnowledgeStore) KnowledgeCounts {
@@ -280,6 +304,8 @@ pub const MemoryKnowledge = struct {
         .listFacilities = listFacilities,
         .listStatistics = listStatistics,
         .recordMonthlyAggregate = recordMonthlyAggregate,
+        .listMonthlyAggregates = listMonthlyAggregates,
+        .recomputeEventCounts = recomputeEventCounts,
         .counts = counts,
         .deinit = deinitErased,
     };
@@ -342,6 +368,14 @@ pub const MemoryKnowledge = struct {
                 e.doc_count += 1;
                 if (ts < e.first_seen) e.first_seen = ts;
                 if (ts > e.last_seen) e.last_seen = ts;
+                // Concise event summary (3.5): an event that has none
+                // takes the joining document's summary, so the summary
+                // fills in as coverage arrives.
+                if (e.summary == null) {
+                    if (doc.summary) |s| {
+                        e.summary = try self.alloc.dupe(u8, s);
+                    }
+                }
                 try self.bumpEventSource(e.id, doc.source_id);
                 return alloc.dupe(u8, e.id);
             }
@@ -598,6 +632,44 @@ pub const MemoryKnowledge = struct {
             .topic = try self.alloc.dupe(u8, topic),
             .count = count,
         });
+    }
+
+    fn listMonthlyAggregates(ptr: *anyopaque, alloc: std.mem.Allocator, limit: usize) anyerror![]MonthlyAggregate {
+        const self: *MemoryKnowledge = @ptrCast(@alignCast(ptr));
+        var out: std.ArrayList(MonthlyAggregate) = .empty;
+        for (self.aggregates.items) |ag| {
+            try out.append(alloc, .{
+                .year_month = try alloc.dupe(u8, ag.year_month),
+                .topic = try alloc.dupe(u8, ag.topic),
+                .doc_count = ag.count,
+            });
+        }
+        std.mem.sort(MonthlyAggregate, out.items, {}, struct {
+            fn lt(_: void, a: MonthlyAggregate, b: MonthlyAggregate) bool {
+                const cmp = std.mem.order(u8, b.year_month, a.year_month); // newest first
+                if (cmp != .eq) return cmp == .lt;
+                return a.doc_count > b.doc_count;
+            }
+        }.lt);
+        if (out.items.len > limit) {
+            for (out.items[limit..]) |ag| {
+                alloc.free(ag.year_month);
+                alloc.free(ag.topic);
+            }
+            out.items.len = limit;
+        }
+        return out.toOwnedSlice(alloc);
+    }
+
+    fn recomputeEventCounts(ptr: *anyopaque) anyerror!void {
+        const self: *MemoryKnowledge = @ptrCast(@alignCast(ptr));
+        for (self.events.items) |*e| {
+            var total: usize = 0;
+            for (self.event_sources.items) |es| {
+                if (std.mem.eql(u8, es.event_id, e.id)) total += es.doc_count;
+            }
+            e.doc_count = total;
+        }
     }
 
     fn counts(ptr: *anyopaque) KnowledgeCounts {

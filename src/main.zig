@@ -1,5 +1,5 @@
 //! Pulse CLI: `pulse serve` | `pulse worker [--once]` | `pulse migrate` |
-//! `pulse status` | `pulse keygen`.
+//! `pulse status` | `pulse keygen` | `pulse maintenance`.
 //!
 //! Zig 0.17.1 entry point: main takes `std.process.Init`, which carries the
 //! Io implementation, the allocator, argv, and the environment map — no
@@ -15,9 +15,11 @@
 
 const std = @import("std");
 const logging = @import("common/logging.zig");
+const timex = @import("common/time.zig");
 const config = @import("config/config.zig");
 const repository = @import("storage/repository.zig");
 const knowledge = @import("storage/knowledge.zig");
+const maintenance = @import("storage/maintenance.zig");
 const memory = @import("storage/memory.zig");
 const postgres = @import("storage/postgres.zig");
 const postgres_knowledge = @import("storage/postgres_knowledge.zig");
@@ -94,8 +96,8 @@ pub fn main(init: std.process.Init) !void {
 
     const is_worker = std.mem.eql(u8, cmd, "worker");
     const once = is_worker and (cmd_arg != null and std.mem.eql(u8, cmd_arg.?, "--once"));
-    if (!std.mem.eql(u8, cmd, "serve") and !is_worker) {
-        logging.err("unknown command (serve | worker [--once] | migrate | status | keygen)", &.{});
+    if (!std.mem.eql(u8, cmd, "serve") and !is_worker and !std.mem.eql(u8, cmd, "maintenance")) {
+        logging.err("unknown command (serve | worker [--once] | migrate | status | keygen | maintenance)", &.{});
         std.process.exit(2);
     }
 
@@ -203,6 +205,23 @@ pub fn main(init: std.process.Init) !void {
         logging.info("facebook connector ready", &.{
             .{ .key = "registered_pages", .value = try std.fmt.allocPrint(alloc, "{d}", .{fb_connector.registeredPages()}) },
         });
+    }
+
+    if (std.mem.eql(u8, cmd, "maintenance")) {
+        const policy = maintenance.RetentionPolicy{
+            .docs_retention_days = cfg.retention_days,
+            .archive_dir = cfg.archive_dir,
+        };
+        const report = try maintenance.runMaintenance(alloc, io, repo, ks, policy, timex.nowSeconds(io));
+        std.debug.print("maintenance: archived={d} deleted={d} exact_dupes={d} near_dupes={d} aggregates={d} archive={s}\n", .{
+            report.archived,
+            report.deleted,
+            report.duplicates_exact,
+            report.duplicates_near,
+            report.aggregates_recorded,
+            report.archive_path orelse "-",
+        });
+        return;
     }
 
     if (is_worker) {

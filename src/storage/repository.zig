@@ -19,6 +19,16 @@ pub const Repository = struct {
         countDocuments: *const fn (ptr: *anyopaque) usize,
         /// Per-source document counts. Strings owned by `alloc`.
         countBySource: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]types.SourceCount,
+        /// Scan documents in fetched_at order (oldest first), optionally only
+        /// those fetched before `before_ts`. Used by maintenance (retention,
+        /// dedup, aggregation). `limit` caps the batch; call repeatedly with
+        /// a moving cutoff for large stores. All returned strings are owned
+        /// by `alloc` (the caller's arena).
+        scanDocuments: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, before_ts: ?i64, limit: usize) anyerror![]types.Document,
+        /// Delete documents by id (retention enforcement). Returns how many
+        /// rows were actually removed. Never deletes events, entities, or
+        /// aggregates — only the document rows themselves.
+        deleteDocuments: *const fn (ptr: *anyopaque, ids: []const []const u8) anyerror!usize,
         deinit: *const fn (ptr: *anyopaque) void,
     };
 
@@ -36,6 +46,14 @@ pub const Repository = struct {
 
     pub fn countBySource(self: Repository, alloc: std.mem.Allocator) ![]types.SourceCount {
         return self.vtable.countBySource(self.ptr, alloc);
+    }
+
+    pub fn scanDocuments(self: Repository, alloc: std.mem.Allocator, before_ts: ?i64, limit: usize) ![]types.Document {
+        return self.vtable.scanDocuments(self.ptr, alloc, before_ts, limit);
+    }
+
+    pub fn deleteDocuments(self: Repository, ids: []const []const u8) !usize {
+        return self.vtable.deleteDocuments(self.ptr, ids);
     }
 
     pub fn deinit(self: Repository) void {

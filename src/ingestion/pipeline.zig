@@ -11,6 +11,7 @@ const timex = @import("../common/time.zig");
 const types = @import("../common/types.zig");
 const repository = @import("../storage/repository.zig");
 const knowledge = @import("../storage/knowledge.zig");
+const compression = @import("../storage/compression.zig");
 const sources = @import("sources.zig");
 const source_manager = @import("source_manager.zig");
 const rss = @import("rss.zig");
@@ -48,6 +49,18 @@ pub const IngestReport = struct {
     duration_ms: i64,
     had_error: bool,
 };
+
+/// Compressed archive key for a raw feed (Roadmap 3.5): the feed is
+/// stored as a zstd frame, not raw XML, so archives stay small.
+pub fn archiveKey(alloc: std.mem.Allocator, source_id: []const u8, now: i64) ![]u8 {
+    return std.fmt.allocPrint(alloc, "raw/{s}/{d}.xml.zst", .{ source_id, now });
+}
+
+test "archive key is a compressed object key" {
+    const key = try archiveKey(std.testing.allocator, "new-dawn", 1794441600);
+    defer std.testing.allocator.free(key);
+    try std.testing.expectEqualStrings("raw/new-dawn/1794441600.xml.zst", key);
+}
 
 /// Record one source's fetch outcome in the knowledge store (Roadmap
 /// 3.1 health monitoring). Success resets the failure streak and stamps
@@ -162,13 +175,26 @@ fn ingestOneSource(
         if (ks) |k| recordHealth(k, alloc, source.id, now, false, "fetch failed", 0);
         return report;
     };
-    // Archive the raw feed (best effort).
+    // Archive the raw feed, compressed (best effort). A compression
+    // failure falls back to the raw body — archiving never blocks
+    // ingestion, and the .zst key is only used for compressed bytes.
     if (archiver) |arc| {
-        const key = std.fmt.allocPrint(alloc, "raw/{s}/{d}.xml", .{ source.id, now }) catch null;
-        if (key) |k| {
-            arc.putObject(k, body, "application/rss+xml") catch {
-                logging.warn("raw archive failed", &.{.{ .key = "source", .value = source.id }});
-            };
+        const compressed = compression.compress(alloc, body, compression.default_level) catch null;
+        if (compressed) |zst| {
+            defer alloc.free(zst);
+            const key = std.fmt.allocPrint(alloc, "raw/{s}/{d}.xml.zst", .{ source.id, now }) catch null;
+            if (key) |k| {
+                arc.putObject(k, zst, "application/zstd") catch {
+                    logging.warn("raw archive failed", &.{.{ .key = "source", .value = source.id }});
+                };
+            }
+        } else {
+            const key = std.fmt.allocPrint(alloc, "raw/{s}/{d}.xml", .{ source.id, now }) catch null;
+            if (key) |k| {
+                arc.putObject(k, body, "application/rss+xml") catch {
+                    logging.warn("raw archive failed", &.{.{ .key = "source", .value = source.id }});
+                };
+            }
         }
     }
     const items = rss.parse(alloc, body) catch {

@@ -1019,6 +1019,8 @@ pub const PostgresStore = struct {
         .search = repoSearch,
         .countDocuments = repoCountDocuments,
         .countBySource = repoCountBySource,
+        .scanDocuments = repoScanDocuments,
+        .deleteDocuments = repoDeleteDocuments,
         .deinit = repoDeinit,
     };
 
@@ -1040,6 +1042,16 @@ pub const PostgresStore = struct {
     fn repoCountBySource(ptr: *anyopaque, alloc: Allocator) anyerror![]types.SourceCount {
         const self: *PostgresStore = @ptrCast(@alignCast(ptr));
         return self.countBySource(alloc);
+    }
+
+    fn repoScanDocuments(ptr: *anyopaque, alloc: Allocator, before_ts: ?i64, limit: usize) anyerror![]types.Document {
+        const self: *PostgresStore = @ptrCast(@alignCast(ptr));
+        return self.scanDocuments(alloc, before_ts, limit);
+    }
+
+    fn repoDeleteDocuments(ptr: *anyopaque, ids: []const []const u8) anyerror!usize {
+        const self: *PostgresStore = @ptrCast(@alignCast(ptr));
+        return self.deleteDocuments(ids);
     }
 
     fn repoDeinit(ptr: *anyopaque) void {
@@ -1364,6 +1376,77 @@ pub const PostgresStore = struct {
         if (res.rows.len == 0) return 0;
         const v = res.rows[0].cols[0] orelse return 0;
         return std.fmt.parseInt(usize, v, 10) catch 0;
+    }
+
+    /// Scan documents oldest-first (Roadmap 3.5 maintenance). `before_ts`
+    /// limits to documents fetched before the cutoff; null scans all.
+    /// `limit` is capped at 1000 per call — retention loops in batches.
+    pub fn scanDocuments(self: *PostgresStore, alloc: Allocator, before_ts: ?i64, limit: usize) ![]types.Document {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const client = try self.ensureClient();
+        var sql: std.ArrayList(u8) = .empty;
+        defer sql.deinit(alloc);
+        try sql.appendSlice(alloc,
+            \\SELECT d.id, d.source_id, s.name, s.home_url, d.title, d.url, d.text,
+            \\  extract(epoch from d.published_at)::bigint,
+            \\  extract(epoch from d.fetched_at)::bigint,
+            \\  d.reliability, d.topics, d.content_hash,
+            \\  d.embedding::text, d.lat, d.lon, d.lang, d.summary
+            \\FROM documents d JOIN sources s ON s.id = d.source_id
+        );
+        if (before_ts) |cut| {
+            const s = try std.fmt.allocPrint(alloc, " WHERE d.fetched_at < to_timestamp({d})", .{cut});
+            defer alloc.free(s);
+            try sql.appendSlice(alloc, s);
+        }
+        const tail = try std.fmt.allocPrint(alloc, " ORDER BY d.fetched_at ASC LIMIT {d}", .{@min(limit, 1000)});
+        defer alloc.free(tail);
+        try sql.appendSlice(alloc, tail);
+        var res = client.query(alloc, sql.items) catch |err| {
+            self.dropClient();
+            return err;
+        };
+        defer res.deinit(alloc);
+        var docs = try alloc.alloc(types.Document, res.rows.len);
+        for (res.rows, 0..) |row, i| {
+            docs[i] = try documentFromRow(alloc, row);
+        }
+        return docs;
+    }
+
+    /// Delete documents by id (Roadmap 3.5 retention). The 001
+    /// event_sources table has no ON DELETE CASCADE, so evidence links
+    /// are removed first; the caller recomputes event doc_counts via
+    /// the knowledge store afterwards. Returns rows actually removed.
+    pub fn deleteDocuments(self: *PostgresStore, ids: []const []const u8) !usize {
+        if (ids.len == 0) return 0;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const client = try self.ensureClient();
+        const a = self.alloc;
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(a);
+        for (ids, 0..) |id, i| {
+            if (i > 0) try list.appendSlice(a, ", ");
+            const esc = try escapeLiteral(a, id);
+            defer a.free(esc);
+            try list.appendSlice(a, esc);
+        }
+        const unlink = try std.fmt.allocPrint(a, "DELETE FROM event_sources WHERE document_id IN ({s})", .{list.items});
+        defer a.free(unlink);
+        client.exec(a, unlink) catch |err| {
+            self.dropClient();
+            return err;
+        };
+        const del = try std.fmt.allocPrint(a, "DELETE FROM documents WHERE id IN ({s}) RETURNING id", .{list.items});
+        defer a.free(del);
+        var res = client.query(a, del) catch |err| {
+            self.dropClient();
+            return err;
+        };
+        defer res.deinit(a);
+        return res.rows.len;
     }
 
     pub fn countBySource(self: *PostgresStore, alloc: Allocator) ![]types.SourceCount {

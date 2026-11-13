@@ -24,6 +24,14 @@ pub const Config = struct {
     log_level: []const u8 = "info",
     /// Minutes east of UTC for time-aware queries (Africa/Monrovia = 0).
     tz_offset_minutes: i32 = 0,
+    /// Retention: documents older than this many days are archived
+    /// (compressed) and deleted by maintenance. 0 disables retention
+    /// (aggregation + dedup reporting still run).
+    retention_days: u32 = 365,
+    /// Local directory for compressed retention archives.
+    archive_dir: []const u8 = "archive",
+    /// Seconds between maintenance passes in the worker loop.
+    maintenance_interval_s: u64 = 86400,
     /// Embedding provider for semantic search: "local" (deterministic
     /// hashed lexical embedding, default), "external" (OpenAI-compatible
     /// API), or "none" (keyword search only).
@@ -102,6 +110,17 @@ pub fn load(alloc: std.mem.Allocator, env_map: *std.process.Environ.Map) !Config
     if (envOwned(alloc, env_map, "PULSE_RATE_LIMIT_PER_DAY")) |v| {
         cfg.rate_limit_per_day = parseU32(v) orelse 10000;
     }
+    if (envOwned(alloc, env_map, "PULSE_RETENTION_DAYS")) |v| {
+        if (parseU32(v)) |n| {
+            if (n <= 3650) cfg.retention_days = n;
+        }
+    }
+    if (envOwned(alloc, env_map, "PULSE_ARCHIVE_DIR")) |v| {
+        if (v.len > 0) cfg.archive_dir = v;
+    }
+    if (envOwned(alloc, env_map, "PULSE_MAINTENANCE_INTERVAL_S")) |v| {
+        cfg.maintenance_interval_s = parseU64(v) orelse 86400;
+    }
     if (envOwned(alloc, env_map, "PULSE_LOG_LEVEL")) |v| cfg.log_level = v;
     if (envOwned(alloc, env_map, "PULSE_TZ_OFFSET_MINUTES")) |v| {
         if (parseI32(v)) |n| {
@@ -157,4 +176,7 @@ test "load returns defaults without env vars" {
     try std.testing.expectEqual(@as(u32, 100), cfg.rate_limit_per_minute);
     try std.testing.expectEqual(@as(u32, 10000), cfg.rate_limit_per_day);
     try std.testing.expectEqualStrings("pulse-raw", cfg.minio_bucket);
+    try std.testing.expectEqual(@as(u32, 365), cfg.retention_days);
+    try std.testing.expectEqualStrings("archive", cfg.archive_dir);
+    try std.testing.expectEqual(@as(u64, 86400), cfg.maintenance_interval_s);
 }

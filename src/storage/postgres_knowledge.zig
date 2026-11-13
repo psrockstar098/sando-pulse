@@ -69,6 +69,8 @@ pub const PostgresKnowledge = struct {
         .listFacilities = listFacilities,
         .listStatistics = listStatistics,
         .recordMonthlyAggregate = recordMonthlyAggregate,
+        .listMonthlyAggregates = listMonthlyAggregates,
+        .recomputeEventCounts = recomputeEventCounts,
         .counts = counts,
         .deinit = deinitErased,
     };
@@ -238,11 +240,12 @@ pub const PostgresKnowledge = struct {
                 \\UPDATE events SET doc_count = doc_count + 1,
                 \\  first_seen_at = LEAST(first_seen_at, {s}),
                 \\  last_seen_at = GREATEST(last_seen_at, {s}),
+                \\  summary = COALESCE(summary, {s}),
                 \\  source_count = (SELECT count(DISTINCT d.source_id)
                 \\    FROM event_sources es JOIN documents d ON d.id = es.document_id
                 \\    WHERE es.event_id = events.id)
                 \\WHERE id = {s}
-            , .{ try tsLit(alloc, ts), try tsLit(alloc, ts), esc_mid });
+            , .{ try tsLit(alloc, ts), try tsLit(alloc, ts), try optLit(alloc, doc.summary), esc_mid });
             defer alloc.free(upd);
             try self.execLocked(alloc, upd);
             return alloc.dupe(u8, mid);
@@ -571,6 +574,41 @@ pub const PostgresKnowledge = struct {
         , .{ esc_ym, esc_topic, count });
         defer alloc.free(sql);
         try self.execLocked(alloc, sql);
+    }
+
+    fn listMonthlyAggregates(ptr: *anyopaque, alloc: Allocator, limit: usize) anyerror![]knowledge.MonthlyAggregate {
+        const self: *PostgresKnowledge = @ptrCast(@alignCast(ptr));
+        self.lock();
+        defer self.unlock();
+        const sql = try std.fmt.allocPrint(alloc,
+            \\SELECT year_month, topic, doc_count FROM monthly_aggregates
+            \\ORDER BY year_month DESC, doc_count DESC LIMIT {d}
+        , .{@min(limit, 500)});
+        defer alloc.free(sql);
+        var res = try self.queryLocked(alloc, sql);
+        defer res.deinit(alloc);
+        var out: std.ArrayList(knowledge.MonthlyAggregate) = .empty;
+        for (res.rows) |row| {
+            if (row.cols.len != 3) return error.ProtocolError;
+            const c = row.cols;
+            try out.append(alloc, .{
+                .year_month = try alloc.dupe(u8, c[0] orelse return error.ProtocolError),
+                .topic = try alloc.dupe(u8, c[1] orelse return error.ProtocolError),
+                .doc_count = try std.fmt.parseInt(usize, c[2] orelse return error.ProtocolError, 10),
+            });
+        }
+        return out.toOwnedSlice(alloc);
+    }
+
+    fn recomputeEventCounts(ptr: *anyopaque) anyerror!void {
+        const self: *PostgresKnowledge = @ptrCast(@alignCast(ptr));
+        self.lock();
+        defer self.unlock();
+        try self.execLocked(self.alloc,
+            \\UPDATE events SET doc_count =
+            \\  (SELECT count(*) FROM event_sources
+            \\   WHERE event_sources.event_id = events.id)
+        );
     }
 
     fn counts(ptr: *anyopaque) knowledge.KnowledgeCounts {

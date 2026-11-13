@@ -32,6 +32,8 @@ pub const MemoryStore = struct {
         .search = search,
         .countDocuments = countDocuments,
         .countBySource = countBySource,
+        .scanDocuments = scanDocuments,
+        .deleteDocuments = deleteDocuments,
         .deinit = deinitErased,
     };
 
@@ -192,6 +194,50 @@ pub const MemoryStore = struct {
             });
         }
         return out.toOwnedSlice(alloc);
+    }
+
+    fn scanDocuments(ptr: *anyopaque, alloc: std.mem.Allocator, before_ts: ?i64, limit: usize) anyerror![]types.Document {
+        const self: *MemoryStore = @ptrCast(@alignCast(ptr));
+        var out: std.ArrayList(types.Document) = .empty;
+        for (self.docs.items) |doc| {
+            if (before_ts) |cut| {
+                if (doc.fetched_at >= cut) continue;
+            }
+            try out.append(alloc, try dupeDocument(alloc, doc));
+        }
+        std.mem.sort(types.Document, out.items, {}, struct {
+            fn lt(_: void, a: types.Document, b: types.Document) bool {
+                return a.fetched_at < b.fetched_at;
+            }
+        }.lt);
+        if (out.items.len > limit) {
+            for (out.items[limit..]) |d| freeDocument(alloc, d);
+            out.items.len = limit;
+        }
+        return out.toOwnedSlice(alloc);
+    }
+
+    fn deleteDocuments(ptr: *anyopaque, ids: []const []const u8) anyerror!usize {
+        const self: *MemoryStore = @ptrCast(@alignCast(ptr));
+        var removed: usize = 0;
+        var i: usize = 0;
+        while (i < self.docs.items.len) {
+            var found = false;
+            for (ids) |id| {
+                if (std.mem.eql(u8, self.docs.items[i].id, id)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (found) {
+                const d = self.docs.orderedRemove(i);
+                freeDocument(self.alloc, d);
+                removed += 1;
+            } else {
+                i += 1;
+            }
+        }
+        return removed;
     }
 
     fn deinitErased(ptr: *anyopaque) void {

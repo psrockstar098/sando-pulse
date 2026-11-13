@@ -4,9 +4,11 @@
 
 const std = @import("std");
 const logging = @import("../common/logging.zig");
+const timex = @import("../common/time.zig");
 const config = @import("../config/config.zig");
 const repository = @import("../storage/repository.zig");
 const knowledge = @import("../storage/knowledge.zig");
+const maintenance = @import("../storage/maintenance.zig");
 const pipeline = @import("../ingestion/pipeline.zig");
 const facebook = @import("../ingestion/connectors/facebook/facebook.zig");
 const object_store = @import("../storage/object_store.zig");
@@ -51,6 +53,7 @@ pub fn runLoop(
     ks: ?knowledge.KnowledgeStore,
     fb: ?*facebook.FacebookConnector,
 ) !void {
+    var last_maintenance: ?i64 = null;
     while (true) {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
@@ -58,6 +61,21 @@ pub fn runLoop(
             logging.err("ingest run failed", &.{.{ .key = "error", .value = @errorName(e) }});
             m.observeIngestRun(true);
         };
+        // Maintenance (Roadmap 3.5): aggregation, dedup report,
+        // retention. At most once per maintenance_interval_s; a
+        // failed pass logs and retries next interval — never fatal.
+        const now = timex.nowSeconds(io);
+        const due = last_maintenance == null or now - last_maintenance.? >= @as(i64, @intCast(cfg.maintenance_interval_s));
+        if (due) {
+            last_maintenance = now;
+            const policy = maintenance.RetentionPolicy{
+                .docs_retention_days = cfg.retention_days,
+                .archive_dir = cfg.archive_dir,
+            };
+            _ = maintenance.runMaintenance(arena.allocator(), io, repo, ks, policy, now) catch |e| {
+                logging.err("maintenance run failed", &.{.{ .key = "error", .value = @errorName(e) }});
+            };
+        }
         try std.Io.sleep(io, .{ .nanoseconds = @intCast(cfg.ingest_interval_s * std.time.ns_per_s) }, .boot);
     }
 }
