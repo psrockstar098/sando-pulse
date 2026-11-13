@@ -396,3 +396,74 @@ The restart wiped the system packages the earlier builders used: `postgresql-16`
 8. **The live knowledge test is state-dependent** — fixed by raising its listEvents limit from 10 to 1000 (`51ad74e`); real worker events had pushed the 2023 fixture out of the top 10.
 9. **`zig build test` does NOT analyse uncalled function bodies** (lazy analysis): 3 loadtest compile errors (`std.time.nanoTimestamp` does not exist in 0.17.1, `ArrayList.writer` does not exist, `stream.read` wants `[][]u8` not `*const [1][]u8`) were only caught by `zig build`. The exe build is the real gate for CLI code.
 10. **PgPool stale-allocator bug (2026-11-13, found + fixed during 4.5):** `PgPool.init` returned the pool by value after handing out `gpa.allocator()` — every PgClient stored a pointer to the GPA's stack location in `init`, and the first pool ping allocated an arena from the dead slot and hit a `DebugAllocator` bucket assert; the live test's teardown hung on a corrupted futex for the same reason. Fixed by heap-allocating the GPA (stable address). Lesson: never move a struct after taking its `.allocator()` — the same applies to any struct that hands out a self-referencing allocator.
+
+## Roadmap 5 — COMPLETE 2026-11-13 ~04:30 GMT
+
+Commits: 5.1 SSRF `23427c4`, rotation `4d5ee43`, audit CLI `8f2375d`, backup/restore `5cd1211`; 5.3 consumers/usage/audit `951e26d`; 5.2 Sando client `33f55e6`; 5.3 docs `e7aeb54`; 5.4 compose/alerts/CI/ops `4c2a4d3`; 5.5 replica/country `9add2d4`; server-crash fix `4bc562c`; OpenAPI YAML fix `1203f8d`. Head `1203f8d`.
+
+### Tests
+
+- `zig build` — **passes** (clean-cache rebuild 2026-11-13 ~04:18, binary `zig-out/bin/pulse`, 38,972,533 bytes).
+- `zig build test` — **204/204 pass, 0 fail, 0 skip, 0 leaks** (unit). Same binary run live with Postgres + Redis — **204/204 pass, 0 fail, 0 skip, 0 leaks**. Live legs use `127.0.0.1` URLs: Zig 0.17.1's std resolver cannot resolve the hostname `localhost` on this VM (`ParseFailed` in `Ip6Address.resolve`); `redis-cli` resolves it fine. Pre-existing environment quirk, not a Pulse bug.
+- Test-count history: Roadmap 1: 74. Roadmap 2: 101. Roadmap 3: 139. Roadmap 4: 175. Roadmap 5: **204**.
+
+### 5.1 Production hardening
+
+- **SSRF protection** (`src/ingestion/ssrf.zig`, `23427c4`): range-check every fetch target before connect — loopback, private, link-local, CGNAT, documentation, benchmarking, multicast, reserved (v4 + v6 incl. IPv4-mapped); hostnames resolved and EVERY returned address must be public. Wired into `fetchOnce` for ingestion GETs (redirects included, one check per hop). Operator-configured POST provider endpoints NOT checked (a local Ollama is legitimate). Residual gap: std `connect` re-resolves internally, so a flipping DNS between check and connect is not fully closed.
+- **Key rotation** (`4d5ee43`): `PULSE_API_KEY_PREVIOUS` accepted alongside `PULSE_API_KEY` (constant-time both); rotation procedure (new key in, old key in PREVIOUS, restart, migrate clients, drop PREVIOUS). Rate-limit buckets key on the presented token (each key gets its own budget). Boot logs rotation state.
+- **Security audit CLI** (`src/cli/audit.zig`, `8f2375d`): `pulse audit` pre-flight checklist — api key, rotation sanity, rate limits, retention, TLS termination, DB password != example ("pulse"), linked dependencies (Zig version + libzstd >= 1.5.0), live Postgres version + required extensions (vector, postgis, pg_trgm), live Redis maxmemory + eviction policy. Exit 1 on any FAIL. Live run vs the test DB: postgres PASS, redis WARN maxmemory 0 (unbounded — fixed in the 5.4 compose update), api_key FAIL (expected, no key in the dev shell), tls WARN (expected).
+- **TLS decision (verified against the stdlib):** the Zig 0.17.1 stdlib has NO TLS server (`pub const Server` absent from `lib/std/crypto/tls.zig`) — TLS termination is a reverse proxy's job, documented; the audit warns while `PULSE_BEHIND_TLS_PROXY` is unset. `PULSE_REQUIRE_HTTPS_FETCHES` (default false — one registry feed, Daily Observer, is http-only) enforced per hop incl. redirects.
+- **Backup/restore** (`src/cli/backup.zig`, `5cd1211`): `pulse backup [--out <path>] [--keep N]` — plain pg_dump to `backups/pulse-<UTC stamp>.sql` (default, keep last 7), prints bytes + SHA-256; a failed pg_dump deletes the partial file. `pulse restore --in <path>` — psql -f with ON_ERROR_STOP=1 into an empty database. Live verification: backup of pulse_test = 27,883 bytes, 18 CREATE TABLEs; restore into scratch DB reproduced documents=2 and schema_migrations=10 (scratch DB dropped after).
+- **Server crash found by the live smoke test and fixed** (`4bc562c`): `std.http.Server` INVALIDATES `head`/`head_buffer` pointers once the body stream is initialized (`readBody`). The 5.3 audit helpers read `req.head.*` AFTER `readBody` on the query/ingest success paths — the smoke test hit a general protection fault in `auditCall`'s `pathOf` on the second request. The Facebook webhook branch had the same latent bug (signature header read after `readBody`). Fix: `captureHead()` copies path, query, method, auth/consumer/webhook headers into arena-owned strings at the top of `handleRequest`; nothing below touches `req.head.*` after a `readBody` call (verified by grep). Also moved the auth check before consumer resolution, so a missing key reports `auth_required` instead of `unknown_consumer`.
+
+### 5.2 Sando integration (Pulse side only — SANDO_UI untouched)
+
+- `src/sando/client.zig` (`33f55e6`): reference Pulse client for Sando — POST /v1/query with retry + linear backoff (transport/5xx/429, max 3 attempts), typed `SandoAnswer` with citations + confidence, county folded into the query text so the planner sees it, `context` object sent for forward compatibility; typed errors (`PulseUnavailable`/`Unauthorized`/`QuotaExceeded`/`BadResponse`) — never fabricated content. Honest limit documented: `std.http.Client.fetch` in 0.17.1 has no per-request timeout, so none is enforced.
+- `src/cli/mock_sando.zig`: `pulse mock-sando "<question>" [--county] [--language] [--pulse-url] [--api-key] [--consumer]` — stand-in Sando client for e2e tests; exit 0 sufficient, 2 valid refusal, 1 error.
+- `docs/SANDO_INTEGRATION.md`: full client contract (endpoint, request, response, error table, consumer setup, versioning). `PULSE_URL` config (default http://127.0.0.1:9000).
+- Live e2e (2026-11-13 ~04:24, fixed server): `mock-sando "zebraquux"` → exit 0, sufficient true, confidence 0.65, 1 citation (Pulse PG live test [New Dawn]); `mock-sando "quantum computing in Lofa county"` → exit 2, sufficient false, `no_documents_matched`.
+
+### 5.3 API readiness
+
+- **Consumers/quotas/usage/audit** (`src/api/usage.zig`, `src/api/auditlog.zig`, `951e26d`): consumer registry from `PULSE_CONSUMERS` (`name:scope,scope:quota_per_day`; scopes query/ingest/admin, `*` = all; quota 0 = global daily limit); name validation `[a-z0-9_-]`; `UsageTracker` (Redis counters `pulse:usage:<consumer>:<day>:<kind>` with 48h TTL, in-memory fallback pruned to two days; Redis failure falls back to memory). Audit records: consumer, key fingerprint (first 8 hex of SHA-256 — the key itself never stored), route, method, status, request id; sinks Postgres `audit_log` (migration 011) + JSONL file (`PULSE_AUDIT_LOG`) + structured log; best-effort, never fails a request.
+- **Server wiring:** auth gate enforces consumer (401 unknown), scope (403), per-consumer daily quota (429 `quota_exceeded`); usage + audit recorded at query/ingest success and at every denial; `GET /v1/usage` (admin scope, optional `?consumer=` filter); `x-pulse-api-version: 1` on all JSON responses; health gains `api_version: "1"` and `country`.
+- **Docs** (`e7aeb54` + `1203f8d`): `docs/openapi.yaml` (OpenAPI 3.0.3, 14 paths, all verified present as routes in `server.zig`; two YAML syntax errors found by validation and fixed — an unquoted `: ` and a leading backtick), `docs/API.md` (auth, consumers/scopes/quotas, rate limits, error codes, versioning), `docs/SECURITY.md` (threat model, SSRF + residual gap, rotation procedure, audit records, pre-flight audit, TLS decision, dependency auditing, input validation, what is NOT built).
+
+### 5.4 Deployment and operations
+
+- `docker-compose.yml` (`4c2a4d3`): Redis `maxmemory 256mb` + `maxmemory-policy allkeys-lru` — **closes the 4.5 query-cache gap** (keys no longer accumulate until TTL); `worker-2` under the `scale` profile (distinct `PULSE_WORKER_ID`); one-shot `backup` service under the `backup` profile; node-exporter; alertmanager under the `alerts` profile; json-file log rotation (10m × 3) on every service; api passes through rotation/consumers/audit-log/TLS env; `pulse-backups` volume.
+- `docker/prometheus/alerts.yml`: 7 rules on real series (PulseDown, High5xx, SlowResponses, IngestFailing, CacheCold, RedisMemoryHigh, PostgresDown); `prometheus.yml` gains `rule_files` + alertmanager target + node-exporter job. `docker/alertmanager/alertmanager.yml` ships with **NO receiver on purpose** — the operator must configure one before enabling alerts.
+- `.github/workflows/ci.yml`: authored only — `zig build` + unit suite + audit; live legs documented as needing a pgvector+PostGIS image (stock postgres:16 lacks the extensions). **Must be added via the GitHub web UI** (gh token lacks `workflow` scope). Has NOT run.
+- `docs/OPERATIONS.md`: deploy, worker scaling, backup/restore/rollback, disaster recovery, monitoring, incident table, what runs here vs a real host.
+- **Authored-only, not run here:** the compose stack cannot run on this VM (podman `--network none`, no container networking). YAML parses; the binary builds; the API itself was smoke-tested live on the host. The first real `docker compose up` must happen on Dominic's machine or a production host.
+
+### 5.5 Future scalability
+
+- `docs/SCALABILITY.md` (`9add2d4`): extension points (Repository vtable, connectors, consumers, countries, workers, read replicas, dedicated search, object storage, multi-tenant controls) + the scaling order. Explicitly NOT a live multi-region deployment.
+- **Read replica** (`src/storage/postgres.zig`): `PostgresStore.setReplica` — second pool (2 connections) on `PULSE_DATABASE_REPLICA_URL`; `search`/`countDocuments`/`countBySource`/`scanDocuments` route to it with fallback to the primary when the replica checkout fails; writes always stay on the primary; a bad replica URL fails at attach, never at boot. Live test: routing + fallback + double-attach error.
+- **Country** (`PULSE_COUNTRY`, default `"lr"`): reported in `/v1/health` (`"country":"lr"`) and `pulse status`; the multi-country extension point (second instance + router; a shared DB needs a `country` column first — deliberately not done).
+
+### Live smoke test (2026-11-13 ~04:20–04:26, fixed server, Postgres + Redis)
+
+Server started with `PULSE_API_KEY=<keygen>`, `PULSE_CONSUMERS=sando:query,admin:10000;ingest-bot:ingest:5000;tiny:query:1`, `PULSE_AUDIT_LOG=~/workspace/tmp/pulse-smoke-audit.jsonl`, `DATABASE_URL`/`REDIS_URL` to the test DB. Real curl outputs:
+
+- `GET /v1/health` → `{"status":"ok","version":"0.1.0","api_version":"1","country":"lr","documents":3,"sources_enabled":5,"store":"postgres"}`; header `x-pulse-api-version: 1`.
+- Query without key → 401 `auth_required`. Bad key → 401 `auth_invalid`. Unknown consumer → 401 `unknown_consumer`.
+- Query `zebraquux` as sando → 200, `sufficient:true`, confidence 0.65, real citation (Pulse PG live test [New Dawn]); server stayed up (the pre-fix server crashed on this exact request).
+- Query `quantum computing in Lofa county` → 200, `sufficient:false`, `insufficient_reason:no_documents_matched`, counties `["Lofa"]` in the plan.
+- Ingest as sando → 403 `forbidden_scope`; ingest as ingest-bot → 201 with document id.
+- `GET /v1/usage` as sando → 200: sando queries 3 / quota 10000 / remaining 9997; ingest-bot ingests 1 / 5000; tiny 0 / 1. As ingest-bot → 403.
+- Quota live: `tiny` (quota 1) first query 200, second → 429 `quota_exceeded`.
+- Audit: JSONL file has one record per call (key_fp `1ffb5a9a`, never the key); `audit_log` table 10 rows covering 200/201/401/403/429 across all three consumers + `default`.
+- `pulse backup` → 32,193 bytes, sha256 printed. `pulse audit` → 7 pass, 2 warn (tls flag unset in the dev shell; local Redis maxmemory 0 — compose sets 256mb), 0 fail. `pulse status` → api_version 1, country lr, consumers 3, audit_log_file true, read_replica false. `/metrics` → live counters (14 requests, 8 2xx). Serve log: 0 errors/panics. Server stopped by PID after; port 9000 free.
+
+### Roadmap 5 honest gaps
+
+1. **Compose stack never ran here** (podman `--network none`); the first real `docker compose up` is on a real Docker host. The CI workflow has never run either (needs the web UI to add, and a pgvector+PostGIS image for the live legs).
+2. **Alertmanager ships with no receiver** — alerts fire into nothing until the operator configures one.
+3. **SSRF residual gap**: DNS flipping between check and connect is not fully closed (5.1).
+4. **Sando client has no per-request timeout** — `std.http.Client.fetch` in 0.17.1 exposes none; Sando must use a worker thread + watchdog for a hard bound.
+5. **Read-replica reads may lag the primary** by the replication delay (accepted for search/counts); the live test used a second pool to the same DB (routing proof, not replication proof).
+6. **External embedding provider never called live** (no API key) — carried from Roadmap 2; the local embedder is lexical, no vector index yet.
+7. **CI live legs are skipped** until a combined pgvector+PostGIS image is chosen (5.4).
+8. **The smoke-test server crashed once** (the `readBody` head-invalidation bug) before the fix — the fix is committed (`4bc562c`) and the exact crashing request now returns 200 with the server alive; no in-suite server-level test exists, the live smoke test is the regression check.
