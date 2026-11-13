@@ -480,10 +480,77 @@ pub fn buildEventDetailResponse(
 }
 
 const trending = @import("../intelligence/trending.zig");
+const forecast_mod = @import("../intelligence/forecast.zig");
+
+/// GET /v1/forecast — predictive trends (Roadmap 7.1): linear
+/// extrapolations + z-score anomalies from monthly aggregates.
+/// `insufficient` names topics asked for by name whose history is
+/// too short to forecast (fewer than 2 months) — an honest refusal,
+/// never a made-up number. The disclaimer is part of the payload:
+/// predictions are statistical extrapolations, not facts.
+pub fn buildForecastResponse(
+    alloc: std.mem.Allocator,
+    req_id: []const u8,
+    now: i64,
+    forecasts: []const forecast_mod.Forecast,
+    anomalies: []const forecast_mod.Anomaly,
+    insufficient: []const []const u8,
+) ![]u8 {
+    var fc_list: std.ArrayList(struct {
+        topic: []const u8,
+        horizon_month: []const u8,
+        predicted_count: f64,
+        confidence: f64,
+        basis: []const u8,
+        method: []const u8,
+        same_month_last_year: ?usize,
+    }) = .empty;
+    for (forecasts) |f| {
+        try fc_list.append(alloc, .{
+            .topic = f.topic,
+            .horizon_month = f.horizon_month,
+            .predicted_count = f.predicted_count,
+            .confidence = f.confidence,
+            .basis = f.basis,
+            .method = f.method,
+            .same_month_last_year = f.same_month_last_year,
+        });
+    }
+    var an_list: std.ArrayList(struct {
+        topic: []const u8,
+        year_month: []const u8,
+        doc_count: usize,
+        mean: f64,
+        stddev: f64,
+        z_score: f64,
+        direction: []const u8,
+    }) = .empty;
+    for (anomalies) |a| {
+        try an_list.append(alloc, .{
+            .topic = a.topic,
+            .year_month = a.year_month,
+            .doc_count = a.doc_count,
+            .mean = a.mean,
+            .stddev = a.stddev,
+            .z_score = a.z_score,
+            .direction = a.direction,
+        });
+    }
+    return stringifyAlloc(alloc, .{
+        .forecasts = fc_list.items,
+        .anomalies = an_list.items,
+        .insufficient_history = insufficient,
+        .disclaimer = "Predictions are statistical extrapolations from past document volume, not facts. Confidence reflects how well a straight line fits the topic's own history, nothing more.",
+        .computed_at = now,
+        .request_id = req_id,
+    });
+}
 
 /// GET /v1/trends — Geez and trending engine (Roadmap 4.2): ranked
 /// topics with velocity, geographic trending, and monthly snapshots.
 /// `snapshots` are the latest 3 months present in the aggregates.
+/// `forecasts` (Roadmap 7.1) is the forecast section: the top
+/// topics' next-month predictions, same shape as /v1/forecast.
 pub fn buildTrendsResponse(
     alloc: std.mem.Allocator,
     req_id: []const u8,
@@ -491,6 +558,7 @@ pub fn buildTrendsResponse(
     trends: []const trending.TopicTrend,
     geo: []const trending.GeoTrend,
     snapshots: []const trending.MonthSnapshot,
+    forecasts: []const forecast_mod.Forecast,
 ) ![]u8 {
     var trend_list: std.ArrayList(struct {
         topic: []const u8,
@@ -529,10 +597,31 @@ pub fn buildTrendsResponse(
     for (snapshots) |s| {
         try snap_list.append(alloc, .{ .year_month = s.year_month, .topics = s.topics });
     }
+    var fc_list: std.ArrayList(struct {
+        topic: []const u8,
+        horizon_month: []const u8,
+        predicted_count: f64,
+        confidence: f64,
+        basis: []const u8,
+        method: []const u8,
+        same_month_last_year: ?usize,
+    }) = .empty;
+    for (forecasts) |f| {
+        try fc_list.append(alloc, .{
+            .topic = f.topic,
+            .horizon_month = f.horizon_month,
+            .predicted_count = f.predicted_count,
+            .confidence = f.confidence,
+            .basis = f.basis,
+            .method = f.method,
+            .same_month_last_year = f.same_month_last_year,
+        });
+    }
     return stringifyAlloc(alloc, .{
         .trends = trend_list.items,
         .geo = geo_list.items,
         .snapshots = snap_list.items,
+        .forecast = fc_list.items,
         // Trends are computed live from a store scan on every request,
         // so they are never stale — the fields exist so callers can
         // treat every precomputed payload the same way (Roadmap 6.4).

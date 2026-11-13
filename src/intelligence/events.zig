@@ -114,6 +114,49 @@ pub fn detectConflicts(alloc: std.mem.Allocator, docs: []const EventDoc) !Confli
     return report;
 }
 
+/// One flagged contradiction (Roadmap 7.5): two reports in the same
+/// title-clustered event whose titles disagree (similarity < 0.30),
+/// with both sources cited. A flag is a WARNING for a human to
+/// check — never a verdict about which report is right.
+pub const ContradictionFlag = struct {
+    a_title: []const u8,
+    b_title: []const u8,
+    a_source: []const u8,
+    b_source: []const u8,
+    similarity: f64,
+    note: []const u8 = "titles disagree: the reports may describe different facts — check both sources",
+};
+
+/// Every divergent pair in the event (not just the worst one), most
+/// dissimilar first. Empty for single-doc events and for events
+/// whose reports agree.
+pub fn detectContradictionFlags(alloc: std.mem.Allocator, docs: []const EventDoc) ![]ContradictionFlag {
+    var out: std.ArrayList(ContradictionFlag) = .empty;
+    if (docs.len < 2) return out.toOwnedSlice(alloc);
+    var i: usize = 0;
+    while (i < docs.len) : (i += 1) {
+        var j: usize = i + 1;
+        while (j < docs.len) : (j += 1) {
+            const sim = try fuzzy.similarity(alloc, docs[i].title, docs[j].title);
+            if (sim < 0.30) {
+                try out.append(alloc, .{
+                    .a_title = docs[i].title,
+                    .b_title = docs[j].title,
+                    .a_source = docs[i].source_name,
+                    .b_source = docs[j].source_name,
+                    .similarity = sim,
+                });
+            }
+        }
+    }
+    std.mem.sort(ContradictionFlag, out.items, {}, struct {
+        fn less(_: void, a: ContradictionFlag, b: ContradictionFlag) bool {
+            return a.similarity < b.similarity;
+        }
+    }.less);
+    return out.toOwnedSlice(alloc);
+}
+
 pub const TimelineDay = struct {
     day: []const u8, // "YYYY-MM-DD" (UTC)
     doc_count: usize,
@@ -218,8 +261,7 @@ test "eventStatus escalates retracted over corrected" {
     try std.testing.expectEqualStrings("retracted", try eventStatus(alloc, &gone));
 }
 
-test "detectConflicts flags divergent titles, not similar ones" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+test "detectConflicts flags divergent titles, not similar ones" {    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
     const same = [_]EventDoc{
@@ -237,6 +279,29 @@ test "detectConflicts flags divergent titles, not similar ones" {
     try std.testing.expect(r2.min_similarity < 0.30);
     const single = [_]EventDoc{.{ .id = "a", .title = "Fuel shortage", .source_id = "s1", .source_name = "S1", .published_at = 0, .text = "" }};
     try std.testing.expect(!(try detectConflicts(alloc, &single)).divergent);
+}
+
+test "detectContradictionFlags lists every divergent pair with sources" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const docs = [_]EventDoc{
+        .{ .id = "a", .title = "Fuel shortage hits Monrovia", .source_id = "s1", .source_name = "New Dawn", .published_at = 0, .text = "" },
+        .{ .id = "b", .title = "President opens new hospital in Gbarnga", .source_id = "s2", .source_name = "GNN Liberia", .published_at = 0, .text = "" },
+        .{ .id = "c", .title = "Fuel shortage hits Monrovia today", .source_id = "s3", .source_name = "Daily Observer", .published_at = 0, .text = "" },
+    };
+    const flags = try detectContradictionFlags(alloc, &docs);
+    // Only the two pairs against the hospital story diverge; the
+    // two fuel stories agree with each other.
+    try std.testing.expectEqual(@as(usize, 2), flags.len);
+    try std.testing.expectEqualStrings("GNN Liberia", flags[0].b_source);
+    try std.testing.expect(flags[0].similarity < 0.30);
+    try std.testing.expect(std.mem.indexOf(u8, flags[0].note, "check both sources") != null);
+    const agree = [_]EventDoc{
+        .{ .id = "a", .title = "Fuel shortage hits Monrovia", .source_id = "s1", .source_name = "S1", .published_at = 0, .text = "" },
+        .{ .id = "b", .title = "Fuel shortage hits Monrovia today", .source_id = "s2", .source_name = "S2", .published_at = 0, .text = "" },
+    };
+    try std.testing.expectEqual(@as(usize, 0), (try detectContradictionFlags(alloc, &agree)).len);
 }
 
 test "dayOf and timelineBuckets group by UTC day" {

@@ -73,6 +73,7 @@ pub const ai_providers = @import("ai/providers.zig");
 pub const seed_liberia = @import("seed/liberia.zig");
 pub const intelligence_events = @import("intelligence/events.zig");
 pub const intelligence_trending = @import("intelligence/trending.zig");
+pub const intelligence_forecast = @import("intelligence/forecast.zig");
 pub const intelligence_precomputed = @import("intelligence/precomputed.zig");
 pub const intelligence_quality = @import("intelligence/quality.zig");
 pub const cli_loadtest = @import("cli/loadtest.zig");

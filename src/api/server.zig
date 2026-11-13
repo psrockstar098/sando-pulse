@@ -5,6 +5,7 @@
 //!   GET  /v1/sources  public — source registry + per-source doc counts
 //!   GET  /v1/events   public — persisted event clusters (Roadmap 3.4)
 //!   GET  /v1/trends   public — Geez + trending engine (Roadmap 4.2)
+//!   GET  /v1/forecast public — predictive trends (Roadmap 7.1)
 //!   GET  /v1/briefing public — precomputed intelligence (Roadmap 4.4)
 //!   GET  /v1/quality  public — reliability, confidence, flags (Roadmap 4.6)
 //!   GET  /v1/locations public — reference places (Roadmap 3.6)
@@ -36,6 +37,7 @@ const pipeline = @import("../ingestion/pipeline.zig");
 const facebook = @import("../ingestion/connectors/facebook/facebook.zig");
 const fb_webhooks = @import("../ingestion/connectors/facebook/webhooks.zig");
 const trending = @import("../intelligence/trending.zig");
+const forecast_mod = @import("../intelligence/forecast.zig");
 const precomputed = @import("../intelligence/precomputed.zig");
 const quality = @import("../intelligence/quality.zig");
 const redis = @import("../storage/redis.zig");
@@ -1094,7 +1096,115 @@ pub const Server = struct {
                     try snapshots.append(alloc, try trending.snapshotFromAggregates(alloc, aggs, m));
                 }
             }
-            const body = try query_json.buildTrendsResponse(alloc, req_id, now, all_trends, geo_trends, snapshots.items);
+            // Forecast section (Roadmap 7.1): the top 3 topics' next-
+            // month predictions, from the same aggregates. Empty when
+            // no topic has 2 months of history yet.
+            var top_forecasts: []forecast_mod.Forecast = &.{};
+            if (self.knowledge) |k| {
+                const aggs = k.listMonthlyAggregates(alloc, 200) catch &.{};
+                top_forecasts = forecast_mod.forecastAll(alloc, aggs, 3) catch &.{};
+            }
+            const body = try query_json.buildTrendsResponse(alloc, req_id, now, all_trends, geo_trends, snapshots.items, top_forecasts);
+            self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+            try respondJson(req, .ok, body, req_id);
+            return;
+        }
+
+        if (method == .GET and std.mem.eql(u8, path, "/v1/forecast")) {
+            // Predictive trends (Roadmap 7.1): linear extrapolations
+            // + z-score anomalies from monthly aggregates. ?topic=
+            // forecasts one topic; ?county= restricts the series to
+            // documents naming that county (monthly counts built from
+            // a store scan — aggregates carry no county). No topic
+            // and no county forecasts the top topics by latest-month
+            // volume. Topics with fewer than 2 months of history are
+            // listed in insufficient_history, never invented.
+            const q = head.query;
+            const topic = queryParam(q, "topic");
+            const county = queryParam(q, "county");
+            var limit: usize = 5;
+            if (queryParam(q, "limit")) |ls| {
+                limit = std.fmt.parseInt(usize, ls, 10) catch 5;
+                if (limit > 20) limit = 20;
+            }
+            const now = timex.nowSeconds(self.io);
+            var forecasts: std.ArrayList(forecast_mod.Forecast) = .empty;
+            var anomalies: std.ArrayList(forecast_mod.Anomaly) = .empty;
+            var insufficient: std.ArrayList([]const u8) = .empty;
+            if (county) |c| {
+                const docs = self.repo.scanDocuments(alloc, now, 5000) catch {
+                    self.respondError(req, alloc, req_id, .internal_server_error, "forecast_failed", "Failed to scan documents");
+                    return;
+                };
+                var topics: std.ArrayList([]const u8) = .empty;
+                if (topic) |t| {
+                    try topics.append(alloc, t);
+                } else {
+                    for (docs) |doc| {
+                        for (doc.topics) |t| {
+                            var seen = false;
+                            for (topics.items) |st| {
+                                if (std.mem.eql(u8, st, t)) {
+                                    seen = true;
+                                    break;
+                                }
+                            }
+                            if (!seen) try topics.append(alloc, t);
+                        }
+                    }
+                }
+                for (topics.items) |t| {
+                    const series = forecast_mod.monthlySeriesFromDocs(alloc, docs, t, c) catch {
+                        self.respondError(req, alloc, req_id, .internal_server_error, "forecast_failed", "Failed to build the county series");
+                        return;
+                    };
+                    if (try forecast_mod.linearForecast(alloc, t, series)) |f| {
+                        try forecasts.append(alloc, f);
+                    } else {
+                        try insufficient.append(alloc, t);
+                    }
+                    for (try forecast_mod.detectAnomalies(alloc, t, series)) |a| {
+                        try anomalies.append(alloc, a);
+                    }
+                }
+                // Most recent-month volume first.
+                std.mem.sort(forecast_mod.Forecast, forecasts.items, {}, struct {
+                    fn less(_: void, a: forecast_mod.Forecast, b: forecast_mod.Forecast) bool {
+                        return a.predicted_count > b.predicted_count;
+                    }
+                }.less);
+                if (forecasts.items.len > limit) forecasts.items.len = limit;
+            } else if (self.knowledge) |k| {
+                const aggs = k.listMonthlyAggregates(alloc, 200) catch {
+                    self.respondError(req, alloc, req_id, .internal_server_error, "forecast_failed", "Failed to read monthly aggregates");
+                    return;
+                };
+                if (topic) |t| {
+                    const series = try trending.historicalRankings(alloc, aggs, t);
+                    if (try forecast_mod.linearForecast(alloc, t, series)) |f| {
+                        try forecasts.append(alloc, f);
+                    } else {
+                        try insufficient.append(alloc, t);
+                    }
+                    for (try forecast_mod.detectAnomalies(alloc, t, series)) |a| {
+                        try anomalies.append(alloc, a);
+                    }
+                } else {
+                    for (try forecast_mod.forecastAll(alloc, aggs, limit)) |f| {
+                        try forecasts.append(alloc, f);
+                    }
+                    for (forecasts.items) |f| {
+                        const series = try trending.historicalRankings(alloc, aggs, f.topic);
+                        for (try forecast_mod.detectAnomalies(alloc, f.topic, series)) |a| {
+                            try anomalies.append(alloc, a);
+                        }
+                    }
+                }
+            } else {
+                self.respondError(req, alloc, req_id, .internal_server_error, "forecast_unavailable", "Knowledge store unavailable");
+                return;
+            }
+            const body = try query_json.buildForecastResponse(alloc, req_id, now, forecasts.items, anomalies.items, insufficient.items);
             self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
             try respondJson(req, .ok, body, req_id);
             return;
@@ -1663,6 +1773,7 @@ pub const Server = struct {
         if ((method == .GET or method == .POST) and
             (std.mem.eql(u8, path, "/v1/health") or std.mem.eql(u8, path, "/v1/sources") or
                 std.mem.eql(u8, path, "/v1/events") or std.mem.eql(u8, path, "/v1/trends") or
+                std.mem.eql(u8, path, "/v1/forecast") or
                 std.mem.eql(u8, path, "/v1/briefing") or
                 std.mem.eql(u8, path, "/v1/locations") or
                 std.mem.eql(u8, path, "/v1/statistics") or
