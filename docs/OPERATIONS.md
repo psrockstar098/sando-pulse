@@ -179,3 +179,30 @@ YAML parses, the binary builds, `zig build test` passes, and the API
 itself was smoke-tested live on the host (see STATUS.md). The first
 real `docker compose up` must happen on Dominic's machine or a
 production host, with the checklist in `pulse audit` as the gate.
+
+## Roadmap 7 operations
+
+- **No new config vars.** Roadmap 7 adds no environment knobs:
+  the forecast/stat/alert/report/social features run on the
+  existing store + Redis. The alert stream and the briefing
+  variants need no configuration.
+- **Alert stream (`pulse:alerts`, consumer group `sando`).** The
+  worker publishes one stream entry per merged breaking alert on
+  every briefing refresh (fields: `kind`, `title`, `event_ids`,
+  `sources`, `doc_count`, `importance`, `ts`). Sando subscribes
+  with `XREADGROUP GROUP sando <consumer> STREAMS pulse:alerts >`.
+  `pulse alerts` reads the stream back newest-first for operators
+  (empty stream and no-Redis both report plainly). A publish
+  failure never fails the briefing refresh — it logs and the
+  endpoint keeps computing live.
+- **Report schedules.** The worker refreshes only the default
+  daily-general briefing, on `PULSE_PRECOMPUTE_INTERVAL_S`
+  (default 3600 s), and caches it in Redis. Weekly, political,
+  economic and county variants are computed live per request and
+  never cached — no schedule, no stale variant. `pulse briefing
+  [--scope weekly] [--kind political|economic] [--county <name>]`
+  renders any variant from the live store for operators.
+- **Seed updates.** `pulse seed` is idempotent (upserts); run it
+  after pulling a seed change. Current counts: locations 166,
+  facilities 47, statistics 5. The seed test pins the counts, so
+  a count change without a test update fails the suite on purpose.

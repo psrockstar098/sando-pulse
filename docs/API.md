@@ -134,6 +134,57 @@ Every `POST /v1/query` 200 carries, alongside the answer:
   `"options"` (`{"query": "...", "options": {"limit": 20}}`).
   Outside 1–20 the request is a 400.
 
+## Roadmap 7 endpoints
+
+- `GET /v1/forecast?topic=<t>&county=<c>&limit=N` — next-month
+  predictions per topic (`topic`, `horizon_month` as `YYYY-MM`,
+  `predicted_count`, `confidence`, `basis`, `method:
+  linear_extrapolation`, `same_month_last_year`), plus `anomalies`
+  (z-score spikes/drops) and `insufficient_history` (topics with
+  under 2 months of aggregates). Every prediction carries the
+  disclaimer that it is a statistical extrapolation, not a fact.
+  The same top-3 forecasts appear as the `forecast` section of
+  `GET /v1/trends`.
+- Stat answers ride on `POST /v1/query`: a "how many schools are
+  in Montserrado County?" or "what is the population of Liberia?"
+  question is answered from the knowledge store and the response
+  carries `stat_answer` in `enrichment` (`kind`, `sufficient`,
+  `answer_text`, `value`, `unit`, `period`, `rows_counted`,
+  `source`, `verified_at`, `insufficient_reason`) with
+  `routing_reason: "stat_answer"`. Unknown places/facilities
+  answer `sufficient: false` — never a guessed number.
+- `GET /v1/alerts` — breaking alerts, each with `kind` (accident,
+  protest, road_closure, emergency, announcement, community_event,
+  unknown), `title`, `event_ids`, `sources`, `doc_count`,
+  `importance`, and `ts`, plus `stream` (`pulse:alerts`),
+  `stream_group` (`sando`) and `stream_available`. Empty is a real
+  answer. `pulse alerts` reads the stream back newest-first.
+- `GET /v1/briefing?scope=weekly&kind=political|economic&county=<name>`
+  — report variants. `scope` defaults to `daily`, `kind` to
+  `general`, `county` unset. Variants are computed live and never
+  cached; the default daily-general briefing still uses the
+  worker-cached payload. Unknown scope/kind/county is a 400.
+  The briefing carries `scope`, `kind`, `county`,
+  `social_available` and `social_note`. `pulse briefing` accepts
+  the same options as flags.
+- `GET /v1/events?id=<id>` — the event detail now carries a
+  `contradictions` array next to `conflicts`: every divergent
+  title pair (similarity < 0.30), most dissimilar first, both
+  sources cited, with the warning note. Empty when the reports
+  agree.
+- `GET /v1/social` — social ingestion status: `social_available`,
+  `post_count`, `posts_by_platform`, `top_hashtags` (from real
+  authorized posts only), and `connectors` (facebook, x, reddit,
+  youtube — each with `available` and an unavailable `reason`).
+  `GET /v1/trends` carries a `social` section with the same
+  hashtag trends (category `social`); empty until a social
+  connector feeds the registry.
+- Semantic search stays lexical: the external embedding provider
+  has no API key and is never called live. `POST /v1/query` with a
+  semantic-only question routes `deep` with
+  `routing_reason: "semantic_only"` and uses the local lexical
+  embedding, labelled as such.
+
 ## Popular searches and freshness (Roadmap 6.4)
 
 - `GET /v1/popular?limit=N` returns the most-asked queries,

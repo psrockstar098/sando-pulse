@@ -1091,3 +1091,80 @@ Full tables in `docs/PERFORMANCE.md`; the short version:
 - Verified: `zig build` passes; **255/255 tests pass** on a
   clean DB. Full R6 verification (build + suite + live smoke)
   is in the R6 closeout below.
+
+## Roadmap 7 — Feature Gaps (DONE, 2026-11-13)
+
+Baseline at start: `zig build` passes, 255/255 tests, origin/main `726d427` (Roadmap 6 head, verified + pushed).
+Constraints: Zig 0.17.1, REST only, raw std.http only (NO httpz — owner's direct order 2026-11-13), real data only, local commits only, docs in the same commits.
+Final state: `zig build` passes, **273/273 tests** (18 new), all sections 7.1–7.9 done. Roadmap 7 complete.
+
+### 7.1 Predictive trends — DONE (commit `0beb5e4`)
+
+- `src/intelligence/forecast.zig` (new): least-squares linear extrapolation over monthly aggregates + z-score anomaly detection (leave-one-out, |z| ≥ 2, needs ≥4 months). `Forecast` carries topic, horizon_month (next "YYYY-MM", Dec→Jan rollover), predicted_count, confidence (1 − mean abs residual / (mean+1)), basis string, method "linear_extrapolation", same_month_last_year. `forecastAll` ranks by latest-month volume, skips single-month topics.
+- `GET /v1/forecast` (topic/county/limit) + a forecast section (top 3 topics) inside the trends response. Every prediction carries the disclaimer that it is a statistical extrapolation, not a fact; topics with under 2 months of history are listed under `insufficient_history`, never predicted.
+- Verified: `zig build` passes; 261/261 tests (6 new). Live smoke: `/v1/forecast?limit=3` → forecasts [], anomalies [], insufficient_history [] — honest empty, the store has ~1 month of aggregates and no topic has 2 months of history yet.
+
+### 7.2 Stat answers — DONE (commit `deece71`)
+
+- `src/intelligence/statanswer.zig` (new): `detectStatQuestion` ("how many" + facility word → facility_count; "population" + known place → population; longest place-name match wins) and `answerStat` from the knowledge store — facility counts via `listFacilities` filtered by county/city, population via location row or the Liberia statistics (newest period wins). Honest refusals (`stat_no_place`, `stat_not_in_knowledge_store`, `stat_not_published`) with sufficient:false.
+- New `.stat` intent in the planner; a stat early-branch in `Server.computeQuery` builds a minimal Outcome with `stat_answer` in `Enrichment` and `routing_reason: "stat_answer"`.
+- Verified: `zig build` passes; 265/265 tests (4 new). Live smoke (seed locations=166 facilities=46 statistics=5): "How many schools are in Montserrado County?" → 2 schools, sufficient:true, confidence 0.9; "What is the population of Liberia?" → 5,437,249 (2024 estimate); "How many schools are in Grand Kru County?" → sufficient:false, `stat_not_in_knowledge_store: no school recorded for Grand Kru`.
+
+### 7.3 Breaking alerts — DONE (commit `47024c9`)
+
+- `src/intelligence/alerts.zig`: `computeBreakingAlerts` (importance ≥ 0.5, seen in the last 6 hours, not retracted) and `publishAlerts` (one entry per alert to Redis stream `pulse:alerts`, consumer group `sando`). `classifyIncident` is rules-based from title+text (accident > protest > road_closure > emergency > announcement > community_event > unknown). `mergeBreakingAlerts` groups by kind + trigram title similarity ≥ 0.5, cites every distinct source, sorts by importance desc.
+- `GET /v1/alerts` (live compute; empty is a real answer) + `pulse alerts` CLI (reads the stream back newest-first via `xrevrange`). `EventRef` carries `kind` in all four briefing event lists.
+- Verified: `zig build` passes; 267/267 tests (2 new). Live smoke: 3 synthetic crash docs (labelled test docs, 3 sources) clustered into 1 alert — kind "accident", 3 docs, 3 sources, importance 0.662 — published to the stream and read back by `pulse alerts` (`1794592492654-0 [accident] Fatal crash on Monrovia Kakata highway kills two sources=gnn-liberia,daily-observer,new-dawn docs=3 importance=0.662`). Note: `pulse worker --once` does not run `refreshBriefing` (precompute is in `runLoop` only); a worker-loop run is what publishes.
+
+### 7.4 Report variants — DONE (commit `a60e213`)
+
+- `computeReport` replaces `computeBriefing`: scope daily|weekly, kind general|political|economic, county filter. The kind filter applies to events AND documents (the doc's own topic list); Geez sections stay empty for political/economic reports. The county filter matches the county name or a city in that county (Monrovia counts for Montserrado), resolved from the seeded knowledge-store locations; strict name match without a store.
+- `GET /v1/briefing?scope=weekly&kind=political|economic&county=<name>`; unknown scope/kind/county is a 400. Variants are computed live and never cached; the default daily-general briefing still uses the worker-cached payload. `pulse briefing [--scope weekly] [--kind political|economic] [--county <name>]` with the same validation. The briefing carries `scope`, `kind`, `county`, `social_available` and a `social_note`.
+- Two bugs the verification caught and fixed: (1) the kind filter initially skipped only events, so a political report listed sports docs as "latest" — fixed by filtering docs on their own topics; (2) the first smoke run used a stale binary (the doc-filter fix landed after the last `zig build`; `zig build test` does not rebuild the exe) — rebuilt, re-smoked, correct.
+- Verified: `zig build` passes; 268/268 tests (1 new computeReport test: weekly 3 vs daily 2 stories, political 1 story with Geez empty, economic 0, Lofa 1 story + 1 doc, Montserrado 2 stories + 2 docs, city-expansion Monrovia doc matches Montserrado). Live smoke: default daily-general cached (4 stories, 6 latest); weekly 4 stories; political 0 stories, 2 latest (the two politics-tagged docs); economic 0/0; county=Lofa 1 story + 1 doc; county=Montserrado 2 stories + 5 latest (city expansion live); bad county/kind → 400. `pulse briefing --scope weekly --kind political --county Lofa` renders the variant JSON.
+
+### 7.5 Contradiction detection — DONE (commit `450df13`)
+
+- `events.detectContradictionFlags`: every divergent title pair in an event (trigram similarity < 0.30), most dissimilar first, both sources cited, with the warning note "titles disagree: the reports may describe different facts — check both sources". A flag is a WARNING for a human to check — never a verdict about which report is right. Empty for single-doc events and agreeing reports.
+- `GET /v1/events?id=<id>` now carries a `contradictions` array next to the existing `conflicts` summary. Flags fire in practice via the same-topic clustering path: two energy docs with different titles join one event and get flagged, while identical titles never flag.
+- Verified: `zig build` passes; 269/269 tests (1 new buildEventDetailResponse test: 2 flags for a 3-doc event with one divergent title, 0 flags for agreeing docs). Live smoke: crash event (3 identical titles) → divergent false, contradictions []; fuel event after ingesting a divergent diesel doc (same energy topic, title sim 0.263) → divergent true, 1 flag citing New Dawn / Daily Observer with the warning note.
+
+### 7.6 Knowledge-gap filling — DONE (commit `5e98d58`)
+
+- Grand Kru 2008 district populations, verified live 2026-11-13 against the Wikipedia Grand Kru County district table (2008 and 2022 censuses): 18 of 19 districts filled (Barclayville 10904, Bleebo 1809, Bolloh 1891, Buah 649, Dorbor 1935, Dweh 935, Felo-Jekwi 2194, Fenetoe 1742, Forpoh 1088, Garraway 9726, Gee 2522, Grand Cess Wedabo 10471, Upper Jloh 1917, Lower Jloh 1212, Kpi 1603, Nrokwia-Wesldow 1878, Trenbo 3912, Wlogba 688). Coordinates left untouched (seeded OSM coords are more precise than the table's 2-decimal ones). Penicess stays null: its 2008 population is unpublished in that source.
+- Lott Carey School Clinic seeded as a clinic facility (Montserrado/Monrovia, 6.4175663 -10.7877694, OpenStreetMap Nominatim, verified 2026-11-13). It is the school's clinic, not the school — Lott Carey school itself remains unseeded/missing.
+- The table's 2022 populations were verified alongside but are NOT seeded: a location row carries one population (2008 by convention); the 2022 figures (Barclayville 12619, Bleebo 2820, Bolloh 1755, Buah 2903, Dorbor 8167, Dweh 3966, Felo-Jekwi 3903, Fenetoe 2236, Forpoh 4970, Garraway 17000, Gee 5328, Grand Cess Wedabo 18011, Upper Jloh 3746, Lower Jloh 3639, Kpi 1367, Nrokwia-Wesldow 2873, Penicess 2828, Trenbo 9182, Wlogba 2029) are recorded here, not in the seed.
+- Still missing, re-checked 2026-11-13 (Nominatim `[]`; homepages unreachable from this VM — 000/403, not proven dead): Starz University, United Methodist University, F. J. Grant Hospital, Rally Time Market, 4 schools (St. Patrick, D. Twe, St. Theresa, J. J. Roberts), 7 highways, 4 media (The News, Spoon TV, ELBC, Truth FM), 2 ministries (Lands, Mines and Energy; Youth & Sports). Districts without a 2008 population: 23 → 5 (Penicess, Quardu Gboni, Barrobo, Pleebo/Sodeken, Webbo).
+- Verified: `zig build` passes; 269/269 tests (seed test now expects 47 facilities and accepts both verification dates, with spot checks for Barclayville 10904, Penicess null, and the clinic). Live: `pulse seed` twice, identical output (locations=166 facilities=47 statistics=5); DB shows all 18 populations and the clinic row; a leftover "Test Hospital" test row from an earlier live test was removed so the DB matches the seed (47 facilities).
+
+### 7.7 Social ingestion (GATED) — DONE (commit `210ac36`)
+
+- `src/intelligence/social.zig` (new): `SocialRegistry` fed ONLY by real authorized connector data via `ingest()` — no scrapers, no faked posts, no invented counts. Bounded at 1000 posts (oldest evicted). Hashtag tracking over stored posts (`#word` runs, lowercased, once per post) and a "social" trend lane with the same velocity/score formula as document trends.
+- X/Twitter stub added to the connector framework (`Kind.x`, `xConnector`, `allConnectors` now 9): unavailable with the reason "needs an approved X API client", same pattern as Reddit.
+- `GET /v1/social` (new): `social_available`, `post_count`, `posts_by_platform`, `top_hashtags`, and every social connector's availability with its reason. Honestly empty today. `GET /v1/trends` gains a `social` section (hashtag trends, category "social"), empty until a social connector feeds the registry. No collection job feeds the registry yet — that waits on Dominic's Meta app / X / Reddit authorization, same as the Facebook connector.
+- Verified: `zig build` passes; 273/273 tests (3 new social registry tests: empty, hashtag counts once-per-post, bounded eviction; 1 new buildSocialResponse test). Live smoke: `GET /v1/social` → social_available false, post_count 0, connectors facebook/youtube/reddit/x all unavailable with reasons; `GET /v1/trends?window=7d` → `social` key present, empty, doc trends unaffected (3 trends).
+
+### 7.8 Semantic search — BLOCKED (recorded, not forced)
+
+- The external embedding provider code exists (Roadmap 2.4) but was NEVER called live — no API key exists, and no live embedding API was called in this roadmap. Do NOT call it without a key.
+- Deep queries that need semantic signals use the lexical local embedding and say so (`routing_reason: "semantic_only"`, local embedding honestly labelled not semantic since Roadmap 2).
+- Dominic's step if he wants real semantic search: provide an embedding API key (external provider), after which the provider can be exercised live for the first time and its cost/latency measured. Until then the gap stands: no semantic similarity, only lexical overlap + trigram fuzzy matching.
+
+### 7.9 Docs + verification — DONE (this commit)
+
+- README.md: API table gains `/v1/forecast`, `/v1/alerts`, `/v1/social`; new "New in Roadmap 7" section (forecast, stat answers, alerts, report variants, contradiction flags, knowledge coverage, gated social, blocked semantic search).
+- docs/API.md: new "Roadmap 7 endpoints" section (forecast, stat answers, alerts, briefing variants, contradictions, social, semantic-search-stays-lexical). docs/OPERATIONS.md: new "Roadmap 7 operations" section (no new config vars; alert stream `pulse:alerts` group `sando` + `pulse alerts`; report schedules — only the daily-general briefing is worker-refreshed, variants are live; seed idempotency + counts 166/47/5).
+- docs/openapi.yaml: new paths `/v1/forecast`, `/v1/alerts`, `/v1/social`; `/v1/briefing` gains scope/kind/county params; `/v1/events` detail notes contradiction flags; `/v1/trends` notes the social section; QueryResponse gains `stat_answer`.
+- Verified: `zig build` passes; **273/273 tests pass** (baseline 255 at R6 head + 18 new; the suite still exits 1 with "36 errors were logged" — pre-existing, error-level logs from failure-path tests). Full R7 verification (build + suite + live smoke of every new endpoint) is in the R7 closeout below.
+
+### Roadmap 7 honest gaps
+
+1. **Forecasts are unproven on real data**: the live store has ~1 month of aggregates, so `/v1/forecast` returns empty today. The first real prediction needs 2+ months of monthly aggregates per topic — the math is unit-tested, the live path is not yet exercised.
+2. **Stat answers cover only what is seeded**: 5 schools in the missing list, 2 ministries, 4 media orgs — any question about them refuses honestly. County-city expansion for stat answers is by stored facility rows only.
+3. **Breaking alerts need a breaking event**: importance ≥ 0.5 + seen in the last 6 hours. Quiet days return empty; the worker only publishes on briefing refresh, so an alert can lag the refresh interval (default 3600 s).
+4. **Report variants are live-computed, never cached**: a weekly/county/political report on a large store scans 5000 docs per request. No caching was added — a variant under load is untested.
+5. **Contradiction flags only fire inside one event**: reports that never cluster (different topics, >72 h apart) are never compared. Cross-event contradiction detection does not exist.
+6. **Knowledge gaps remain** (7.6): 5 districts without 2008 populations, 22 districts without coordinates, Starz/UMU/F. J. Grant/Rally Time/4 schools/7 highways/4 media/2 ministries unseeded. The 2022 district populations are verified but not seeded (single-population convention).
+7. **Social is plumbing only**: no collection job feeds the registry; the Facebook/X/Reddit connectors are all unconfigured. `GET /v1/social` and the trends `social` section stay empty until Dominic authorizes a connector.
+8. **Semantic search is blocked** (7.8): no API key, no live call, lexical only.
+9. **Test residue in the live test DB**: the 7.3/7.5 smoke tests ingested synthetic docs labelled "PULSE TEST DOC" (3 crash docs + 1 diesel doc) that now live in the `pulse_test` documents table and cluster into real events. They are labelled, but a clean-DB re-run would not have them.

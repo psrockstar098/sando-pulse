@@ -206,7 +206,45 @@ components:
           description: Measured server-side latency in milliseconds (fractional). Client-measured latency is higher (connection + the ~42 ms per-request floor on the dev VM — see docs/PERFORMANCE.md).
         routing_reason:
           type: string
-          description: Why the router chose this path (e.g. l1_hit, l2_hit, default_fast, intent_deep, strategy_deep, semantic_only).
+          description: Why the router chose this path (e.g. l1_hit, l2_hit, default_fast, intent_deep, strategy_deep, semantic_only, stat_answer).
+        stat_answer:
+          type: object
+          nullable: true
+          description: |
+            Stat answer (Roadmap 7.2), present only when the query
+            is a statistics question answered from the knowledge
+            store: kind (facility_count | population), sufficient,
+            answer_text, value, unit, period, rows_counted, source,
+            verified_at, insufficient_reason. Unknown places or
+            facilities answer sufficient false — never a guessed number.
+          properties:
+            kind:
+              type: string
+            sufficient:
+              type: boolean
+            answer_text:
+              type: string
+              nullable: true
+            value:
+              type: number
+              nullable: true
+            unit:
+              type: string
+              nullable: true
+            period:
+              type: string
+              nullable: true
+            rows_counted:
+              type: integer
+            source:
+              type: string
+              nullable: true
+            verified_at:
+              type: string
+              nullable: true
+            insufficient_reason:
+              type: string
+              nullable: true
         query_plan:
           type: object
           properties:
@@ -404,7 +442,7 @@ paths:
       parameters:
         - name: id
           in: query
-          description: Event id for the detail view (documents, corroboration, status, conflicts, timeline).
+          description: Event id for the detail view (documents, corroboration, status, conflicts, contradiction flags, timeline).
           schema:
             type: string
       responses:
@@ -446,7 +484,7 @@ paths:
             default: 10
       responses:
         "200":
-          description: Trends, geo trends and monthly snapshots. Computed live from a store scan on every request, so `stale` is always false — the fields exist so every precomputed payload reports freshness the same way (Roadmap 6.4).
+          description: Trends, geo trends, monthly snapshots, forecasts and the social hashtag lane. Computed live from a store scan on every request, so `stale` is always false — the fields exist so every precomputed payload reports freshness the same way (Roadmap 6.4). The `social` section is empty until an authorized social connector feeds the registry (Roadmap 7.7).
           content:
             application/json:
               schema:
@@ -460,10 +498,100 @@ paths:
   /v1/briefing:
     get:
       tags: [intelligence]
-      summary: Today's precomputed briefing (no auth)
+      summary: Today's precomputed briefing, or a report variant (no auth)
+      parameters:
+        - name: scope
+          in: query
+          description: `daily` (default, worker-cached) or `weekly` (computed live).
+          schema:
+            type: string
+            enum: ["daily", "weekly"]
+            default: daily
+        - name: kind
+          in: query
+          description: `general` (default), `political` or `economic` (computed live; Geez sections stay empty for political/economic).
+          schema:
+            type: string
+            enum: ["general", "political", "economic"]
+            default: general
+        - name: county
+          in: query
+          description: County filter; a city in the county counts (a Monrovia story is a Montserrado story).
+          schema:
+            type: string
       responses:
         "200":
-          description: Briefing for today (empty when no documents were collected today). `stale` is evaluated at serve time against the precompute TTL — a cached payload served hours after it was computed is honestly marked stale (Roadmap 6.4).
+          description: Briefing for today (empty when no documents were collected today). `stale` is evaluated at serve time against the precompute TTL — a cached payload served hours after it was computed is honestly marked stale (Roadmap 6.4). Variants are computed live and never cached; an unknown scope/kind/county is a 400 (Roadmap 7.4).
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          description: "Unknown scope, kind, or county."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /v1/forecast:
+    get:
+      tags: [intelligence]
+      summary: Next-month topic predictions with confidence and basis (no auth)
+      description: |
+        Linear extrapolation over monthly aggregates (Roadmap 7.1).
+        Every prediction is a statistical extrapolation, not a fact;
+        topics with under 2 months of history are listed under
+        `insufficient_history`, never predicted.
+      parameters:
+        - name: topic
+          in: query
+          description: Filter to one topic.
+          schema:
+            type: string
+        - name: county
+          in: query
+          description: Filter to one county.
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 10
+      responses:
+        "200":
+          description: Forecasts, anomalies (z-score spikes/drops) and insufficient-history topics.
+          content:
+            application/json:
+              schema:
+                type: object
+  /v1/alerts:
+    get:
+      tags: [intelligence]
+      summary: Breaking alerts, typed incidents (no auth)
+      description: |
+        Merged incidents from breaking events (Roadmap 7.3), computed
+        live. Also published to the `pulse:alerts` Redis stream
+        (consumer group `sando`). Empty is a real answer.
+      responses:
+        "200":
+          description: Alerts plus stream name, group and availability.
+          content:
+            application/json:
+              schema:
+                type: object
+  /v1/social:
+    get:
+      tags: [intelligence]
+      summary: Social ingestion status — honestly empty until a connector is authorized (no auth)
+      description: |
+        The registry is fed only by authorized connector data
+        (Roadmap 7.7, gated). Today no social connector is
+        configured, so `social_available` is false and the lists are
+        empty; each connector is listed with its unavailable reason.
+        No scrapers, no faked posts.
+      responses:
+        "200":
+          description: Social availability, post counts, top hashtags and connector statuses.
           content:
             application/json:
               schema:
