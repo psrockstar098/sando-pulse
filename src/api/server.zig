@@ -177,6 +177,13 @@ pub const Server = struct {
     /// wrapped). Both are read by the /metrics handler.
     redis_breaker: breaker.CircuitBreaker,
     embed_breaker: ?*breaker.CircuitBreaker = null,
+    /// Whether the Redis client is known dead (Roadmap 6.11): the
+    /// client holds one persistent TCP stream with no reconnect, so
+    /// after Redis dies every command fails until the server
+    /// restarts. Set on any L2 error; the next allowed L2 call
+    /// tries a fresh connect first, so the breaker can observe a
+    /// real trial call and close again.
+    redis_dead: bool = false,
     /// Live reindex interval in seconds (Roadmap 6.11): initialised
     /// from cfg, movable by POST /v1/admin/config. Read here instead
     /// of cfg so a hot reload takes effect on the next query.
@@ -422,6 +429,31 @@ pub const Server = struct {
         const pages = std.fmt.parseInt(u64, std.mem.trim(u8, rss_pages, " \n"), 10) catch return 0;
         // Linux x86_64 page size (std has no page_size constant in 0.17.1).
         return pages * 4096;
+    }
+
+    /// Lazy Redis reconnect (Roadmap 6.11): the client holds one
+    /// persistent TCP stream with no reconnect, so after Redis dies
+    /// every command fails until the server restarts. When the L2
+    /// path has marked the client dead, try a fresh connect and
+    /// overwrite the client IN PLACE — the usage tracker and the
+    /// event-bus sink hold the same pointer, so every holder sees
+    /// the fresh connection at once. Order matters: connect FIRST,
+    /// then close the old stream and overwrite. A failed connect
+    /// leaves the old client untouched (dead but open — its
+    /// commands fail as errors). Closing it first would leave a
+    /// closed fd behind, and the next write from another holder
+    /// panics the process (BADF is a programmer-bug panic in
+    /// std.Io.Threaded, not a catchable error — found by the smoke
+    /// test). Returns true when a live client is present afterwards.
+    fn reconnectRedis(self: *Server) bool {
+        const url = self.cfg.redis_url orelse return false;
+        const client = self.redis orelse return false;
+        const connected = redis.RedisClient.connect(self.alloc, self.io, url) catch return false;
+        client.close();
+        client.* = connected;
+        self.redis_dead = false;
+        logging.info("redis reconnected", &.{});
+        return true;
     }
 
     fn keyFpOf(head: HeadCapture, arena: std.mem.Allocator) []const u8 {
@@ -751,15 +783,23 @@ pub const Server = struct {
                     }
                     // Breaker (Roadmap 6.11): no writes to a dead
                     // Redis either; a successful put proves it alive.
-                    if (self.redis) |rc| {
+                    // A dead client is reconnected first (same reason
+                    // as the lookup: without it the breaker could
+                    // never observe a success after Redis recovers).
+                    if (self.redis) |_| {
                         const put_now_ms = timex.nowMillis(self.io);
                         if (self.redis_breaker.allow(put_now_ms)) {
                             const k = cache.cacheKey(alloc, row.query, 10) catch null;
                             if (k) |ck| {
-                                if (cache.put(rc, alloc, ck, epoch, s, self.cfg.query_cache_ttl_s)) {
-                                    self.redis_breaker.recordSuccess(put_now_ms);
-                                } else |_| {
+                                if (self.redis_dead and !self.reconnectRedis()) {
                                     self.redis_breaker.recordFailure(put_now_ms);
+                                } else if (self.redis) |rc| {
+                                    if (cache.put(rc, alloc, ck, epoch, s, self.cfg.query_cache_ttl_s)) {
+                                        self.redis_breaker.recordSuccess(put_now_ms);
+                                    } else |_| {
+                                        self.redis_dead = true;
+                                        self.redis_breaker.recordFailure(put_now_ms);
+                                    }
                                 }
                             }
                         }
@@ -873,6 +913,15 @@ pub const Server = struct {
             while (it.next()) |entry| {
                 const key = entry.key_ptr.*;
                 const val = entry.value_ptr.*;
+                // Name the problem precisely: an unknown key is
+                // unknown_setting even when its value is also the
+                // wrong type — the operator's mistake is the key.
+                const known = std.mem.eql(u8, key, "l1_ttl_s") or std.mem.eql(u8, key, "fanout_timeout_ms") or std.mem.eql(u8, key, "reindex_interval_s");
+                if (!known) {
+                    const msg = std.fmt.allocPrint(alloc, "unknown setting: {s}", .{key}) catch "unknown setting";
+                    self.respondError(req, alloc, req_id, .bad_request, "unknown_setting", msg);
+                    return;
+                }
                 if (val != .integer) {
                     self.respondError(req, alloc, req_id, .bad_request, "bad_value", "All config values must be integers");
                     return;
@@ -1231,7 +1280,7 @@ pub const Server = struct {
             // epoch, or a malformed entry all fall through to planning.
             var cache_key: ?[]u8 = null;
             var cache_epoch: i64 = 0;
-            if (self.redis) |rc| {
+            if (self.redis) |_| {
                 if (self.cfg.query_cache_ttl_s > 0) {
                     cache_key = cache.cacheKey(alloc, qr.query, qr.limit) catch null;
                     if (cache_key) |k| {
@@ -1240,21 +1289,28 @@ pub const Server = struct {
                         // — the degraded path a miss already takes. A
                         // clean answer (hit or miss) is a success for
                         // the breaker; only a Redis error counts as a
-                        // failure.
+                        // failure. When the client is known dead, a
+                        // fresh connect is tried first — without it the
+                        // breaker could never observe a successful
+                        // trial call after Redis recovers.
                         const l2_now_ms = timex.nowMillis(self.io);
                         if (self.redis_breaker.allow(l2_now_ms)) {
-                            cache_epoch = cache.currentEpoch(rc, alloc);
-                            var l2_failed = false;
-                            const stored = cache.get(rc, alloc, k, cache_epoch) catch blk: {
-                                l2_failed = true;
-                                break :blk null;
-                            };
-                            if (l2_failed) {
+                            if (self.redis_dead and !self.reconnectRedis()) {
                                 self.redis_breaker.recordFailure(l2_now_ms);
-                            } else {
-                                self.redis_breaker.recordSuccess(l2_now_ms);
-                            }
-                            if (stored) |stored_body| {
+                            } else if (self.redis) |rc| {
+                                cache_epoch = cache.currentEpoch(rc, alloc);
+                                var l2_failed = false;
+                                const stored = cache.get(rc, alloc, k, cache_epoch) catch blk: {
+                                    l2_failed = true;
+                                    break :blk null;
+                                };
+                                if (l2_failed) {
+                                    self.redis_dead = true;
+                                    self.redis_breaker.recordFailure(l2_now_ms);
+                                } else {
+                                    self.redis_breaker.recordSuccess(l2_now_ms);
+                                }
+                                if (stored) |stored_body| {
                                 const latency_ms = timex.latencyMsF64(query_start_ns, timex.nowNanos(self.io));
                                 if (cache.stampServed(alloc, stored_body, req_id, "instant", latency_ms, "l2_hit") catch null) |stamped_body| {
                                     self.metrics.observeCacheHit();
@@ -1266,6 +1322,7 @@ pub const Server = struct {
                                     try respondJsonCached(req, .ok, stamped_body, req_id, true);
                                     return;
                                 }
+                            }
                             }
                         }
                         self.metrics.observeCacheMiss();
@@ -1309,14 +1366,20 @@ pub const Server = struct {
                         }
                         if (cache_key) |k| {
                             // Breaker (Roadmap 6.11): skip the write
-                            // while the Redis breaker is open.
-                            if (self.redis) |rc| {
+                            // while the Redis breaker is open; a dead
+                            // client is reconnected first.
+                            if (self.redis) |_| {
                                 const put_now_ms = timex.nowMillis(self.io);
                                 if (self.redis_breaker.allow(put_now_ms)) {
-                                    if (cache.put(rc, alloc, k, cache_epoch, s, self.cfg.query_cache_ttl_s)) {
-                                        self.redis_breaker.recordSuccess(put_now_ms);
-                                    } else |_| {
+                                    if (self.redis_dead and !self.reconnectRedis()) {
                                         self.redis_breaker.recordFailure(put_now_ms);
+                                    } else if (self.redis) |rc| {
+                                        if (cache.put(rc, alloc, k, cache_epoch, s, self.cfg.query_cache_ttl_s)) {
+                                            self.redis_breaker.recordSuccess(put_now_ms);
+                                        } else |_| {
+                                            self.redis_dead = true;
+                                            self.redis_breaker.recordFailure(put_now_ms);
+                                        }
                                     }
                                 }
                             }

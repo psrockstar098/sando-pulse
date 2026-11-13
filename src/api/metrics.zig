@@ -319,25 +319,25 @@ pub const Metrics = struct {
         // Third format call (Roadmap 6.11): breaker state + trips +
         // skipped calls, same 32-argument cap reason as above.
         const breakers = try std.fmt.allocPrint(alloc,
-            \\\\# HELP pulse_breaker_redis_state Circuit breaker state for the Redis L2 cache (0 closed, 1 half-open, 2 open)
-            \\\\# TYPE pulse_breaker_redis_state gauge
-            \\\\pulse_breaker_redis_state {d}
-            \\\\# HELP pulse_breaker_redis_trips_total Times the Redis breaker tripped open
-            \\\\# TYPE pulse_breaker_redis_trips_total counter
-            \\\\pulse_breaker_redis_trips_total {d}
-            \\\\# HELP pulse_breaker_redis_skipped_total L2 lookups refused while the Redis breaker was open
-            \\\\# TYPE pulse_breaker_redis_skipped_total counter
-            \\\\pulse_breaker_redis_skipped_total {d}
-            \\\\# HELP pulse_breaker_embedding_state Circuit breaker state for the external embedder (0 closed, 1 half-open, 2 open)
-            \\\\# TYPE pulse_breaker_embedding_state gauge
-            \\\\pulse_breaker_embedding_state {d}
-            \\\\# HELP pulse_breaker_embedding_trips_total Times the embedding breaker tripped open
-            \\\\# TYPE pulse_breaker_embedding_trips_total counter
-            \\\\pulse_breaker_embedding_trips_total {d}
-            \\\\# HELP pulse_breaker_embedding_skipped_total Embed calls refused while the embedding breaker was open
-            \\\\# TYPE pulse_breaker_embedding_skipped_total counter
-            \\\\pulse_breaker_embedding_skipped_total {d}
-            \\\\
+            \\# HELP pulse_breaker_redis_state Circuit breaker state for the Redis L2 cache (0 closed, 1 half-open, 2 open)
+            \\# TYPE pulse_breaker_redis_state gauge
+            \\pulse_breaker_redis_state {d}
+            \\# HELP pulse_breaker_redis_trips_total Times the Redis breaker tripped open
+            \\# TYPE pulse_breaker_redis_trips_total counter
+            \\pulse_breaker_redis_trips_total {d}
+            \\# HELP pulse_breaker_redis_skipped_total L2 lookups refused while the Redis breaker was open
+            \\# TYPE pulse_breaker_redis_skipped_total counter
+            \\pulse_breaker_redis_skipped_total {d}
+            \\# HELP pulse_breaker_embedding_state Circuit breaker state for the external embedder (0 closed, 1 half-open, 2 open)
+            \\# TYPE pulse_breaker_embedding_state gauge
+            \\pulse_breaker_embedding_state {d}
+            \\# HELP pulse_breaker_embedding_trips_total Times the embedding breaker tripped open
+            \\# TYPE pulse_breaker_embedding_trips_total counter
+            \\pulse_breaker_embedding_trips_total {d}
+            \\# HELP pulse_breaker_embedding_skipped_total Embed calls refused while the embedding breaker was open
+            \\# TYPE pulse_breaker_embedding_skipped_total counter
+            \\pulse_breaker_embedding_skipped_total {d}
+            \\
         , .{
             self.breaker_redis_state,
             self.breaker_redis_trips,

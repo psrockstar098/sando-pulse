@@ -890,10 +890,49 @@ direct order 2026-11-13), real data only, docs in the same commits.
 - Verified: `zig build` passes; **249/249 tests pass** (5 new
   breaker unit tests: closed/success-reset, threshold trip +
   skipped count, cooldown trial + close, half-open re-trip,
-  threshold-1). Live smoke still to run in the verification pass
-  (breaker trip on a dead Redis + admin-config endpoint probes).
-  Note: the test binary exits 1 with "36 errors were logged" even
-  though all 249 tests pass — whether that is pre-existing is
-  being checked against the 6.9 tree (worktree verification was
-  interrupted by a VM restart; redo it before reporting 6.11
-  complete).
+  threshold-1). Test-binary exit code is 1 with "36 errors were
+  logged" even though all tests pass — PROVEN pre-existing: the
+  6.9 tree (244 tests) exits 1 with the same 36 logged errors
+  (worktree run at e9ba31e). It is the Zig test runner failing
+  the run on error-level logs from failure-path tests, not a
+  6.11 regression.
+- Live smoke (Postgres + Redis, port 9010): embedding breaker
+  tripped open after 2 ingest failures against a dead provider
+  URL (state 2, trips 1); queries kept serving 200 via lexical
+  fallback (path fast, ~85 ms); cooldown trial re-tripped
+  (trips 2, skipped 2). Admin config: valid set applied
+  (`l1_ttl_s` 600 visible in /v1/autotune) + multi-key set;
+  unknown key / out-of-range / non-integer / no-key / empty body
+  all rejected with the right 400/401 codes. Redis breaker:
+  tripped on Redis kill (state 2, trips 1, skipped 5 —
+  reconciles exactly); queries kept serving 200 compute-fresh.
+- Smoke-found fixes (same section, follow-up commit): (1) the
+  Redis client holds one persistent stream with NO reconnect,
+  so the breaker could never observe a successful trial after
+  Redis recovered — first fix attempt (close + replace the
+  pointer) CRASHED the server: the usage tracker holds the same
+  pointer, and its next write hit the closed fd — Zig panics on
+  BADF (programmer-bug panic, not catchable). Correct fix:
+  connect FIRST, then close the old stream and overwrite the
+  client struct IN PLACE, so every holder (L2, usage tracker,
+  event-bus sink) sees the fresh connection at once; a failed
+  connect leaves the old client untouched. Re-smoked: after
+  Redis restart + cooldown, trial reconnected ("redis
+  reconnected" in the log), breaker closed (state 0, trips
+  stayed 1), and a fresh-L1 server served the same query as
+  `instant l2_hit` — the full cycle proven end-to-end. (2) The
+  breaker metrics rendered with a literal `\\` prefix on every
+  line — the format-string lines were written with 4 leading
+  backslashes instead of 2; fixed to match the other blocks
+  (verified with od: `# HELP pulse_breaker_redis_state` clean).
+  (3) Admin-config unknown-key check now runs BEFORE the
+  value-type check, so an unknown key reports `unknown_setting`
+  even when its value is also the wrong type. (4) `pulse
+  maintenance` logs "maintenance: ANALYZE done"; `pulse audit`
+  shows `[PASS] indexes: 42 indexes, 23 never scanned (...);
+  documents last ANALYZE: 2026-11-13 16:01:34` (8 pass, 2 warn
+  — TLS + Redis maxmemory, both expected in dev — 0 fail).
+  Honest limit: the embedding breaker's live CLOSE was not
+  proven (no working external provider exists to succeed a
+  trial call); the close logic is the same code path as the
+  Redis breaker (proven live) plus unit tests.
