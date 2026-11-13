@@ -47,11 +47,14 @@ pkgs = sorted({l.strip() for l in out.splitlines()
 # version is a no-op; upgrading one fixes the skew.
 needed = pkgs
 specs = []
+skipped = []
 for pkg in needed:
     pol = subprocess.run(["apt-cache", "policy", pkg],
                          capture_output=True, text=True).stdout
-    versions, cur = [], None
+    versions, cur, candidate = [], None, None
     for line in pol.splitlines():
+        if line.strip().startswith("Candidate:"):
+            candidate = line.strip().split(None, 1)[1]
         m = re.match(r"\s*\**\s*(\S+)\s+\d+\s*$", line)
         if m and m.group(1) not in ("Installed:", "Candidate:"):
             cur = m.group(1)
@@ -61,11 +64,24 @@ for pkg in needed:
             cur = None
         elif cur and "/var/lib/dpkg/status" in line:
             cur = None
-    if not versions:
-        raise SystemExit(f"no archive version for {pkg}")
-    specs.append(f"{pkg}={versions[0]}")
+    if versions:
+        specs.append(f"{pkg}={versions[0]}")
+    elif candidate and candidate != "(none)":
+        # No archive entry found (e.g. the host's apt lists lack this
+        # package's source) but a candidate exists in the lists: use it.
+        print(f"  WARN {pkg}: no archive version, using candidate {candidate}")
+        specs.append(f"{pkg}={candidate}")
+    else:
+        # Installed-only on this host (no archive entry, no candidate):
+        # the version already ships in the ubuntu:24.04 base image, so
+        # the dependency is satisfied there and no .deb is needed.
+        # Record it loudly — if dpkg -i later complains about this
+        # package, the skip is the first suspect.
+        print(f"  SKIP {pkg}: installed-only, no archive version, no candidate")
+        print(f"    policy output: {pol!r}")
+        skipped.append(pkg)
 open(f"{aio}/download-specs.txt", "w").write("\n".join(specs))
-print(f"  {len(specs)} packages")
+print(f"  {len(specs)} packages, {len(skipped)} skipped: {skipped}")
 EOF
 cd "$AIO/debs"
 rm -f ./*.deb
