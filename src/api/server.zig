@@ -205,28 +205,56 @@ pub const Server = struct {
         return reader.readAllocAll(arena, @intCast(len));
     }
 
+    /// Captured request-head values, owned by the per-request arena.
+    /// std.http.Server INVALIDATES head/head_buffer pointers once the
+    /// body stream is initialized (readBody), so everything the request
+    /// needs from the head is copied here at the top of handleRequest.
+    /// Nothing below may touch req.head.* or req.head_buffer after a
+    /// readBody call — doing so reads freed memory and crashes (seen
+    /// 2026-11-13: GPF in auditCall's pathOf on the query success path,
+    /// and the same latent bug in the Facebook webhook signature read).
+    const HeadCapture = struct {
+        path: []const u8,
+        query: ?[]const u8,
+        method: std.http.Method,
+        auth_header: ?[]const u8,
+        consumer_header: ?[]const u8,
+        webhook_sig: ?[]const u8,
+    };
+
+    fn captureHead(req: *std.http.Server.Request, alloc: std.mem.Allocator) !HeadCapture {
+        const target = req.head.target;
+        return .{
+            .path = try alloc.dupe(u8, pathOf(target)),
+            .query = if (queryOf(target)) |q| try alloc.dupe(u8, q) else null,
+            .method = req.head.method,
+            .auth_header = if (headerValue(req.head_buffer, "authorization")) |h| try alloc.dupe(u8, h) else null,
+            .consumer_header = if (headerValue(req.head_buffer, "x-pulse-consumer")) |h| try alloc.dupe(u8, h) else null,
+            .webhook_sig = if (headerValue(req.head_buffer, "x-hub-signature-256")) |h| try alloc.dupe(u8, h) else null,
+        };
+    }
+
     /// The consumer named by X-Pulse-Consumer, or "default" when the
     /// header is absent. Callers only reach this after checkAuthAndRate
     /// validated the name.
-    fn consumerOf(req: *std.http.Server.Request) []const u8 {
-        return headerValue(req.head_buffer, "x-pulse-consumer") orelse usage.default_consumer_name;
+    fn consumerOf(head: HeadCapture) []const u8 {
+        return head.consumer_header orelse usage.default_consumer_name;
     }
 
-    fn keyFpOf(self: *Server, req: *std.http.Server.Request, arena: std.mem.Allocator) []const u8 {
-        _ = self;
-        const presented = auth.presentedToken(headerValue(req.head_buffer, "authorization"));
+    fn keyFpOf(head: HeadCapture, arena: std.mem.Allocator) []const u8 {
+        const presented = auth.presentedToken(head.auth_header);
         return auditlog.keyFingerprint(arena, presented) catch "anonymous";
     }
 
     /// Write one audit record for this request (best-effort, never fails
     /// the request). `status` is the final HTTP status.
-    fn auditCall(self: *Server, req: *std.http.Server.Request, arena: std.mem.Allocator, req_id: []const u8, status: u16) void {
+    fn auditCall(self: *Server, head: HeadCapture, arena: std.mem.Allocator, req_id: []const u8, status: u16) void {
         self.audit_sink.record(.{
             .ts = timex.nowSeconds(self.io),
-            .consumer = consumerOf(req),
-            .key_fingerprint = keyFpOf(self, req, arena),
-            .route = pathOf(req.head.target),
-            .method = @tagName(req.head.method),
+            .consumer = consumerOf(head),
+            .key_fingerprint = keyFpOf(head, arena),
+            .route = head.path,
+            .method = @tagName(head.method),
             .status = status,
             .request_id = req_id,
         });
@@ -236,24 +264,39 @@ pub const Server = struct {
     /// daily usage. Best-effort: a tracking failure never fails the
     /// request (the quota check reads the same counter, so a lost
     /// increment only ever under-counts).
-    fn recordUsage(self: *Server, req: *std.http.Server.Request, kind: usage.UsageKind) void {
+    fn recordUsage(self: *Server, head: HeadCapture, kind: usage.UsageKind) void {
         const day = usage.dayOf(self.alloc, timex.nowSeconds(self.io)) catch return;
         defer self.alloc.free(day);
-        self.usage_tracker.record(consumerOf(req), kind, day) catch {};
+        self.usage_tracker.record(consumerOf(head), kind, day) catch {};
     }
 
     /// Auth + scope + rate limit + quota gate (Roadmap 5.3).
     /// `kind` is the usage kind being gated, or null for the admin
     /// endpoint (/v1/usage), which is rate-limited but not quota-counted.
     /// Denials are audit-recorded with their status before responding.
-    fn checkAuthAndRate(self: *Server, req: *std.http.Server.Request, arena: std.mem.Allocator, req_id: []const u8, kind: ?usage.UsageKind) bool {
-        const auth_header = headerValue(req.head_buffer, "authorization");
+    /// Check order: auth first, then consumer/scope — a missing key must
+    /// report auth_required, not unknown_consumer.
+    fn checkAuthAndRate(self: *Server, req: *std.http.Server.Request, head: HeadCapture, arena: std.mem.Allocator, req_id: []const u8, kind: ?usage.UsageKind) bool {
+        const auth_header = head.auth_header;
+        switch (auth.authenticateRotated(self.cfg.api_key, self.cfg.api_key_previous, auth_header)) {
+            .open, .ok => {},
+            .missing => {
+                self.auditCall(head, arena, req_id, 401);
+                self.respondError(req, arena, req_id, .unauthorized, "auth_required", "Missing Authorization: Bearer <api-key> header");
+                return false;
+            },
+            .invalid => {
+                self.auditCall(head, arena, req_id, 401);
+                self.respondError(req, arena, req_id, .unauthorized, "auth_invalid", "Invalid API key");
+                return false;
+            },
+        }
         // Consumer resolution: unknown names and malformed names are
         // denials, not defaults — a typo'd consumer must not silently
         // spend the default consumer's quota.
-        const consumer_name = consumerOf(req);
+        const consumer_name = consumerOf(head);
         if (!usage.validConsumerName(consumer_name)) {
-            self.auditCall(req, arena, req_id, 400);
+            self.auditCall(head, arena, req_id, 400);
             self.respondError(req, arena, req_id, .bad_request, "invalid_consumer", "X-Pulse-Consumer must be 1-64 chars of [a-z0-9_-]");
             return false;
         }
@@ -267,7 +310,7 @@ pub const Server = struct {
         else if (usage.findConsumer(self.cfg.consumers, consumer_name)) |c|
             c
         else {
-            self.auditCall(req, arena, req_id, 401);
+            self.auditCall(head, arena, req_id, 401);
             self.respondError(req, arena, req_id, .unauthorized, "unknown_consumer", "No such consumer is registered");
             return false;
         };
@@ -276,39 +319,26 @@ pub const Server = struct {
             .ingest => .ingest,
         } else .admin;
         if (!usage.consumerHasScope(consumer, needed)) {
-            self.auditCall(req, arena, req_id, 403);
+            self.auditCall(head, arena, req_id, 403);
             self.respondError(req, arena, req_id, .forbidden, "forbidden_scope", "This consumer does not hold the scope for this endpoint");
             return false;
-        }
-        switch (auth.authenticateRotated(self.cfg.api_key, self.cfg.api_key_previous, auth_header)) {
-            .open, .ok => {},
-            .missing => {
-                self.auditCall(req, arena, req_id, 401);
-                self.respondError(req, arena, req_id, .unauthorized, "auth_required", "Missing Authorization: Bearer <api-key> header");
-                return false;
-            },
-            .invalid => {
-                self.auditCall(req, arena, req_id, 401);
-                self.respondError(req, arena, req_id, .unauthorized, "auth_invalid", "Invalid API key");
-                return false;
-            },
         }
         // Rate-limit bucket: the presented token (each key gets its own
         // budget during rotation); "anonymous" in open dev mode.
         const key = auth.presentedToken(auth_header) orelse "anonymous";
         const check = self.limiter.check(key, timex.nowMillis(self.io)) catch {
-            self.auditCall(req, arena, req_id, 429);
+            self.auditCall(head, arena, req_id, 429);
             self.respondError(req, arena, req_id, .too_many_requests, "rate_limited", "Rate limit exceeded");
             return false;
         };
         if (!check.allowed) {
             const body = query_json.buildErrorResponse(arena, req_id, "rate_limited", "Rate limit exceeded") catch {
-                self.auditCall(req, arena, req_id, 429);
+                self.auditCall(head, arena, req_id, 429);
                 self.respondError(req, arena, req_id, .too_many_requests, "rate_limited", "Rate limit exceeded");
                 return false;
             };
             self.metrics.observeRequest(429, 0);
-            self.auditCall(req, arena, req_id, 429);
+            self.auditCall(head, arena, req_id, 429);
             req.respond(body, .{
                 .status = .too_many_requests,
                 .extra_headers = &.{
@@ -326,13 +356,13 @@ pub const Server = struct {
         if (kind) |k| {
             const effective = if (consumer.quota_per_day > 0) consumer.quota_per_day else self.cfg.rate_limit_per_day;
             const day = usage.dayOf(arena, timex.nowSeconds(self.io)) catch {
-                self.auditCall(req, arena, req_id, 429);
+                self.auditCall(head, arena, req_id, 429);
                 self.respondError(req, arena, req_id, .too_many_requests, "quota_exceeded", "Daily quota exceeded");
                 return false;
             };
             const used = self.usage_tracker.count(arena, consumer.name, k, day);
             if (used >= effective) {
-                self.auditCall(req, arena, req_id, 429);
+                self.auditCall(head, arena, req_id, 429);
                 self.respondError(req, arena, req_id, .too_many_requests, "quota_exceeded", "Daily quota exceeded for this consumer");
                 return false;
             }
@@ -369,8 +399,12 @@ pub const Server = struct {
         defer arena.deinit();
         const alloc = arena.allocator();
         const req_id = try newRequestId(alloc, self.io);
-        const method = req.head.method;
-        const path = pathOf(req.head.target);
+        // Capture the head BEFORE any readBody call: std.http.Server
+        // invalidates head/head_buffer pointers once the body stream is
+        // initialized. Everything below uses `head`, never req.head.*.
+        const head = try captureHead(req, alloc);
+        const method = head.method;
+        const path = head.path;
 
         if (method == .GET and std.mem.eql(u8, path, "/v1/health")) {
             const body = try query_json.buildHealthResponse(alloc, req_id, self.repo.countDocuments(), sources.enabledCount(), self.store_name, self.cfg.country);
@@ -392,7 +426,7 @@ pub const Server = struct {
                 // Detail: /v1/events?id=<event_id> — the event plus
                 // its documents, corroboration, status, conflicts and
                 // timeline (4.1).
-                if (queryParam(queryOf(req.head.target), "id")) |ev_id| {
+                if (queryParam(head.query, "id")) |ev_id| {
                     const ev = (k.getEvent(alloc, ev_id) catch {
                         self.respondError(req, alloc, req_id, .internal_server_error, "event_failed", "Failed to load event");
                         return;
@@ -423,7 +457,7 @@ pub const Server = struct {
         }
 
         if (method == .GET and std.mem.eql(u8, path, "/v1/trends")) {
-            const q = queryOf(req.head.target);
+            const q = head.query;
             const window_s = trending.parseWindow(queryParam(q, "window")) orelse {
                 self.respondError(req, alloc, req_id, .bad_request, "invalid_window", "window must be 24h, 7d, or 30d");
                 return;
@@ -544,7 +578,7 @@ pub const Server = struct {
 
         if (method == .GET and std.mem.eql(u8, path, "/v1/locations")) {
             if (self.knowledge) |k| {
-                const q = queryOf(req.head.target);
+                const q = head.query;
                 const kind = queryParam(q, "kind");
                 var limit: usize = 100;
                 if (queryParam(q, "limit")) |ls| {
@@ -592,7 +626,7 @@ pub const Server = struct {
         }
 
         if (method == .POST and std.mem.eql(u8, path, "/v1/query")) {
-            if (!self.checkAuthAndRate(req, alloc, req_id, .query)) return;
+            if (!self.checkAuthAndRate(req, head, alloc, req_id, .query)) return;
             const body = readBody(req, alloc) catch {
                 self.respondError(req, alloc, req_id, .bad_request, "invalid_request", "Request body too large or unreadable");
                 return;
@@ -622,8 +656,8 @@ pub const Server = struct {
                                 self.metrics.observeCacheHit();
                                 self.metrics.observeQuery(cachedSufficient(stamped_body) orelse true);
                                 self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
-                                self.recordUsage(req, .query);
-                                self.auditCall(req, alloc, req_id, 200);
+                                self.recordUsage(head, .query);
+                                self.auditCall(head, alloc, req_id, 200);
                                 try respondJsonCached(req, .ok, stamped_body, req_id, true);
                                 return;
                             }
@@ -661,14 +695,14 @@ pub const Server = struct {
                 }
             }
             self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
-            self.recordUsage(req, .query);
-            self.auditCall(req, alloc, req_id, 200);
+            self.recordUsage(head, .query);
+            self.auditCall(head, alloc, req_id, 200);
             try respondJsonCached(req, .ok, resp, req_id, false);
             return;
         }
 
         if (method == .POST and std.mem.eql(u8, path, "/v1/ingest")) {
-            if (!self.checkAuthAndRate(req, alloc, req_id, .ingest)) return;
+            if (!self.checkAuthAndRate(req, head, alloc, req_id, .ingest)) return;
             const body = readBody(req, alloc) catch {
                 self.respondError(req, alloc, req_id, .bad_request, "invalid_request", "Request body too large or unreadable");
                 return;
@@ -753,8 +787,8 @@ pub const Server = struct {
             self.metrics.setDocumentsIndexed(@intCast(self.repo.countDocuments()));
             const resp = try std.fmt.allocPrint(alloc, "{{\"id\":\"{s}\",\"source_id\":\"{s}\",\"request_id\":\"{s}\"}}", .{ doc.id, doc.source_id, req_id });
             self.metrics.observeRequest(201, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
-            self.recordUsage(req, .ingest);
-            self.auditCall(req, alloc, req_id, 201);
+            self.recordUsage(head, .ingest);
+            self.auditCall(head, alloc, req_id, 201);
             try respondJson(req, .created, resp, req_id);
             return;
         }
@@ -763,13 +797,13 @@ pub const Server = struct {
         // (Roadmap 5.3). Admin scope: consumers registered without the
         // admin scope cannot read anyone's usage, including their own.
         if (method == .GET and std.mem.eql(u8, path, "/v1/usage")) {
-            if (!self.checkAuthAndRate(req, alloc, req_id, null)) return;
+            if (!self.checkAuthAndRate(req, head, alloc, req_id, null)) return;
             const now = timex.nowSeconds(self.io);
             const day = usage.dayOf(alloc, now) catch {
                 self.respondError(req, alloc, req_id, .internal_server_error, "usage_failed", "Failed to compute the current day");
                 return;
             };
-            const filter = queryParam(queryOf(req.head.target), "consumer");
+            const filter = queryParam(head.query, "consumer");
             var rows: std.ArrayList(usage.UsageRow) = .empty;
             if (self.cfg.consumers.len == 0) {
                 const q = self.usage_tracker.count(alloc, usage.default_consumer_name, .query, day);
@@ -809,7 +843,7 @@ pub const Server = struct {
                 return;
             };
             self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
-            self.auditCall(req, alloc, req_id, 200);
+            self.auditCall(head, alloc, req_id, 200);
             try respondJson(req, .ok, body, req_id);
             return;
         }
@@ -835,7 +869,7 @@ pub const Server = struct {
                 self.respondError(req, alloc, req_id, .service_unavailable, "facebook_unavailable", "Facebook connector unavailable");
                 return;
             };
-            const challenge = fb.handleWebhookVerification(queryOf(req.head.target)) orelse {
+            const challenge = fb.handleWebhookVerification(head.query) orelse {
                 self.respondError(req, alloc, req_id, .forbidden, "verification_failed", "Webhook verification failed (mode/token)");
                 return;
             };
@@ -868,7 +902,7 @@ pub const Server = struct {
                 self.respondError(req, alloc, req_id, .bad_request, "invalid_request", "Request body too large or unreadable");
                 return;
             };
-            const sig = headerValue(req.head_buffer, "x-hub-signature-256");
+            const sig = head.webhook_sig;
             if (!fb.verifyWebhookSignature(body, sig)) {
                 self.respondError(req, alloc, req_id, .unauthorized, "bad_signature", "Webhook signature verification failed");
                 return;
