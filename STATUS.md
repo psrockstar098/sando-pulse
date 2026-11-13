@@ -778,3 +778,44 @@ direct order 2026-11-13), real data only, docs in the same commits.
   rate limit tripped during the 105-query run — the reset probe
   needed `PULSE_RATE_LIMIT_PER_MINUTE=1000`; the no-key reset
   correctly returned `auth_required`.
+
+### 6.9 Horizontal scaling readiness — DONE (2026-11-13 ~17:00)
+
+- Statelessness contract (new section in `docs/SCALABILITY.md`):
+  the API is stateless except four per-instance caches, each safe
+  to lose — L1 (refills from the shared Redis L2), the in-memory
+  index (rebuilt from the store at boot + on epoch changes;
+  queries fall back to the store search until the build
+  finishes), the popular list (local `popular.json`, NOT shared
+  between instances — a new instance starts empty and unwarm
+  unless `PULSE_POPULAR_PATH` is on a shared volume), and the
+  auto-tuner values (each instance tunes from its own traffic;
+  reset is per instance). Shared state — Postgres, Redis, MinIO —
+  carries auth, rate limits, quotas, and audit, so scaling out
+  changes none of the guarantees.
+- Scale-out shape in `docker-compose.yml` (profile `scale`):
+  `api-2` (same image/command as `api`, no published port) +
+  `lb` (nginx:1.27-alpine, host 9080) fronting `api:9000` +
+  `api-2:9000` round-robin (`docker/nginx.conf`, new). In
+  production the LB takes port 9000 and the api services drop
+  their host mappings. Worker-N pattern documented: a third
+  worker is the `worker-2` block copied with a new
+  `PULSE_WORKER_ID`; the stream group splits the work.
+- Triggers documented, not built: Redis cluster (sustained
+  evictions + falling L2 hit ratio while the working set grows;
+  raise maxmemory first), Postgres partitioning (sustained
+  fast-path p95 above target with the DB as the measured
+  bottleneck; replica + prepared statements first; monthly
+  `documents` partitions only when those are exhausted),
+  multi-region (a second full stack; `PULSE_COUNTRY` already
+  scopes one country). Read-replica routing (R5.5, proof-only)
+  unchanged.
+- Honest limits: the shape is authored, not run — this VM cannot
+  run the compose stack (podman `--network none`), so the first
+  real `docker compose --profile scale up` on a Docker host is
+  the validation step. Open-source nginx has no active health
+  checks (a dead backend is skipped only after a failed request).
+  `docker-compose.yml` parses as YAML (verified); `nginx.conf`
+  is NOT syntax-checked here (no nginx on the VM).
+- Verified: `zig build` passes; 244/244 tests (no code changed in
+  this section — compose + docs only).

@@ -53,6 +53,64 @@ services:
       - pulse-net
     restart: unless-stopped
 
+  # Second API instance + load balancer (Roadmap 6.9): only with the
+  # `scale` profile. api-2 is api with no published port; lb (nginx)
+  # fronts both on host 9080. The API is stateless except L1 (see
+  # docs/SCALABILITY.md — statelessness contract), so either instance
+  # can serve any request; a query cached on api is not on api-2, but
+  # the shared Redis L2 covers it. Start with:
+  #   docker compose --profile scale up -d
+  # Then point clients at the LB (9080 here; in production give the LB
+  # port 9000 and drop the api services' host mappings).
+  api-2:
+    profiles: ["scale"]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: pulse-api:0.1.0
+    command: ["serve"]
+    environment:
+      PULSE_HOST: "0.0.0.0"
+      PULSE_PORT: "9000"
+      PULSE_API_KEY: <redacted>
+      PULSE_API_KEY_PREVIOUS: "${PULSE_API_KEY_PREVIOUS:-}"
+      PULSE_CONSUMERS: "${PULSE_CONSUMERS:-}"
+      PULSE_AUDIT_LOG: "${PULSE_AUDIT_LOG:-}"
+      PULSE_BEHIND_TLS_PROXY: "${PULSE_BEHIND_TLS_PROXY:-1}"
+      PULSE_LOG_LEVEL: "${PULSE_LOG_LEVEL:-info}"
+      DATABASE_URL: <redacted>
+      REDIS_URL: "redis://redis:6379"
+      MINIO_ENDPOINT: "http://minio:9000"
+      MINIO_ACCESS_KEY: "${MINIO_ACCESS_KEY:?set MINIO_ACCESS_KEY in .env}"
+      MINIO_SECRET_KEY: "${MINIO_SECRET_KEY:?set MINIO_SECRET_KEY in .env}"
+      MINIO_BUCKET: "pulse-raw"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    logging: *default-logging
+    networks:
+      - pulse-net
+    restart: unless-stopped
+
+  lb:
+    profiles: ["scale"]
+    image: nginx:1.27-alpine
+    ports:
+      - "9080:80"
+    volumes:
+      - ./docker/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api
+      - api-2
+    logging: *default-logging
+    networks:
+      - pulse-net
+    restart: unless-stopped
+
   worker:
     image: pulse-api:0.1.0
     command: ["worker"]

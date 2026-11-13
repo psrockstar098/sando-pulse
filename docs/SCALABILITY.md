@@ -10,12 +10,81 @@ in what order, when each limit is actually hit.
 
 | Resource | Today | First limit hit |
 | -------- | ----- | --------------- |
-| API | 1 process, single-threaded request loop | CPU on concurrent queries |
+| API | 1 process, single-threaded request loop (+ 2nd instance + nginx LB via the `scale` profile, Roadmap 6.9) | CPU on concurrent queries |
 | Worker | 1 process (+ optional 2nd via the `scale` profile) | Ingest throughput |
 | Postgres | 1 primary, pool size 1 by default | Concurrent search reads |
 | Redis | 1 instance, 256 MB maxmemory, allkeys-lru | Cache + stream volume |
 | Search | Sequential scan over documents (no vector index) | ~10k+ documents |
 | Object storage | MinIO (or none) on the same host | Raw archive volume |
+
+## Statelessness contract (Roadmap 6.9)
+
+The API is stateless **except for four per-instance caches**, each
+safe to lose. Any instance can serve any request; nothing a client
+does depends on landing on the same instance twice.
+
+| State | Where | Lost when | Consequence |
+| ----- | ----- | --------- | ----------- |
+| L1 in-process cache (6.2) | Per API instance | Instance restarts / new instance | Cold L1: the first asks miss and compute fresh; the shared Redis L2 still serves them. Bounded by `PULSE_L1_MAX_ENTRIES` / `PULSE_L1_MAX_BYTES`. |
+| In-memory index (6.3/6.5) | Per API instance | Instance restarts / new instance | Rebuilt from the store at boot (`memindex built` log line; 0 ms at 3 docs — re-measure at real scale) and on Redis epoch changes. Until the build finishes, queries fall back to the store search. |
+| Popular list (6.4) | Per API instance, local `popular.json` | Instance restarts without the file / new instance | A new instance starts with an empty tracker and no warming until it has seen queries. The file is NOT shared between instances — if warming matters on a scaled-out deploy, put `PULSE_POPULAR_PATH` on a shared volume. |
+| Auto-tuner values (6.10) | Per API instance | Instance restarts | Each instance tunes its own knobs from its own traffic; reset is per instance (`POST /v1/admin/autotune/reset`) or a restart. There is no shared tuning state. |
+
+Shared state (the contract — every instance reads/writes the same):
+Postgres (documents, knowledge, audit, usage counters), Redis (L2
+query cache, cache epochs, Streams event bus, usage counters),
+MinIO (raw feed archives). A request's auth, rate limit, quota,
+and audit trail are all enforced against this shared state, so
+scaling the API out changes none of the guarantees.
+
+### API scale-out shape (Roadmap 6.9)
+
+`docker compose --profile scale up -d` starts a second API
+instance (`api-2`, no published port) plus an nginx load balancer
+(`lb`, host port 9080) in front of `api:9000` + `api-2:9000`
+(round-robin, see `docker/nginx.conf`). Point clients at the LB;
+in production give the LB port 9000 and drop the api services'
+host port mappings. The shape is authored, not run: this VM cannot
+run the compose stack (podman `--network none`), so the first real
+`docker compose --profile scale up` on a Docker host is the
+validation step. Honest limit: open-source nginx has no active
+health checks — a dead backend is skipped only after a failed
+request, not proactively.
+
+### Workers — N workers (Roadmap 6.9)
+
+The `scale` profile already ships `worker-2` (distinct
+`PULSE_WORKER_ID`, separate Redis Streams consumer). A third worker
+is the same block copied with `PULSE_WORKER_ID: "worker-3"` — no
+code change; the stream group splits the realtime work and the
+ingest loop is idempotent (re-runs are safe). See "Workers —
+horizontal scaling" below.
+
+### When to cluster / partition (triggers, not builds)
+
+Redis clustering and Postgres partitioning are **documented
+triggers, not built**: do not build them until measured demand
+justifies it.
+
+- **Redis cluster:** when the single instance's 256 MB maxmemory
+  is the binding constraint — watch the eviction rate and the L2
+  hit rate in `/metrics`: sustained evictions with a falling L2
+  hit ratio while the working set keeps growing means the cache no
+  longer fits one node. First step is raising `maxmemory` on a
+  bigger host, not clustering; cluster only when one host's memory
+  cannot hold the working set.
+- **Postgres partitioning:** when one primary cannot keep up —
+  sustained fast-path p95 above target with the database as the
+  measured bottleneck (slow-query log / `pg_stat_statements`),
+  or connection-pool saturation under load. First steps are the
+  read replica (`PULSE_DATABASE_REPLICA_URL`, already built) and
+  the prepared-statement work (6.8); partition by time (monthly
+  `documents` partitions) only when those are exhausted.
+- **Multi-region:** `PULSE_COUNTRY` already scopes the deployment
+  to one country; a second region is a second full stack (API +
+  worker + Postgres + Redis) with Postgres logical replication
+  between them. Not built; the statelessness contract above is
+  what makes it possible at all.
 
 ## Extension points (already built)
 
