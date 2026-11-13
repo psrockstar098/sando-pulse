@@ -564,3 +564,35 @@ direct order 2026-11-13), real data only, docs in the same commits.
   scale — 0 ms for 3 docs); a timestamp-filtered incremental refresh
   needs a `scanDocuments(after_ts)` extension and is recorded as a
   future optimization, not done here.
+
+### 6.6 Parallel query execution (fan-out) — DONE (2026-11-13 ~15:15)
+
+- `src/engine/fanout.zig` (new): generic fan-out. Each task gets its
+  own page-allocator-backed arena, so no allocator is shared across
+  threads. `Fanout.start` spawns one thread per task (spawn failure
+  runs the task inline in its own arena); `wait(timeout_ms)` polls
+  until all tasks finish or the deadline passes; `joinAll` joins the
+  stragglers AFTER the response is sent. `runSequential` is the
+  fallback when parallel start fails or the store is not thread-safe.
+- Wired into POST /v1/query: locations + statistics from the knowledge
+  store run concurrently with the news search. Parallel only when the
+  store is Postgres (its knowledge store is mutex-guarded) and
+  `PULSE_PARALLEL_QUERY=1` (default); the memory store runs the same
+  tasks inline. No entities in the plan = no fan-out.
+- Response gains `locations` (max 10, matching the query's counties/
+  cities), `statistics` (max 10, key names a query topic), and
+  `fanout_complete` (false when a backend was still running at the
+  deadline — partial results, labelled, never silently stale).
+- Verified: `zig build` passes; 231/231 tests (3 new fanout unit tests:
+  sequential, parallel, deadline-expiry + post-response join; 1 new
+  locationMatches test). Live smoke test: "news in Lofa county" ->
+  locations [Lofa/county], fanout_complete true; "zebraquux" (no
+  entities) -> empty enrichment, fanout_complete true; "news in
+  Testville" -> empty (correct: the entity extractor does not know
+  Testville, so no fan-out ran). The fanout deadline path (straggler)
+  is unit-tested with a 50 ms sleeper vs a 5 ms deadline; a live
+  straggler was not forced (the knowledge lookups are single-digit ms).
+- Honest note: the test DB holds only 15 counties + Testville (the
+  full 166-location R3 seed was wiped with the DB recreations), so the
+  Monrovia city match could not be verified live — the county match
+  (Lofa) and the unit test cover the same code path.

@@ -182,6 +182,18 @@ const TimelineDayJson = struct {
     event_titles: []const []const u8,
 };
 
+/// Fan-out enrichment attached to a query response (Roadmap 6.6):
+/// knowledge-store locations and statistics that match the query's
+/// places/topics, fetched concurrently with the news search.
+/// `fanout_complete` is false when a backend was still running when the
+/// deadline passed — its section is then empty (partial results,
+/// labelled, never silently stale).
+pub const Enrichment = struct {
+    locations: []const knowledge.LocationRow = &.{},
+    statistics: []const knowledge.StatisticRow = &.{},
+    fanout_complete: bool = true,
+};
+
 pub fn buildQueryResponse(
     alloc: std.mem.Allocator,
     req_id: []const u8,
@@ -197,6 +209,7 @@ pub fn buildQueryResponse(
     latency_ms: f64,
     /// Why the router chose this path.
     routing_reason: []const u8,
+    enrich: Enrichment,
 ) ![]u8 {
     var results: std.ArrayList(ResultJson) = .empty;
     const shown = @min(outcome.results.len, 10);
@@ -248,6 +261,9 @@ pub fn buildQueryResponse(
         .path = path,
         .latency_ms = latency_ms,
         .routing_reason = routing_reason,
+        .locations = enrich.locations,
+        .statistics = enrich.statistics,
+        .fanout_complete = enrich.fanout_complete,
         .results = results.items,
         .events = events.items,
         .timeline = timeline.items,
@@ -604,12 +620,12 @@ test "buildQueryResponse carries path, latency_ms and routing_reason" {
         .timeline = &.{},
     };
     // The live shape: real path + measured latency.
-    const live = try buildQueryResponse(alloc, "req-1", "fuel", p, outcome, 5, 1794477600, "fast", 12.345678, "simple_indexed");
+    const live = try buildQueryResponse(alloc, "req-1", "fuel", p, outcome, 5, 1794477600, "fast", 12.345678, "simple_indexed", .{});
     try std.testing.expect(std.mem.indexOf(u8, live, "\"path\":\"fast\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, live, "\"latency_ms\":12.345678") != null);
     try std.testing.expect(std.mem.indexOf(u8, live, "\"routing_reason\":\"simple_indexed\"") != null);
     // The storable shape: empty markers stampServed expects.
-    const stored = try buildQueryResponse(alloc, "", "fuel", p, outcome, 5, 1794477600, "", 0, "");
+    const stored = try buildQueryResponse(alloc, "", "fuel", p, outcome, 5, 1794477600, "", 0, "", .{});
     try std.testing.expect(std.mem.indexOf(u8, stored, "\"path\":\"\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, stored, "\"latency_ms\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, stored, "\"routing_reason\":\"\"") != null);

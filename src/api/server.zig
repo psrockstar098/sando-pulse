@@ -46,7 +46,69 @@ const cache = @import("cache.zig");
 const l1cache = @import("l1cache.zig");
 const memindex = @import("../engine/memindex.zig");
 const router = @import("../engine/router.zig");
+const fanout = @import("../engine/fanout.zig");
 const usage = @import("usage.zig");
+
+/// Fan-out task: knowledge-store locations matching the query's
+/// counties/cities (Roadmap 6.6). Runs in a worker thread when the
+/// store is Postgres, inline otherwise.
+const LocationsTask = struct {
+    ks: knowledge.KnowledgeStore,
+    counties: []const []const u8,
+    cities: []const []const u8,
+    out: []knowledge.LocationRow = &.{},
+
+    fn run(ctx: *anyopaque, alloc: std.mem.Allocator) anyerror!void {
+        const t: *LocationsTask = @ptrCast(@alignCast(ctx));
+        const all = try t.ks.listLocations(alloc, null, 500);
+        var filtered: std.ArrayList(knowledge.LocationRow) = .empty;
+        for (all) |loc| {
+            if (filtered.items.len >= 10) break;
+            if (locationMatches(loc, t.counties, t.cities)) try filtered.append(alloc, loc);
+        }
+        t.out = try filtered.toOwnedSlice(alloc);
+    }
+};
+
+fn locationMatches(loc: knowledge.LocationRow, counties: []const []const u8, cities: []const []const u8) bool {
+    for (counties) |c| {
+        if (std.ascii.eqlIgnoreCase(loc.name, c)) return true;
+        if (loc.county) |county| {
+            if (std.ascii.eqlIgnoreCase(county, c)) return true;
+        }
+    }
+    for (cities) |city| {
+        if (std.ascii.eqlIgnoreCase(loc.name, city)) return true;
+    }
+    return false;
+}
+
+/// Fan-out task: knowledge-store statistics whose key names a query
+/// topic (Roadmap 6.6). The full stat-answer feature is Roadmap 7.2;
+/// this is the plumbing: concurrent fetch + merge.
+const StatisticsTask = struct {
+    ks: knowledge.KnowledgeStore,
+    topics: []const []const u8,
+    out: []knowledge.StatisticRow = &.{},
+
+    fn run(ctx: *anyopaque, alloc: std.mem.Allocator) anyerror!void {
+        const t: *StatisticsTask = @ptrCast(@alignCast(ctx));
+        const all = try t.ks.listStatistics(alloc);
+        var filtered: std.ArrayList(knowledge.StatisticRow) = .empty;
+        for (all) |stat| {
+            if (filtered.items.len >= 10) break;
+            const key_lower = try entities.lowerCopy(alloc, stat.key);
+            defer alloc.free(key_lower);
+            for (t.topics) |topic| {
+                if (std.mem.indexOf(u8, key_lower, topic) != null) {
+                    try filtered.append(alloc, stat);
+                    break;
+                }
+            }
+        }
+        t.out = try filtered.toOwnedSlice(alloc);
+    }
+};
 const auditlog = @import("auditlog.zig");
 const timex = @import("../common/time.zig");
 const query_json = @import("query.zig");
@@ -774,17 +836,51 @@ pub const Server = struct {
                     }
                 }
             }
+            // Parallel fan-out (Roadmap 6.6): locations + statistics from
+            // the knowledge store run concurrently with the news search
+            // below. Parallel only when the store is Postgres (its
+            // knowledge store is mutex-guarded); the memory store runs
+            // the same tasks inline. When PULSE_PARALLEL_QUERY=0 the
+            // tasks run inline too. No entities in the plan = nothing
+            // to enrich, so no fan-out at all.
+            var loc_task: ?LocationsTask = null;
+            var stat_task: ?StatisticsTask = null;
+            var fo: ?fanout.Fanout = null;
+            if ((p.counties.len > 0 or p.cities.len > 0 or p.topics.len > 0) and self.knowledge != null) {
+                loc_task = .{ .ks = self.knowledge.?, .counties = p.counties, .cities = p.cities };
+                stat_task = .{ .ks = self.knowledge.?, .topics = p.topics };
+                var tasks = [_]fanout.Task{
+                    .{ .name = "locations", .run = LocationsTask.run, .ctx = &loc_task.? },
+                    .{ .name = "statistics", .run = StatisticsTask.run, .ctx = &stat_task.? },
+                };
+                const parallel = self.cfg.parallel_query and std.mem.eql(u8, self.store_name, "postgres");
+                fo = fanout.Fanout.start(alloc, &tasks, parallel) catch null;
+                if (fo == null) fanout.runSequential(alloc, &tasks);
+            }
             const outcome = search.searchAndRank(alloc, self.repo, p, now, .{
                 .embedder = self.embedder,
                 .tz_offset_minutes = self.cfg.tz_offset_minutes,
                 .candidates = index_docs,
             }) catch {
+                if (fo) |*f| f.joinAll();
                 self.respondError(req, alloc, req_id, .internal_server_error, "search_failed", "Search failed");
                 return;
             };
+            // Fan-out merge (Roadmap 6.6): wait for the knowledge tasks
+            // until the deadline, then take whatever completed. A task
+            // still running leaves its section empty and
+            // fanout_complete false (partial results, labelled).
+            var enrich = query_json.Enrichment{};
+            if (fo) |*f| {
+                f.wait(self.cfg.fanout_timeout_ms);
+                enrich.fanout_complete = f.allDone();
+                if (f.completed("locations")) enrich.locations = loc_task.?.out;
+                if (f.completed("statistics")) enrich.statistics = stat_task.?.out;
+            }
             self.metrics.observeQuery(outcome.sufficient);
             const latency_ms = timex.latencyMsF64(query_start_ns, timex.nowNanos(self.io));
-            const resp = query_json.buildQueryResponse(alloc, req_id, qr.query, p, outcome, enabled.items.len, timex.nowSeconds(self.io), decision.path.name(), latency_ms, decision.reason) catch {
+            const resp = query_json.buildQueryResponse(alloc, req_id, qr.query, p, outcome, enabled.items.len, timex.nowSeconds(self.io), decision.path.name(), latency_ms, decision.reason, enrich) catch {
+                if (fo) |*f| f.joinAll();
                 self.respondError(req, alloc, req_id, .internal_server_error, "response_failed", "Failed to render response");
                 return;
             };
@@ -796,7 +892,7 @@ pub const Server = struct {
             // ingest can invalidate only the affected entries (6.2).
             if (l1_key != null or cache_key != null) {
                 if (resp.len <= cache.max_response_bytes) {
-                    const storable = query_json.buildQueryResponse(alloc, "", qr.query, p, outcome, enabled.items.len, timex.nowSeconds(self.io), "", 0, "") catch null;
+                    const storable = query_json.buildQueryResponse(alloc, "", qr.query, p, outcome, enabled.items.len, timex.nowSeconds(self.io), "", 0, "", enrich) catch null;
                     if (storable) |s| {
                         if (l1_key) |lk| {
                             var tags: std.ArrayList([]const u8) = .empty;
@@ -820,6 +916,9 @@ pub const Server = struct {
             self.recordUsage(head, .query);
             self.auditCall(head, alloc, req_id, 200);
             try respondJsonCached(req, .ok, resp, req_id, false);
+            // Post-response join (Roadmap 6.6): straggler fan-out threads
+            // finish here, after the response is sent — never before.
+            if (fo) |*f| f.joinAll();
             return;
         }
 
@@ -1087,6 +1186,19 @@ pub const Server = struct {
         self.respondError(req, alloc, req_id, .not_found, "not_found", "No such route");
     }
 };
+
+test "fanout locationMatches matches county name, place county, and city name" {
+    const loc_county = knowledge.LocationRow{ .name = "Lofa", .kind = "county" };
+    try std.testing.expect(locationMatches(loc_county, &.{"Lofa"}, &.{}));
+    try std.testing.expect(!locationMatches(loc_county, &.{"Nimba"}, &.{}));
+    const loc_city = knowledge.LocationRow{ .name = "Monrovia", .kind = "city", .county = "Montserrado" };
+    try std.testing.expect(locationMatches(loc_city, &.{"Montserrado"}, &.{}));
+    try std.testing.expect(locationMatches(loc_city, &.{}, &.{"Monrovia"}));
+    try std.testing.expect(!locationMatches(loc_city, &.{"Lofa"}, &.{"Gbarnga"}));
+    // Case-insensitive: the plan's entities are canonical-cased, the
+    // store's names are not always.
+    try std.testing.expect(locationMatches(loc_city, &.{}, &.{"monrovia"}));
+}
 
 test "queryParam parses kind and limit" {
     try std.testing.expectEqualStrings("city", Server.queryParam("kind=city&limit=20", "kind").?);
