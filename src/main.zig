@@ -24,6 +24,7 @@ const auditlog = @import("api/auditlog.zig");
 const loadtest = @import("cli/loadtest.zig");
 const audit = @import("cli/audit.zig");
 const backup_cli = @import("cli/backup.zig");
+const mock_sando = @import("cli/mock_sando.zig");
 const repository = @import("storage/repository.zig");
 const knowledge = @import("storage/knowledge.zig");
 const seed = @import("seed/liberia.zig");
@@ -149,6 +150,17 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, cmd, "mock-sando")) {
+        const question = cmd_arg orelse {
+            logging.err("mock-sando needs a question (mock-sando \"<question>\" [--county <name>] [--pulse-url <url>] [--api-key <key>])", &.{});
+            std.process.exit(2);
+        };
+        var flag_args: std.ArrayList([]const u8) = .empty;
+        try flag_args.append(alloc, question);
+        while (args_it.next()) |a| try flag_args.append(alloc, a);
+        std.process.exit(mock_sando.run(alloc, io, cfg, flag_args.items));
+    }
+
     if (std.mem.eql(u8, cmd, "status")) {
         printStatus(cfg);
         return;
@@ -166,8 +178,8 @@ pub fn main(init: std.process.Init) !void {
 
     const is_worker = std.mem.eql(u8, cmd, "worker");
     const once = is_worker and (cmd_arg != null and std.mem.eql(u8, cmd_arg.?, "--once"));
-    if (!std.mem.eql(u8, cmd, "serve") and !is_worker and !std.mem.eql(u8, cmd, "maintenance") and !std.mem.eql(u8, cmd, "seed") and !std.mem.eql(u8, cmd, "briefing") and !std.mem.eql(u8, cmd, "loadtest") and !std.mem.eql(u8, cmd, "audit") and !std.mem.eql(u8, cmd, "backup") and !std.mem.eql(u8, cmd, "restore")) {
-        logging.err("unknown command (serve | worker [--once] | migrate | status | keygen | maintenance | seed | briefing | loadtest | audit | backup | restore)", &.{});
+    if (!std.mem.eql(u8, cmd, "serve") and !is_worker and !std.mem.eql(u8, cmd, "maintenance") and !std.mem.eql(u8, cmd, "seed") and !std.mem.eql(u8, cmd, "briefing") and !std.mem.eql(u8, cmd, "loadtest") and !std.mem.eql(u8, cmd, "audit") and !std.mem.eql(u8, cmd, "backup") and !std.mem.eql(u8, cmd, "restore") and !std.mem.eql(u8, cmd, "mock-sando")) {
+        logging.err("unknown command (serve | worker [--once] | migrate | status | keygen | maintenance | seed | briefing | loadtest | audit | backup | restore | mock-sando)", &.{});
         std.process.exit(2);
     }
 

@@ -16,6 +16,9 @@ pub const Config = struct {
     /// Previous key, accepted alongside api_key during rotation
     /// (Roadmap 5.1). Remove it once clients have migrated.
     api_key_previous: ?[]const u8 = null,
+    /// Base URL of this Pulse instance, used by the mock-sando client
+    /// (Roadmap 5.2). Defaults to the local server.
+    pulse_url: []const u8 = "http://127.0.0.1:9000",
     /// Registered API consumers (Roadmap 5.3). Empty = a single implicit
     /// "default" consumer with all scopes and the global daily limit.
     consumers: []const usage.Consumer = &.{},
@@ -117,6 +120,9 @@ pub fn load(alloc: std.mem.Allocator, env_map: *std.process.Environ.Map) !Config
     }
     if (envOwned(alloc, env_map, "PULSE_API_KEY_PREVIOUS")) |v| {
         if (v.len > 0) cfg.api_key_previous = v;
+    }
+    if (envOwned(alloc, env_map, "PULSE_URL")) |v| {
+        if (v.len > 0) cfg.pulse_url = v;
     }
     if (envOwned(alloc, env_map, "PULSE_CONSUMERS")) |v| {
         if (v.len > 0) {
