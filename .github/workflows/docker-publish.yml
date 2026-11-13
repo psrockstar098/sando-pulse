@@ -47,8 +47,7 @@ jobs:
           ZIG: zig
           TAG: ${{ secrets.DOCKERHUB_USERNAME }}/sando-pulse:all-in-one-0.1.0
           ZIG_GLOBAL_CACHE_DIR: /tmp/pulse-zig-cache
-          BUILDER: docker
-          
+          BUILDER: docker          
         run: bash docker/all-in-one/build.sh
       - name: Tag latest and push
         run: |
