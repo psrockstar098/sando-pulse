@@ -481,3 +481,30 @@ direct order 2026-11-13), real data only, docs in the same commits.
 - Metrics (Roadmap 6.7 groundwork): `pulse_l1_cache_hits_total`, `pulse_l1_cache_misses_total`, `pulse_l1_cache_evictions_total`, `pulse_l1_cache_entries`, `pulse_l1_cache_bytes`, plus per-path counters/latency totals (wired in 6.1/6.7).
 - Verified: `zig build` passes; 212/212 tests (8 new L1 unit tests); live smoke test — first identical query `cached:false`, second `cached:true`, metrics `l1_cache_hits_total 1`, `l1_cache_misses_total 1`, entries 1, bytes 1347.
 - Honest note: cached bodies are rendered before the 6.1 `path`/`latency_ms` fields exist; 6.1 adds the stamp mechanism so a served-from-cache body reports the serving path, not the original one.
+
+### 6.3 In-memory inverted index — DONE (2026-11-13 ~14:35)
+
+- `src/engine/memindex.zig` (new): term -> postings (doc_id, score).
+  Tokenization matches the planner exactly (same delimiters, same
+  stopword list, lowercased); title terms weigh double; only the first
+  4000 bytes of a document's text are indexed. Bounded by term count
+  (default 50000, `PULSE_MEMINDEX_MAX_TERMS`), document count (default
+  100000, `PULSE_MEMINDEX_MAX_DOCS`), and bytes (default 64 MiB):
+  coldest terms evicted first, oldest documents first (sliding window
+  keeps the newest slice). Single-threaded, no locking (same rule as
+  L1); per-process — the worker holds its own index.
+- `Repository.getDocument` added to the vtable (Roadmap 6.3): memory
+  store (linear scan + dupe) and Postgres store (same SELECT as search,
+  `WHERE d.id = <escaped>`). The index resolves candidates through it.
+- `buildFromRepo`: paginated `scanDocuments` (1000/batch, moving cutoff
+  + seen-set dedupe), returns a measured report (docs seen/added/
+  evicted, terms, duration).
+- Verified: `zig build` passes; 218/218 tests (6 new memindex tests:
+  5 unit + 1 live against Postgres — build from the store, search for
+  a unique marker, resolve by id, plus a getDocument miss case).
+  Two bugs found by the suite and fixed: `init` caps were floored too
+  high (`@max(100/10/1024)` defeated small test caps — now `@max(1,
+  ...)`; production floors live in config), and two allocator leaks
+  (freq-map keys; term-map keys in `deinit`).
+- Not yet wired into the query path: the index is built and tested but
+  no endpoint reads it — that is 6.1/6.7 (router + Path A), next.

@@ -1232,6 +1232,7 @@ pub const PostgresStore = struct {
         .countDocuments = repoCountDocuments,
         .countBySource = repoCountBySource,
         .scanDocuments = repoScanDocuments,
+        .getDocument = repoGetDocument,
         .deleteDocuments = repoDeleteDocuments,
         .deinit = repoDeinit,
     };
@@ -1259,6 +1260,11 @@ pub const PostgresStore = struct {
     fn repoScanDocuments(ptr: *anyopaque, alloc: Allocator, before_ts: ?i64, limit: usize) anyerror![]types.Document {
         const self: *PostgresStore = @ptrCast(@alignCast(ptr));
         return self.scanDocuments(alloc, before_ts, limit);
+    }
+
+    fn repoGetDocument(ptr: *anyopaque, alloc: Allocator, id: []const u8) anyerror!?types.Document {
+        const self: *PostgresStore = @ptrCast(@alignCast(ptr));
+        return self.getDocument(alloc, id);
     }
 
     fn repoDeleteDocuments(ptr: *anyopaque, ids: []const []const u8) anyerror!usize {
@@ -1608,6 +1614,31 @@ pub const PostgresStore = struct {
             docs[i] = try documentFromRow(alloc, row);
         }
         return docs;
+    }
+
+    /// Fetch one document by its content id (Roadmap 6.3, in-memory
+    /// index resolution). Null when absent.
+    pub fn getDocument(self: *PostgresStore, alloc: Allocator, id: []const u8) !?types.Document {
+        const conn = try self.checkoutRead();
+        errdefer self.dropRead(conn);
+        defer self.checkinRead(conn);
+        const client = conn.client;
+        var sql: std.ArrayList(u8) = .empty;
+        defer sql.deinit(alloc);
+        try sql.appendSlice(alloc,
+            \\SELECT d.id, d.source_id, s.name, s.home_url, d.title, d.url, d.text,
+            \\  extract(epoch from d.published_at)::bigint,
+            \\  extract(epoch from d.fetched_at)::bigint,
+            \\  d.reliability, d.topics, d.content_hash,
+            \\  d.embedding::text, d.lat, d.lon, d.lang, d.summary
+            \\FROM documents d JOIN sources s ON s.id = d.source_id
+            \\ WHERE d.id =
+        );
+        try appendEscapedLiteral(&sql, alloc, id);
+        var res = try client.query(alloc, sql.items);
+        defer res.deinit(alloc);
+        if (res.rows.len == 0) return null;
+        return try documentFromRow(alloc, res.rows[0]);
     }
 
     /// Delete documents by id (Roadmap 3.5 retention). The 001

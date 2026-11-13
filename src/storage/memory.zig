@@ -33,6 +33,7 @@ pub const MemoryStore = struct {
         .countDocuments = countDocuments,
         .countBySource = countBySource,
         .scanDocuments = scanDocuments,
+        .getDocument = getDocument,
         .deleteDocuments = deleteDocuments,
         .deinit = deinitErased,
     };
@@ -169,6 +170,14 @@ pub const MemoryStore = struct {
             }
         }
         return out.toOwnedSlice(alloc);
+    }
+
+    fn getDocument(ptr: *anyopaque, alloc: std.mem.Allocator, id: []const u8) anyerror!?types.Document {
+        const self: *MemoryStore = @ptrCast(@alignCast(ptr));
+        for (self.docs.items) |doc| {
+            if (std.mem.eql(u8, doc.id, id)) return try dupeDocument(alloc, doc);
+        }
+        return null;
     }
 
     fn countDocuments(ptr: *anyopaque) usize {

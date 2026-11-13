@@ -25,6 +25,10 @@ pub const Repository = struct {
         /// a moving cutoff for large stores. All returned strings are owned
         /// by `alloc` (the caller's arena).
         scanDocuments: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, before_ts: ?i64, limit: usize) anyerror![]types.Document,
+        /// Fetch one document by its content id (Roadmap 6.3, in-memory
+        /// index resolution). Null when absent. All returned strings are
+        /// owned by `alloc` (the caller's arena).
+        getDocument: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, id: []const u8) anyerror!?types.Document,
         /// Delete documents by id (retention enforcement). Returns how many
         /// rows were actually removed. Never deletes events, entities, or
         /// aggregates — only the document rows themselves.
@@ -50,6 +54,10 @@ pub const Repository = struct {
 
     pub fn scanDocuments(self: Repository, alloc: std.mem.Allocator, before_ts: ?i64, limit: usize) ![]types.Document {
         return self.vtable.scanDocuments(self.ptr, alloc, before_ts, limit);
+    }
+
+    pub fn getDocument(self: Repository, alloc: std.mem.Allocator, id: []const u8) !?types.Document {
+        return self.vtable.getDocument(self.ptr, alloc, id);
     }
 
     pub fn deleteDocuments(self: Repository, ids: []const []const u8) !usize {
