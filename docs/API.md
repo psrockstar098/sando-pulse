@@ -1,0 +1,110 @@
+# Pulse API guide (Roadmap 5.3)
+
+Base URL: `http://127.0.0.1:9000` locally, or the public URL behind the
+TLS proxy in production. The full machine-readable contract is
+`docs/openapi.yaml`; the Sando-specific contract is
+`docs/SANDO_INTEGRATION.md`.
+
+## Authentication
+
+`POST /v1/query`, `POST /v1/ingest` and `GET /v1/usage` require an API
+key. Every other route is public (read-only intelligence endpoints).
+
+```
+Authorization: Bearer <PULSE_API_KEY>
+X-Pulse-Consumer: sando
+```
+
+- Generate a key with `./zig-out/bin/pulse keygen` and set it as
+  `PULSE_API_KEY`. The key is a random 32-byte hex string; never commit
+  it, never put it in a URL, never log it.
+- When **no** key is configured the server runs in open dev mode and
+  the header is not required. `pulse audit` fails this state, and it
+  must never be used in production.
+- `X-Pulse-Consumer` names the caller. When `PULSE_CONSUMERS` is set,
+  an unknown name is rejected with `401 unknown_consumer`; when it is
+  unset, every caller is the implicit `default` consumer.
+
+## Consumers, scopes and quotas
+
+Register consumers in `PULSE_CONSUMERS` (semicolon-separated):
+
+```
+PULSE_CONSUMERS=sando:query,admin:10000;ingest-bot:ingest:5000
+```
+
+Format per entry: `name:scope,scope:quota_per_day`. Scopes:
+
+| Scope | Endpoints |
+| ----- | --------- |
+| `query` | `POST /v1/query` |
+| `ingest` | `POST /v1/ingest` |
+| `admin` | `GET /v1/usage` |
+| `*` | all three |
+
+- Names are 1–64 chars of `[a-z0-9_-]`; anything else is `400
+  invalid_consumer`. Malformed entries are skipped with a warning.
+- A missing scope is `403 forbidden_scope`.
+- `quota_per_day` is the consumer's daily call budget across query +
+  ingest. `0` means "use the global `PULSE_RATE_LIMIT_PER_DAY`".
+  Spending the quota is `429 quota_exceeded`.
+- `GET /v1/usage` (admin scope) shows today's counts, quotas and
+  remaining budget per consumer; `?consumer=<name>` filters to one.
+
+## Rate limits
+
+Per presented API key (each key gets its own budget, so rotation does
+not share a bucket with the old key):
+
+- `PULSE_RATE_LIMIT_PER_MINUTE` (default 100)
+- `PULSE_RATE_LIMIT_PER_DAY` (default 10000, also the fallback quota)
+
+Exceeding either is `429 rate_limited` with a `Retry-After` header.
+The response header `x-pulse-cached: true/false` on `/v1/query` tells
+whether the answer came from the Redis query cache.
+
+## Error codes
+
+Every error uses one envelope (HTTP status + JSON body):
+
+```json
+{ "error": "rate_limited", "code": "rate_limited", "message": "Rate limit exceeded", "request_id": "req-..." }
+```
+
+| Code | Status | Meaning |
+| ---- | ------ | ------- |
+| `invalid_request` | 400 | Malformed body or parameters |
+| `invalid_consumer` | 400 | Bad `X-Pulse-Consumer` name |
+| `invalid_window` | 400 | `window` not `24h`, `7d` or `30d` |
+| `auth_required` | 401 | Missing `Authorization` header |
+| `auth_invalid` | 401 | Wrong API key |
+| `unknown_consumer` | 401 | Consumer not registered |
+| `forbidden_scope` | 403 | Consumer lacks the scope |
+| `method_not_allowed` | 405 | Wrong method on a known route |
+| `not_found` | 404 | Unknown route, or unknown event id |
+| `rate_limited` | 429 | Per-minute/per-day limit |
+| `quota_exceeded` | 429 | Consumer daily quota spent |
+| `facebook_unavailable` / `webhooks_unavailable` | 503 | Facebook connector not configured |
+| `*_failed` (e.g. `search_failed`) | 500 | Pulse-side failure |
+
+Include the `request_id` when reporting a problem — it is in every
+response body and in the `x-request-id` header, and it appears in the
+audit log.
+
+## Versioning
+
+- Current API version is **1**: every JSON response carries the
+  `x-pulse-api-version: 1` header, and `/v1/health` carries
+  `"api_version": "1"`.
+- v1 is **additive-only**: new fields may appear, existing fields
+  never change meaning or disappear.
+- A breaking change, if ever needed, ships as `/v2/...` alongside v1
+  — v1 is not removed without notice.
+
+## Honest answers
+
+`POST /v1/query` returns `sufficient: false` with
+`insufficient_reason` (e.g. `no_documents_matched`) when Pulse has no
+evidence. That is a valid 200 response, not an error — treat it as "I
+don't know" and never fill the gap with invented content. The answer
+text is extractive: it is built only from the cited `results`.

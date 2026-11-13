@@ -1,0 +1,607 @@
+openapi: 3.0.3
+info:
+  title: Sando Pulse API
+  version: "1"
+  description: |
+    Liberia-first intelligence and search engine. All responses are JSON
+    (except /metrics, which is Prometheus text, and the Facebook webhook
+    verification, which is plain text). All JSON responses carry the
+    `x-pulse-api-version: 1` header and a `request_id` field.
+
+    Answers are extractive and evidence-grounded: `sufficient: false`
+    means Pulse has no evidence and says so, rather than inventing an
+    answer. See docs/API.md for the full guide and
+    docs/SANDO_INTEGRATION.md for the Sando client contract.
+servers:
+  - url: http://127.0.0.1:9000
+    description: Local development server
+  - url: https://pulse.example.invalid
+    description: Production (behind a TLS-terminating reverse proxy)
+tags:
+  - name: query
+    description: Ask questions and ingest documents
+  - name: intelligence
+    description: Trends, briefings, events, locations, statistics, quality
+  - name: admin
+    description: Usage, metrics, connectors
+  - name: webhooks
+    description: Facebook webhook verification and receiver
+security:
+  - bearerAuth: []
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: API key
+      description: |
+        Pulse API key (PULSE_API_KEY). In open dev mode (no key
+        configured) the header is not required. Send
+        `X-Pulse-Consumer: <name>` to identify the consumer; unknown
+        names are rejected with 401 when consumers are configured.
+  parameters:
+    RequestIdHeader:
+      name: x-request-id
+      in: header
+      description: Echoed in every JSON response body as `request_id`.
+      schema:
+        type: string
+    ApiVersionHeader:
+      name: x-pulse-api-version
+      in: header
+      description: Always `1` on JSON responses.
+      schema:
+        type: string
+        enum: ["1"]
+    ConsumerHeader:
+      name: X-Pulse-Consumer
+      in: header
+      description: Registered consumer name (PULSE_CONSUMERS). Defaults to `default`.
+      schema:
+        type: string
+        example: sando
+  responses:
+    BadRequest:
+      description: The request was malformed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Missing/invalid API key, or unknown consumer.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: The consumer lacks the scope for this endpoint.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: No such route, or no such event id.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    RateLimited:
+      description: Per-minute/per-day rate limit or per-consumer daily quota spent.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ServerError:
+      description: Pulse failed to serve the request.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+  schemas:
+    Error:
+      type: object
+      required: [error, code, message, request_id]
+      properties:
+        error:
+          type: string
+          example: rate_limited
+        code:
+          type: string
+          example: rate_limited
+        message:
+          type: string
+          example: Rate limit exceeded
+        request_id:
+          type: string
+    QueryRequest:
+      type: object
+      required: [query]
+      properties:
+        query:
+          type: string
+          minLength: 1
+          maxLength: 1000
+          example: fuel shortage in Monrovia
+        options:
+          type: object
+          properties:
+            limit:
+              type: integer
+              minimum: 1
+              maximum: 20
+              default: 10
+        context:
+          type: object
+          description: Forward-compatibility context; ignored by the server today. County is folded into the query text instead.
+          properties:
+            county:
+              type: string
+              example: Montserrado
+            language:
+              type: string
+              example: koloqua
+    Citation:
+      type: object
+      properties:
+        title:
+          type: string
+        summary:
+          type: string
+          description: Extractive summary, max 280 chars.
+        url:
+          type: string
+          format: uri
+        source:
+          type: object
+          properties:
+            name:
+              type: string
+            url:
+              type: string
+              format: uri
+        published_at:
+          type: string
+          format: date-time
+          nullable: true
+        score:
+          type: number
+    QueryResponse:
+      type: object
+      required: [query, sufficient, confidence, results]
+      properties:
+        query:
+          type: string
+        answer:
+          type: string
+          nullable: true
+          description: Extractive answer grounded in `results`; null when insufficient.
+        sufficient:
+          type: boolean
+        insufficient_reason:
+          type: string
+          nullable: true
+          example: no_documents_matched
+        confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/Citation"
+        events:
+          type: array
+          items:
+            type: object
+        timeline:
+          type: array
+          items:
+            type: object
+        query_plan:
+          type: object
+          properties:
+            intent:
+              type: string
+            topics:
+              type: array
+              items:
+                type: string
+            counties:
+              type: array
+              items:
+                type: string
+            strategy:
+              type: string
+            classification_confidence:
+              type: number
+        meta:
+          type: object
+          properties:
+            request_id:
+              type: string
+            results_count:
+              type: integer
+            sources_checked:
+              type: integer
+            generated_at:
+              type: string
+              format: date-time
+    IngestRequest:
+      type: object
+      required: [title, text, url, source_id]
+      properties:
+        title:
+          type: string
+          maxLength: 500
+        text:
+          type: string
+          maxLength: 20000
+        url:
+          type: string
+          format: uri
+        source_id:
+          type: string
+          description: Must name a registered source (see GET /v1/sources).
+    IngestResponse:
+      type: object
+      properties:
+        id:
+          type: string
+        source_id:
+          type: string
+        request_id:
+          type: string
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: ok
+        version:
+          type: string
+          example: "0.1.0"
+        api_version:
+          type: string
+          example: "1"
+        documents:
+          type: integer
+        sources_enabled:
+          type: integer
+        store:
+          type: string
+          enum: [memory, postgres]
+        request_id:
+          type: string
+    UsageRow:
+      type: object
+      properties:
+        consumer:
+          type: string
+        queries:
+          type: integer
+        ingests:
+          type: integer
+        quota_per_day:
+          type: integer
+        remaining:
+          type: integer
+    UsageResponse:
+      type: object
+      properties:
+        day:
+          type: string
+          example: "2026-11-13"
+        usage:
+          type: array
+          items:
+            $ref: "#/components/schemas/UsageRow"
+        request_id:
+          type: string
+paths:
+  /v1/health:
+    get:
+      tags: [admin]
+      summary: Health check (no auth)
+      responses:
+        "200":
+          description: Pulse is up.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+  /v1/query:
+    post:
+      tags: [query]
+      summary: Ask a question (auth + rate limit + quota, scope `query`)
+      parameters:
+        - $ref: "#/components/parameters/ConsumerHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryRequest"
+      responses:
+        "200":
+          description: Answer (possibly an honest refusal: `sufficient: false`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/ServerError"
+  /v1/ingest:
+    post:
+      tags: [query]
+      summary: Ingest one document manually (auth + rate limit + quota, scope `ingest`)
+      parameters:
+        - $ref: "#/components/parameters/ConsumerHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IngestRequest"
+      responses:
+        "201":
+          description: Document stored.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/ServerError"
+  /v1/sources:
+    get:
+      tags: [intelligence]
+      summary: Registered sources with document counts (no auth)
+      responses:
+        "200":
+          description: Source list.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sources:
+                    type: array
+                    items:
+                      type: object
+  /v1/events:
+    get:
+      tags: [intelligence]
+      summary: Latest clustered events, or one event's detail (no auth)
+      parameters:
+        - name: id
+          in: query
+          description: Event id for the detail view (documents, corroboration, status, conflicts, timeline).
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Event list or event detail.
+          content:
+            application/json:
+              schema:
+                type: object
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/trends:
+    get:
+      tags: [intelligence]
+      summary: Accelerating topics and geo trends (no auth)
+      parameters:
+        - name: window
+          in: query
+          description: Time window.
+          schema:
+            type: string
+            enum: ["24h", "7d", "30d"]
+            default: 24h
+        - name: category
+          in: query
+          description: Topic category filter (e.g. `politics`, `entertainment`).
+          schema:
+            type: string
+        - name: county
+          in: query
+          description: County filter for geo trends.
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            maximum: 50
+            default: 10
+      responses:
+        "200":
+          description: Trends, geo trends and monthly snapshots.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          description: `window` was not 24h, 7d or 30d.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /v1/briefing:
+    get:
+      tags: [intelligence]
+      summary: Today's precomputed briefing (no auth)
+      responses:
+        "200":
+          description: Briefing for today (empty when no documents were collected today).
+          content:
+            application/json:
+              schema:
+                type: object
+  /v1/locations:
+    get:
+      tags: [intelligence]
+      summary: Seeded Liberian locations (no auth)
+      parameters:
+        - name: kind
+          in: query
+          description: Location kind filter (e.g. `city`, `county`, `district`).
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+      responses:
+        "200":
+          description: Locations with coordinates and provenance.
+          content:
+            application/json:
+              schema:
+                type: object
+  /v1/statistics:
+    get:
+      tags: [intelligence]
+      summary: Seeded Liberian statistics (no auth)
+      responses:
+        "200":
+          description: Statistics with provenance.
+          content:
+            application/json:
+              schema:
+                type: object
+  /v1/quality:
+    get:
+      tags: [intelligence]
+      summary: Intelligence quality report (no auth)
+      responses:
+        "200":
+          description: Coverage, freshness and conflict quality metrics.
+          content:
+            application/json:
+              schema:
+                type: object
+  /v1/usage:
+    get:
+      tags: [admin]
+      summary: Per-consumer daily usage and quotas (auth, scope `admin`)
+      parameters:
+        - $ref: "#/components/parameters/ConsumerHeader"
+        - name: consumer
+          in: query
+          description: Filter to one consumer.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Today's usage rows.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UsageResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /v1/connectors/facebook:
+    get:
+      tags: [admin]
+      summary: Facebook connector status (no auth)
+      description: |
+        Returns `available: false` with the reason until a Meta app and
+        authorized Page access are configured. Never returns invented data.
+      responses:
+        "200":
+          description: Connector status.
+          content:
+            application/json:
+              schema:
+                type: object
+        "503":
+          description: Connector unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /v1/webhooks/facebook:
+    get:
+      tags: [webhooks]
+      summary: Meta subscription handshake (no API-key auth; verify token instead)
+      description: |
+        Meta GETs `?hub.mode=subscribe&hub.verify_token=...&hub.challenge=...`.
+        Pulse echoes `hub.challenge` only when the token matches
+        PULSE_FACEBOOK_VERIFY_TOKEN.
+      parameters:
+        - name: hub.mode
+          in: query
+          schema:
+            type: string
+        - name: hub.verify_token
+          in: query
+          schema:
+            type: string
+        - name: hub.challenge
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The challenge string, plain text.
+          content:
+            text/plain:
+              schema:
+                type: string
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      tags: [webhooks]
+      summary: Facebook webhook receiver (HMAC signature is the auth)
+      description: |
+        Requires `X-Hub-Signature-256` validated against
+        PULSE_FACEBOOK_APP_SECRET. Validated notifications are recorded
+        for the worker; the response counts received vs recorded.
+      responses:
+        "200":
+          description: Received/recorded counts.
+          content:
+            application/json:
+              schema:
+                type: object
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          description: Webhooks not configured (no app secret).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /metrics:
+    get:
+      tags: [admin]
+      summary: Prometheus metrics (no auth)
+      responses:
+        "200":
+          description: Prometheus text exposition.
+          content:
+            text/plain:
+              schema:
+                type: string
