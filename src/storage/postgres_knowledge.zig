@@ -840,7 +840,10 @@ test "postgres knowledge: live" {
     const ev2 = try ks.upsertEventForDoc(a, doc2, ent);
     defer a.free(ev2);
     try std.testing.expectEqualStrings("kt1-hash-test", ev2);
-    const events = try ks.listEvents(a, 10);
+    const events = try ks.listEvents(a, 1000);
+    // Limit 1000, not 10: the fixture event is dated 2023-11-14, so
+    // real worker runs (34 events at last check) push it out of a
+    // small top-N. The loop below still matches by id.
     var found = false;
     for (events) |e| {
         if (std.mem.eql(u8, e.id, "kt1-hash-test")) {
