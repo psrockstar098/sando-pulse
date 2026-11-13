@@ -4,12 +4,14 @@
 //! packages. Simple Query protocol, cleartext + MD5 + SCRAM-SHA-256 auth.
 //!
 //! Design choices (documented, per docs/INTERFACES.md):
-//! * Pool: ONE connection behind a `std.Io.Mutex`, not a 4-connection
-//!   pool. Phase 1 traffic is a single worker + the API server's coarse
+//! * Pool: a `PgPool` of N connections (Roadmap 4.5), default 1 — the
+//!   original single-connection design, now with lazy reconnect per
+//!   slot. Phase 1 traffic is a single worker + the API server's coarse
 //!   search path; one connection keeps the protocol state machine trivially
 //!   correct (no interleaved Simple Query streams). `PgClient` itself is
-//!   NOT thread-safe — all store access goes through the mutex, and a dead
-//!   connection is dropped and re-established lazily on the next call.
+//!   NOT thread-safe — each slot is used by at most one caller at a time
+//!   (checkout exclusivity), and a dead connection is dropped and
+//!   re-established lazily on the next checkout.
 //! * Plaintext only. `sslmode` is parsed and recorded; `require` /
 //!   `verify-ca` / `verify-full` are REFUSED at connect time with
 //!   `error.TlsNotImplemented` because TLS is out of scope for Phase 1.
@@ -976,33 +978,190 @@ fn openDirForMigrations(io: std.Io, dir: []const u8) !std.Io.Dir {
     return std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true });
 }
 
+/// Connection pool (Roadmap 4.5): N PgClient slots, each used by at
+/// most one caller at a time. Checkout is exclusive; a slot whose
+/// connection died is reconnected lazily on the next checkout. When
+/// every slot is busy the caller waits (bounded, 10s) and then gets
+/// error.PoolExhausted. Size 1 behaves exactly like the original
+/// single-connection design; the server and worker are single-threaded
+/// today, so the default stays 1 (PULSE_PG_POOL_SIZE raises it for
+/// concurrent callers). Client internals use a thread-safe GPA because
+/// two threads may connect two slots at once.
+///
+/// The pool mutex is an `std.Io.Mutex` locked through the DIRECT
+/// `std.Io.Threaded.mutexLockUncancelable` / `mutexUnlock` helpers
+/// (plain OS futex, no `Io` instance involved) — NOT through the
+/// `Io`-bound `mutex.lockUncancelable(io)`: that path parks via the
+/// `Io` instance, which is unreliable from raw `std.Thread.spawn`
+/// threads (two threads could both observe a slot as free and check
+/// out the same client, which corrupts the client's protocol state
+/// and the GPA's buckets — seen 2026-11-13 in the pool test). The
+/// spin wait likewise uses `std.Thread.sleep`, never `Io.sleep`.
+/// (There is no `std.Thread.Mutex` in Zig 0.17.1; the direct
+/// Threaded helpers are the same ones `DebugAllocator` uses for its
+/// own thread-safe mode.)
+pub const PgPool = struct {
+    alloc: Allocator,
+    io: std.Io,
+    conninfo: []const u8,
+    clients: []?PgClient,
+    in_use: []bool,
+    mutex: std.Io.Mutex = .init,
+    /// Heap-allocated on purpose: `PgPool` (and `PostgresStore`) are
+    /// returned by value, and `gpa.allocator()` captures `&gpa` — the
+    /// clients store that allocator long-term. If the GPA lived inline,
+    /// the move would leave every client holding a pointer to a dead
+    /// stack slot, and the next client-alloc use corrupts memory (seen
+    /// 2026-11-13: bucket assert on the first pool ping; futex hang in
+    /// the live test's teardown). The heap address never moves.
+    gpa: *std.heap.DebugAllocator(.{ .thread_safe = true }),
+
+    pub const max_wait_attempts: usize = 5000; // 5000 x 2ms = 10s
+
+    /// Sleep without an `Io` instance: the pool is used from raw
+    /// threads, where `Io.sleep` is unreliable. Matches the codebase's
+    /// existing `std.os.linux.*` usage (logging, auth).
+    fn sleepNanos(ns: u64) void {
+        var req: std.os.linux.timespec = .{
+            .sec = @intCast(ns / std.time.ns_per_s),
+            .nsec = @intCast(ns % std.time.ns_per_s),
+        };
+        _ = std.os.linux.nanosleep(&req, null);
+    }
+
+    pub fn init(alloc: Allocator, io: std.Io, conninfo: []const u8, size: usize) !PgPool {
+        const n = @max(1, @min(size, 32));
+        var self = PgPool{
+            .alloc = alloc,
+            .io = io,
+            .conninfo = try alloc.dupe(u8, conninfo),
+            .clients = try alloc.alloc(?PgClient, n),
+            .in_use = try alloc.alloc(bool, n),
+            .gpa = undefined, // created on the heap just below
+        };
+        errdefer {
+            alloc.free(self.clients);
+            alloc.free(self.in_use);
+            alloc.free(self.conninfo);
+        }
+        self.gpa = try alloc.create(std.heap.DebugAllocator(.{ .thread_safe = true }));
+        self.gpa.* = .{};
+        errdefer alloc.destroy(self.gpa);
+        @memset(self.clients, null);
+        @memset(self.in_use, false);
+        // Eager connect, like the old single client: init fails fast
+        // when Postgres is down, so the caller keeps its fallback.
+        for (self.clients) |*slot| {
+            slot.* = try PgClient.connect(self.gpa.allocator(), io, conninfo);
+        }
+        return self;
+    }
+
+    pub fn deinit(self: *PgPool) void {
+        for (self.clients) |*slot| {
+            if (slot.*) |*c| c.close();
+            slot.* = null;
+        }
+        self.alloc.free(self.clients);
+        self.alloc.free(self.in_use);
+        self.alloc.free(self.conninfo);
+        _ = self.gpa.deinit();
+        self.alloc.destroy(self.gpa);
+    }
+
+    /// Exclusive checkout. Reconnects a dead slot lazily.
+    pub fn checkout(self: *PgPool) !*PgClient {
+        var attempt: usize = 0;
+        while (attempt < max_wait_attempts) : (attempt += 1) {
+            std.Io.Threaded.mutexLockUncancelable(&self.mutex);
+            for (self.clients, 0..) |*slot, i| {
+                if (!self.in_use[i]) {
+                    self.in_use[i] = true;
+                    std.Io.Threaded.mutexUnlock(&self.mutex);
+                    if (slot.* == null) {
+                        slot.* = PgClient.connect(self.gpa.allocator(), self.io, self.conninfo) catch |err| {
+                            std.Io.Threaded.mutexLockUncancelable(&self.mutex);
+                            self.in_use[i] = false;
+                            std.Io.Threaded.mutexUnlock(&self.mutex);
+                            return err;
+                        };
+                    }
+                    return &slot.*.?;
+                }
+            }
+            std.Io.Threaded.mutexUnlock(&self.mutex);
+            sleepNanos(2_000_000);
+        }
+        return error.PoolExhausted;
+    }
+
+    /// Return a healthy client to the pool.
+    pub fn checkin(self: *PgPool, client: *PgClient) void {
+        std.Io.Threaded.mutexLockUncancelable(&self.mutex);
+        defer std.Io.Threaded.mutexUnlock(&self.mutex);
+        for (self.clients, 0..) |*slot, i| {
+            if (slot.* != null and &slot.*.? == client) {
+                self.in_use[i] = false;
+                return;
+            }
+        }
+    }
+
+    /// Drop a dead client: close it and free the slot so the next
+    /// checkout reconnects. Must not be followed by checkin.
+    pub fn drop(self: *PgPool, client: *PgClient) void {
+        std.Io.Threaded.mutexLockUncancelable(&self.mutex);
+        defer std.Io.Threaded.mutexUnlock(&self.mutex);
+        for (self.clients, 0..) |*slot, i| {
+            if (slot.* != null and &slot.*.? == client) {
+                slot.*.?.close();
+                slot.* = null;
+                self.in_use[i] = false;
+                return;
+            }
+        }
+    }
+};
+
 /// PostgreSQL-backed `repository.Repository`.
 ///
-/// Connection strategy: ONE connection behind a mutex (see header). The
-/// connection is opened eagerly by `init` and re-established lazily if a
-/// call finds it dead.
+/// Connection strategy: a PgPool (Roadmap 4.5) of N connections,
+/// default 1 — the original single-connection design, now with lazy
+/// reconnect per slot. SQL strings are built on a thread-safe GPA so
+/// concurrent checkouts (pool size > 1) never share an arena.
 pub const PostgresStore = struct {
     alloc: Allocator,
     io: std.Io,
     conninfo: []const u8,
-    mutex: std.Io.Mutex = .init,
-    client: ?PgClient = null,
+    pool: PgPool,
+    sql_gpa: std.heap.DebugAllocator(.{ .thread_safe = true }) = .{},
+
+    /// SQL-building allocator: thread-safe, so two concurrent store
+    /// calls (pool size > 1) never share an arena.
+    fn sqlAlloc(self: *PostgresStore) Allocator {
+        return self.sql_gpa.allocator();
+    }
 
     pub fn init(alloc: Allocator, io: std.Io, conninfo: []const u8) !PostgresStore {
+        return initWithPoolSize(alloc, io, conninfo, 1);
+    }
+
+    pub fn initWithPoolSize(alloc: Allocator, io: std.Io, conninfo: []const u8, pool_size: usize) !PostgresStore {
         var self = PostgresStore{
             .alloc = alloc,
             .io = io,
             .conninfo = try alloc.dupe(u8, conninfo),
+            .pool = undefined,
         };
         errdefer alloc.free(self.conninfo);
-        self.client = try PgClient.connect(alloc, io, conninfo);
+        self.pool = try PgPool.init(alloc, io, conninfo, pool_size);
         return self;
     }
 
     pub fn deinit(self: *PostgresStore) void {
-        if (self.client) |*c| c.close();
-        self.client = null;
+        self.pool.deinit();
         self.alloc.free(self.conninfo);
+        _ = self.sql_gpa.deinit();
     }
 
     pub fn repository(self: *PostgresStore) repo_mod.Repository {
@@ -1059,34 +1218,23 @@ pub const PostgresStore = struct {
         self.deinit();
     }
 
-    /// Get a live client, reconnecting if the previous one died.
-    /// Caller must hold `mutex`.
-    fn ensureClient(self: *PostgresStore) !*PgClient {
-        if (self.client == null) {
-            self.client = try PgClient.connect(self.alloc, self.io, self.conninfo);
-        }
-        return &self.client.?;
-    }
-
-    /// Drop the current connection; the next call reconnects.
-    /// Caller must hold `mutex`.
-    fn dropClient(self: *PostgresStore) void {
-        if (self.client) |*c| c.close();
-        self.client = null;
+    /// Check a client out of the pool. A dead slot reconnects lazily;
+    /// a query error drops the client (see the callers) so the next
+    /// checkout reconnects. Checkout exclusivity is the only
+    /// synchronization: PgClient is not thread-safe.
+    fn checkout(self: *PostgresStore) !*PgClient {
+        return self.pool.checkout();
     }
 
     pub fn insertDocument(self: *PostgresStore, doc: types.Document) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const client = self.ensureClient() catch |err| return err;
-        self.insertDocumentLocked(client, doc) catch |err| {
-            self.dropClient();
-            return err;
-        };
+        const client = try self.checkout();
+        errdefer self.pool.drop(client);
+        defer self.pool.checkin(client);
+        try self.insertDocumentLocked(client, doc);
     }
 
     fn insertDocumentLocked(self: *PostgresStore, client: *PgClient, doc: types.Document) !void {
-        const a = self.alloc;
+        const a = self.sqlAlloc();
         // The source row must exist for the FK; the feed URL is unknown here,
         // so the source home URL stands in for it.
         const esc_src_id = try escapeLiteral(a, doc.source_id);
@@ -1189,14 +1337,10 @@ pub const PostgresStore = struct {
     /// `source_id` or source name; counties have no column in the schema, so
     /// they match as ILIKE terms against title/text (coarse fallback).
     pub fn search(self: *PostgresStore, alloc: Allocator, q: types.SearchQuery) ![]types.Document {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const client = try self.ensureClient();
-        const docs = self.searchLocked(client, alloc, q) catch |err| {
-            self.dropClient();
-            return err;
-        };
-        return docs;
+        const client = try self.checkout();
+        errdefer self.pool.drop(client);
+        defer self.pool.checkin(client);
+        return self.searchLocked(client, alloc, q);
     }
 
     fn searchLocked(self: *PostgresStore, client: *PgClient, alloc: Allocator, q: types.SearchQuery) ![]types.Document {
@@ -1364,13 +1508,12 @@ pub const PostgresStore = struct {
     }
 
     pub fn countDocuments(self: *PostgresStore) usize {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const client = self.ensureClient() catch return 0;
-        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        const client = self.checkout() catch return 0;
+        defer self.pool.checkin(client);
+        var arena = std.heap.ArenaAllocator.init(self.sqlAlloc());
         defer arena.deinit();
         const res = client.query(arena.allocator(), "SELECT count(*) FROM documents") catch {
-            self.dropClient();
+            self.pool.drop(client);
             return 0;
         };
         if (res.rows.len == 0) return 0;
@@ -1382,9 +1525,9 @@ pub const PostgresStore = struct {
     /// limits to documents fetched before the cutoff; null scans all.
     /// `limit` is capped at 1000 per call — retention loops in batches.
     pub fn scanDocuments(self: *PostgresStore, alloc: Allocator, before_ts: ?i64, limit: usize) ![]types.Document {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const client = try self.ensureClient();
+        const client = try self.checkout();
+        errdefer self.pool.drop(client);
+        defer self.pool.checkin(client);
         var sql: std.ArrayList(u8) = .empty;
         defer sql.deinit(alloc);
         try sql.appendSlice(alloc,
@@ -1403,10 +1546,7 @@ pub const PostgresStore = struct {
         const tail = try std.fmt.allocPrint(alloc, " ORDER BY d.fetched_at ASC LIMIT {d}", .{@min(limit, 1000)});
         defer alloc.free(tail);
         try sql.appendSlice(alloc, tail);
-        var res = client.query(alloc, sql.items) catch |err| {
-            self.dropClient();
-            return err;
-        };
+        var res = try client.query(alloc, sql.items);
         defer res.deinit(alloc);
         var docs = try alloc.alloc(types.Document, res.rows.len);
         for (res.rows, 0..) |row, i| {
@@ -1421,10 +1561,10 @@ pub const PostgresStore = struct {
     /// the knowledge store afterwards. Returns rows actually removed.
     pub fn deleteDocuments(self: *PostgresStore, ids: []const []const u8) !usize {
         if (ids.len == 0) return 0;
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const client = try self.ensureClient();
-        const a = self.alloc;
+        const client = try self.checkout();
+        errdefer self.pool.drop(client);
+        defer self.pool.checkin(client);
+        const a = self.sqlAlloc();
         var list: std.ArrayList(u8) = .empty;
         defer list.deinit(a);
         for (ids, 0..) |id, i| {
@@ -1435,30 +1575,21 @@ pub const PostgresStore = struct {
         }
         const unlink = try std.fmt.allocPrint(a, "DELETE FROM event_sources WHERE document_id IN ({s})", .{list.items});
         defer a.free(unlink);
-        client.exec(a, unlink) catch |err| {
-            self.dropClient();
-            return err;
-        };
+        try client.exec(a, unlink);
         const del = try std.fmt.allocPrint(a, "DELETE FROM documents WHERE id IN ({s}) RETURNING id", .{list.items});
         defer a.free(del);
-        var res = client.query(a, del) catch |err| {
-            self.dropClient();
-            return err;
-        };
+        var res = try client.query(a, del);
         defer res.deinit(a);
         return res.rows.len;
     }
 
     pub fn countBySource(self: *PostgresStore, alloc: Allocator) ![]types.SourceCount {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const client = try self.ensureClient();
-        var res = client.query(alloc,
+        const client = try self.checkout();
+        errdefer self.pool.drop(client);
+        defer self.pool.checkin(client);
+        var res = try client.query(alloc,
             "SELECT source_id, count(*) FROM documents GROUP BY source_id ORDER BY count(*) DESC",
-        ) catch |err| {
-            self.dropClient();
-            return err;
-        };
+        );
         defer res.deinit(alloc);
         var out = try alloc.alloc(types.SourceCount, res.rows.len);
         for (res.rows, 0..) |row, i| {
@@ -1884,4 +2015,63 @@ test "postgres: live" {
 
     // Migrations are idempotent: a second run must not error.
     try runMigrations(alloc, io, url, "/home/hatch/workspace/pulse/migrations");
+}
+
+test "PgPool: two threads hold two connections at once (live)" {
+    const alloc = testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const url = (try getTestEnvVar(alloc, io, "PULSE_TEST_POSTGRES_URL")) orelse {
+        std.debug.print("skip: PULSE_TEST_POSTGRES_URL not set\n", .{});
+        return;
+    };
+    defer alloc.free(url);
+
+    var pool = try PgPool.init(alloc, io, url, 2);
+    defer pool.deinit();
+
+    const Ctx = struct {
+        pool: *PgPool,
+        held: *std.atomic.Value(usize),
+        max_held: *std.atomic.Value(usize),
+        ok: *std.atomic.Value(bool),
+
+        fn run(c: *@This()) void {
+            const client = c.pool.checkout() catch {
+                c.ok.store(false, .seq_cst);
+                return;
+            };
+            const cur = c.held.fetchAdd(1, .seq_cst) + 1;
+            var prev = c.max_held.load(.seq_cst);
+            while (cur > prev) {
+                if (c.max_held.cmpxchgWeak(prev, cur, .seq_cst, .seq_cst) == null) break;
+                prev = c.max_held.load(.seq_cst);
+            }
+            client.ping() catch {
+                c.ok.store(false, .seq_cst);
+            };
+            // Plain nanosleep: Io.sleep goes through the Io instance
+            // and is not reliable from a raw spawned thread.
+            PgPool.sleepNanos(50_000_000);
+            _ = c.held.fetchSub(1, .seq_cst);
+            c.pool.checkin(client);
+        }
+    };
+    var held = std.atomic.Value(usize).init(0);
+    var max_held = std.atomic.Value(usize).init(0);
+    var ok = std.atomic.Value(bool).init(true);
+    var ctx = Ctx{ .pool = &pool, .held = &held, .max_held = &max_held, .ok = &ok };
+    const t1 = try std.Thread.spawn(.{}, Ctx.run, .{&ctx});
+    const t2 = try std.Thread.spawn(.{}, Ctx.run, .{&ctx});
+    t1.join();
+    t2.join();
+    try testing.expect(ok.load(.seq_cst));
+    // Both threads held a connection at the same time: the pool really
+    // handed out two distinct connections, not one behind a mutex.
+    try testing.expectEqual(@as(usize, 2), max_held.load(.seq_cst));
+    // A checkout after both returned works (slots freed).
+    const c = try pool.checkout();
+    try c.ping();
+    pool.checkin(c);
 }

@@ -118,7 +118,7 @@ pub fn main(init: std.process.Init) !void {
     if (cfg.database_url) |url| {
         logging.info("opening postgres store", &.{});
         const pg = try alloc.create(postgres.PostgresStore);
-        pg.* = try postgres.PostgresStore.init(alloc, io, url);
+        pg.* = try postgres.PostgresStore.initWithPoolSize(alloc, io, url, cfg.pg_pool_size);
         // Fresh `compose up` should just work: migrate on boot.
         try postgres.runMigrations(alloc, io, url, "migrations");
         pg_store = pg;

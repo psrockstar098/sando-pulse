@@ -25,6 +25,14 @@ pub const Config = struct {
     /// Precomputed briefing (4.4): recompute every N seconds, cache TTL.
     precompute_interval_s: u64 = 3600,
     precompute_ttl_s: u64 = 3600,
+    /// Query-result cache TTL (Roadmap 4.5). 0 disables caching.
+    query_cache_ttl_s: u64 = 300,
+    /// Max sources fetched concurrently in one ingest run (Roadmap 4.5).
+    max_concurrent_sources: usize = 4,
+    /// Postgres connection pool size (Roadmap 4.5). 1 = the original
+    /// single-connection design; higher values only help when store
+    /// calls run concurrently.
+    pg_pool_size: usize = 1,
     rate_limit_per_minute: u32 = 100,
     rate_limit_per_day: u32 = 10000,
     log_level: []const u8 = "info",
@@ -118,6 +126,15 @@ pub fn load(alloc: std.mem.Allocator, env_map: *std.process.Environ.Map) !Config
     }
     if (envOwned(alloc, env_map, "PULSE_PRECOMPUTE_TTL_S")) |v| {
         cfg.precompute_ttl_s = parseU64(v) orelse 3600;
+    }
+    if (envOwned(alloc, env_map, "PULSE_QUERY_CACHE_TTL_S")) |v| {
+        cfg.query_cache_ttl_s = parseU64(v) orelse 300;
+    }
+    if (envOwned(alloc, env_map, "PULSE_MAX_CONCURRENT_SOURCES")) |v| {
+        cfg.max_concurrent_sources = @intCast(parseU64(v) orelse 4);
+    }
+    if (envOwned(alloc, env_map, "PULSE_PG_POOL_SIZE")) |v| {
+        cfg.pg_pool_size = @intCast(parseU64(v) orelse 1);
     }
     if (envOwned(alloc, env_map, "PULSE_RATE_LIMIT_PER_MINUTE")) |v| {
         cfg.rate_limit_per_minute = parseU32(v) orelse 100;

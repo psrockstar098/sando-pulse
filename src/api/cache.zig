@@ -19,6 +19,27 @@ const realtime = @import("../workers/realtime.zig");
 pub const epoch_key: []const u8 = "pulse:cache:epoch";
 pub const key_prefix: []const u8 = "pulse:cache:q:";
 pub const default_ttl_s: u64 = 300;
+/// Responses larger than this are served but never stored: a cached
+/// giant is a memory sink, and the next query recomputes cheaply
+/// enough at this scale.
+pub const max_response_bytes: usize = 64 * 1024;
+
+/// Splice the current request id into a cached response body. The
+/// stored body is rendered with an empty request id, so the marker
+/// `"request_id":""` is unique and fixed-length; the replacement is a
+/// plain concatenation. Returns error when the marker is absent (the
+/// caller then recomputes instead of serving a stale id).
+pub fn stampRequestId(alloc: std.mem.Allocator, stored_json: []const u8, req_id: []const u8) ![]u8 {
+    const marker = "\"request_id\":\"\"";
+    const at = std.mem.indexOf(u8, stored_json, marker) orelse return error.MarkerMissing;
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(alloc, stored_json[0..at]);
+    try out.appendSlice(alloc, "\"request_id\":\"");
+    try out.appendSlice(alloc, req_id);
+    try out.appendSlice(alloc, "\"");
+    try out.appendSlice(alloc, stored_json[at + marker.len ..]);
+    return out.toOwnedSlice(alloc);
+}
 
 /// Bump the cache epoch (call on every document ingest). Returns the
 /// new epoch. Best-effort: callers ignore errors.
@@ -61,7 +82,8 @@ pub fn get(client: *redis.RedisClient, alloc: std.mem.Allocator, key: []const u8
     const nl = std.mem.indexOfScalar(u8, raw, '\n') orelse return null;
     const stored_epoch = std.fmt.parseInt(i64, raw[0..nl], 10) catch return null;
     if (stored_epoch != epoch) return null;
-    return alloc.dupe(u8, raw[nl + 1 ..]);
+    const duped = try alloc.dupe(u8, raw[nl + 1 ..]);
+    return duped;
 }
 
 test "cacheKey is stable per query+limit and differs across inputs" {
@@ -77,6 +99,25 @@ test "cacheKey is stable per query+limit and differs across inputs" {
     try std.testing.expect(!std.mem.eql(u8, a, d));
     try std.testing.expect(std.mem.startsWith(u8, a, key_prefix));
     try std.testing.expectEqual(@as(usize, key_prefix.len + 64), a.len);
+}
+
+test "stampRequestId splices the current id into the empty marker" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const stored = "{\"meta\":{\"request_id\":\"\",\"results_count\":2}}";
+    const stamped = try stampRequestId(alloc, stored, "req-abc123");
+    try std.testing.expectEqualStrings("{\"meta\":{\"request_id\":\"req-abc123\",\"results_count\":2}}", stamped);
+    try std.testing.expectError(error.MarkerMissing, stampRequestId(alloc, "{\"meta\":{}}", "x"));
+}
+
+test "stampRequestId leaves a body without the marker untouched (error, not silent)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    // A body that already carries a real id must never be served as a
+    // cache entry: the marker is only the empty string.
+    try std.testing.expectError(error.MarkerMissing, stampRequestId(alloc, "{\"meta\":{\"request_id\":\"old\"}}", "new"));
 }
 
 test "epoch parsing: stored epoch must match" {

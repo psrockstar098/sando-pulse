@@ -40,6 +40,7 @@ const providers = @import("../ai/providers.zig");
 const auth = @import("auth.zig");
 const ratelimit = @import("ratelimit.zig");
 const metrics = @import("metrics.zig");
+const cache = @import("cache.zig");
 const timex = @import("../common/time.zig");
 const query_json = @import("query.zig");
 
@@ -132,6 +133,25 @@ pub const Server = struct {
     fn newRequestId(alloc: std.mem.Allocator, io: std.Io) ![]u8 {
         const ts: i96 = timex.nowNanos(io);
         return std.fmt.allocPrint(alloc, "req-{x}", .{ts});
+    }
+
+    fn respondJsonCached(req: *std.http.Server.Request, status: std.http.Status, body: []const u8, req_id: []const u8, cached: bool) !void {
+        try req.respond(body, .{
+            .status = status,
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/json" },
+                .{ .name = "x-request-id", .value = req_id },
+                .{ .name = "x-pulse-cached", .value = if (cached) "true" else "false" },
+            },
+        });
+    }
+
+    /// Read the top-level "sufficient" flag out of a cached query body.
+    /// The renderer emits `"sufficient":true|false` exactly once.
+    fn cachedSufficient(body: []const u8) ?bool {
+        if (std.mem.indexOf(u8, body, "\"sufficient\":true") != null) return true;
+        if (std.mem.indexOf(u8, body, "\"sufficient\":false") != null) return false;
+        return null;
     }
 
     fn respondJson(req: *std.http.Server.Request, status: std.http.Status, body: []const u8, req_id: []const u8) !void {
@@ -454,6 +474,31 @@ pub const Server = struct {
             for (sources.sources) |s| {
                 if (s.enabled) try enabled.append(alloc, s.id);
             }
+            // Query cache (Roadmap 4.5): an identical query+limit within
+            // the TTL and the same ingest epoch serves the stored body.
+            // The stored body is rendered with an empty request id; the
+            // current id is spliced in on the way out. A miss, a stale
+            // epoch, or a malformed entry all fall through to planning.
+            var cache_key: ?[]u8 = null;
+            var cache_epoch: i64 = 0;
+            if (self.redis) |rc| {
+                if (self.cfg.query_cache_ttl_s > 0) {
+                    cache_key = cache.cacheKey(alloc, qr.query, qr.limit) catch null;
+                    if (cache_key) |k| {
+                        cache_epoch = cache.currentEpoch(rc, alloc);
+                        if (cache.get(rc, alloc, k, cache_epoch) catch null) |stored| {
+                            if (cache.stampRequestId(alloc, stored, req_id) catch null) |stamped_body| {
+                                self.metrics.observeCacheHit();
+                                self.metrics.observeQuery(cachedSufficient(stamped_body) orelse true);
+                                self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+                                try respondJsonCached(req, .ok, stamped_body, req_id, true);
+                                return;
+                            }
+                        }
+                        self.metrics.observeCacheMiss();
+                    }
+                }
+            }
             const now = timex.nowSeconds(self.io);
             const p = planner.plan(alloc, qr.query, enabled.items, now, self.cfg.tz_offset_minutes) catch {
                 self.respondError(req, alloc, req_id, .internal_server_error, "planner_failed", "Query planning failed");
@@ -471,8 +516,19 @@ pub const Server = struct {
                 self.respondError(req, alloc, req_id, .internal_server_error, "response_failed", "Failed to render response");
                 return;
             };
+            // Store a copy rendered with an empty request id so a later
+            // hit can splice in its own id. Oversized responses are
+            // served but never stored.
+            if (self.redis) |rc| {
+                if (cache_key) |k| {
+                    if (resp.len <= cache.max_response_bytes) {
+                        const storable = query_json.buildQueryResponse(alloc, "", qr.query, p, outcome, enabled.items.len, timex.nowSeconds(self.io)) catch null;
+                        if (storable) |s| cache.put(rc, alloc, k, cache_epoch, s, self.cfg.query_cache_ttl_s) catch {};
+                    }
+                }
+            }
             self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
-            try respondJson(req, .ok, resp, req_id);
+            try respondJsonCached(req, .ok, resp, req_id, false);
             return;
         }
 

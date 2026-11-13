@@ -12,6 +12,8 @@ pub const Metrics = struct {
     request_duration_ms_total: u64 = 0,
     queries_total: u64 = 0,
     queries_insufficient_total: u64 = 0,
+    queries_cache_hits_total: u64 = 0,
+    queries_cache_misses_total: u64 = 0,
     ingest_runs_total: u64 = 0,
     ingest_errors_total: u64 = 0,
     documents_indexed_total: u64 = 0,
@@ -31,6 +33,14 @@ pub const Metrics = struct {
     pub fn observeQuery(self: *Metrics, sufficient: bool) void {
         self.queries_total += 1;
         if (!sufficient) self.queries_insufficient_total += 1;
+    }
+
+    pub fn observeCacheHit(self: *Metrics) void {
+        self.queries_cache_hits_total += 1;
+    }
+
+    pub fn observeCacheMiss(self: *Metrics) void {
+        self.queries_cache_misses_total += 1;
     }
 
     pub fn observeIngestRun(self: *Metrics, had_error: bool) void {
@@ -68,6 +78,12 @@ pub const Metrics = struct {
             \\# HELP pulse_queries_insufficient_evidence_total Queries answered with insufficient evidence
             \\# TYPE pulse_queries_insufficient_evidence_total counter
             \\pulse_queries_insufficient_evidence_total {d}
+            \\# HELP pulse_queries_cache_hits_total /v1/query responses served from the Redis cache
+            \\# TYPE pulse_queries_cache_hits_total counter
+            \\pulse_queries_cache_hits_total {d}
+            \\# HELP pulse_queries_cache_misses_total /v1/query cache lookups that recomputed
+            \\# TYPE pulse_queries_cache_misses_total counter
+            \\pulse_queries_cache_misses_total {d}
             \\# HELP pulse_ingest_runs_total Ingestion runs completed
             \\# TYPE pulse_ingest_runs_total counter
             \\pulse_ingest_runs_total {d}
@@ -87,6 +103,8 @@ pub const Metrics = struct {
             self.request_duration_ms_total,
             self.queries_total,
             self.queries_insufficient_total,
+            self.queries_cache_hits_total,
+            self.queries_cache_misses_total,
             self.ingest_runs_total,
             self.ingest_errors_total,
             self.documents_indexed_total,
