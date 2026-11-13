@@ -451,16 +451,23 @@ pub const PostgresKnowledge = struct {
         defer alloc.free(esc_src);
         const esc_ver = try optLit(alloc, row.verified_at);
         defer alloc.free(esc_ver);
+        // The id carries the full identity (kind:name[:county]); it is
+        // the upsert arbiter, so a facility with no verified county
+        // (media/government orgs) still upserts instead of erroring.
+        const id = try slugId(alloc, row.kind, row.name, row.county);
+        defer alloc.free(id);
+        const esc_id = try pg.escapeLiteral(alloc, id);
+        defer alloc.free(esc_id);
         const sql = try std.fmt.allocPrint(alloc,
-            \\INSERT INTO facilities (name, kind, county, city, lat, lon, source, verified_at)
-            \\VALUES ({s}, {s}, {s}, {s}, {s}, {s}, {s}, {s})
-            \\ON CONFLICT (name, kind, county) DO UPDATE SET
+            \\INSERT INTO facilities (id, name, kind, county, city, lat, lon, source, verified_at)
+            \\VALUES ({s}, {s}, {s}, {s}, {s}, {s}, {s}, {s}, {s})
+            \\ON CONFLICT (id) DO UPDATE SET
             \\  city = COALESCE(EXCLUDED.city, facilities.city),
             \\  lat = COALESCE(EXCLUDED.lat, facilities.lat),
             \\  lon = COALESCE(EXCLUDED.lon, facilities.lon),
             \\  source = EXCLUDED.source,
             \\  verified_at = COALESCE(EXCLUDED.verified_at, facilities.verified_at)
-        , .{ esc_name, esc_kind, esc_county, esc_city, lat_s, lon_s, esc_src, esc_ver });
+        , .{ esc_id, esc_name, esc_kind, esc_county, esc_city, lat_s, lon_s, esc_src, esc_ver });
         defer alloc.free(sql);
         try self.execLocked(alloc, sql);
     }

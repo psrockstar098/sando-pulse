@@ -26,13 +26,14 @@ UPDATE locations SET id = 'county:' || replace(lower(name), ' ', '_')
 -- Rows written by the pre-007 upsert carry ids without the county
 -- suffix (city:testville). Recompute them to the new form so the
 -- upsert's ON CONFLICT (id) finds them instead of tripping the
--- unique index. (County names in this dataset are plain words, so
--- lower + space-to-underscore matches the slug exactly.)
+-- unique index. The regexp slug matches the Zig slug exactly
+-- (drop [^a-z0-9 _-], then map space/dash to '_').
 UPDATE locations SET id =
-    lower(kind) || ':' || replace(lower(name), ' ', '_') ||
-    ':' || replace(lower(county), ' ', '_')
+    regexp_replace(regexp_replace(lower(kind), '[^a-z0-9 _-]', '', 'g'), '[- ]', '_', 'g') || ':' ||
+    regexp_replace(regexp_replace(lower(name), '[^a-z0-9 _-]', '', 'g'), '[- ]', '_', 'g') || ':' ||
+    regexp_replace(regexp_replace(lower(county), '[^a-z0-9 _-]', '', 'g'), '[- ]', '_', 'g')
   WHERE kind <> 'county' AND county IS NOT NULL
-    AND id NOT LIKE '%:' || replace(lower(county), ' ', '_');
+    AND id NOT LIKE '%:' || regexp_replace(regexp_replace(lower(county), '[^a-z0-9 _-]', '', 'g'), '[- ]', '_', 'g');
 
 DROP INDEX IF EXISTS locations_name_kind_key;
 
