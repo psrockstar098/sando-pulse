@@ -334,3 +334,65 @@ Commits: 3.1 `bd864df`, 3.3/3.4 `ab620c7` + `eacd3b6`, 3.2 `354a836`, Facebook `
 6. **2022 census figure:** 5,250,187 per the Wikipedia Demographics table; LISGIS elsewhere cites 5,248,621. The table figure is seeded, with its provenance, and the discrepancy is recorded here.
 7. **District populations sum to 3,620,633, above the official 2008 total of 3,476,608** — the source table's own inconsistency; recorded, not reconciled.
 8. **The geo live test was state-dependent** (an unfiltered top-10 search stopped finding the probe doc once real worker docs lived in the DB). Fixed by searching on the probe doc's own term; the test still exercises the geo leg (lat/lon + 128-dim embedding round-trip).
+
+## Roadmap 4 — COMPLETE 2026-11-13 ~03:00 GMT
+
+Commits: 4.1 `a77d5bc`, 4.2 `3dc952b`, 4.3 `31b2b5f`, 4.4 `467cb6a`, 4.5 `1f2005d` + `b9c07e0` + `c097066` + `51ad74e`, 4.6 `4ec4c30`. Head `51ad74e`.
+
+### Tests
+
+- `zig build` — **passes** (binary `zig-out/bin/pulse`, ~47 MB).
+- `zig build test` with live Postgres + Redis — **175/175 pass, 0 fail, 0 skip, 0 leaks** (log `/tmp/pulse-test23.log`). Includes the Postgres live test, Redis live test, Postgres-knowledge live test, PgPool concurrent-checkout live test, and the fetchConcurrent bounded-concurrency test.
+
+### Environment reinstall (2026-11-13 ~01:20–01:30, after the ~00:44 VM restart)
+
+The restart wiped the system packages the earlier builders used: `postgresql-16`, `redis-server`, `postgresql-16-pgvector`, `postgresql-16-postgis-3`, and the libzstd dev files. Reinstalled via apt (`postgresql-16` + `redis-server`, then `postgresql-16-pgvector` 0.6.0 + `postgresql-16-postgis-3` 3.4.2); libzstd headers + symlink re-applied from the pre-downloaded deb. Postgres 16 + Redis 7 running; `pulse_test` DB recreated (it had not survived either). The first live run after reinstall failed 2 tests (vector/postgis missing) — fixed by the extension install, then 162/162.
+
+### 4.1 Event intelligence (`a77d5bc`, by the previous coordinator)
+
+- `src/intelligence/events.zig`: importanceScore, scanRetraction, eventStatus, detectConflicts, timelineBuckets. KnowledgeEvent gains distinct_sources + status; the pipeline scans for retraction markers at ingest; `/v1/events?id=` detail endpoint. 146/146 at the time.
+- Honest gap: events are topic-clustered (3.3/3.4), so conflict detection reads 'divergent' for topic buckets whose docs are different stories; meaningful only for title-clustered events.
+
+### 4.2 Geez and trending engine (`3dc952b`)
+
+- `src/intelligence/trending.zig`: computeTrends (recent vs prior equal-length window, velocity = recent/max(prior,1), score = ln(1+recent) x clamped velocity), categoryOf (politics→political, sports→sports, culture→entertainment = the Geez lane, else general), computeGeoTrends (counties named in title+text, top topic per county), snapshotFromAggregates + historicalRankings over the 3.5 monthly aggregates, topGeez helper, parseWindow 24h/7d/30d.
+- `GET /v1/trends?window=&category=&county=&limit=` (default 24h, limit cap 50, invalid window is 400) with ranked trends, geo trends, latest 3 monthly snapshots.
+- Live smoke test (2026-11-13 ~03:05): business 7.99, politics 5.42, economy 4.16. Geo trends empty on this dataset (no county name matched in the fetched docs) — see honest gaps.
+
+### 4.3 Real-time processing (`31b2b5f`)
+
+- `src/workers/realtime.zig`: StreamConsumer over `pulse:events`, group `pulse-workers` — drainOnce reads new entries, reclaimPending re-reads unacked ones, unknown kinds acked+skipped, failures retried with per-entry attempt counters (`pulse:events:attempts:<id>`) and moved to `pulse:events:dlq` after max_attempts=3 with the reason attached.
+- `src/api/cache.zig`: epoch-based query-cache invalidation — cached responses stored as `<epoch>\n<json>` under `pulse:cache:q:<sha256(query|limit)>`, TTL default 300s; ingest bumps the single epoch via one INCR (no key scans); EpochInvalidator processor. Worker loop drains + reclaims each iteration; a Redis outage logs and retries next iteration, never fatal.
+- Honest gap: the stream only carries document.collected today; event-driven indexing means cache invalidation + epoch bump, not a re-index (documents are indexed at ingest already).
+
+### 4.4 Precomputed intelligence (`467cb6a`)
+
+- `src/intelligence/precomputed.zig`: Briefing (top_stories, top_geez_today/week/month, latest_liberia/lofa/montserrado, popular_political/entertainment, breaking — importance ≥ 0.5, seen in last 6h, not retracted), computeBriefing over repo + knowledge store, renderBriefing JSON, refreshBriefing stores the payload in Redis `pulse:briefing` with TTL. Config `precompute_interval_s`/`precompute_ttl_s` (defaults 3600). `GET /v1/briefing` serves the cached payload when fresh else computes live (`cached` flag in the body). Worker refreshes on schedule. `pulse briefing` CLI prints the payload.
+- Live smoke test: `cached:false`, top_stories 0, breaking 0, geez_today 0 — the feeds' latest items are dated 2026-11-12 and the server's "today" is 2026-11-13, so the empty briefing is correct behaviour, not a bug. The non-empty path is proven by unit tests only.
+
+### 4.5 Performance optimization (`1f2005d`, `b9c07e0`, `c097066`, `51ad74e`)
+
+- **Query cache** (`src/api/cache.zig`, `src/api/server.zig`, `src/api/metrics.zig`): POST /v1/query serves identical query+limit from Redis when the ingest epoch is unchanged, header `x-pulse-cached: true/false`. Stored bodies are rendered with an empty request id and spliced in on a hit (`stampRequestId`, unit-tested incl. the marker-missing error path). Responses > 64 KB are served but never stored. Metrics `pulse_queries_cache_hits/misses_total`. TTL via `PULSE_QUERY_CACHE_TTL_S` (default 300s, 0 disables). Live smoke test: first query `x-pulse-cached: false`, second identical query `x-pulse-cached: true`, same 2 results, counters 1/1.
+- **Connection pool** (`src/storage/postgres.zig`): PgPool — N PgClient slots, exclusive checkout, lazy reconnect per slot, bounded 10s wait then `PoolExhausted`, size clamped 1..32. PostgresStore uses it (default 1 = the original single-connection design; `PULSE_PG_POOL_SIZE` raises it). SQL strings build on a thread-safe GPA so concurrent checkouts never share an arena. Pool mutex uses the direct `std.Io.Threaded` futex helpers (plain OS futex) — the Io-bound mutex path is unreliable from raw spawned threads. Spin wait uses a raw `nanosleep`, never `Io.sleep`. Live test: two threads hold two connections at once, max_held == 2.
+- **Indexes** (migration 010): `events(last_seen_at)`, `events(topic, last_seen_at)`, `documents(source_id, fetched_at)`, all `IF NOT EXISTS`. Applied live; verified in `\d`. Note: migration 004's CREATE TABLE never ran — 001 already created events with `first_seen_at`/`last_seen_at`.
+- **Concurrent collection** (`src/ingestion/pipeline.zig`): runOnce builds the due-source list sequentially (config + interval checks read the knowledge store), fetches them in bounded waves (`PULSE_MAX_CONCURRENT_SOURCES`, default 4, clamped 1..8), then processes each fetched source sequentially on the main thread — the repository, event sink and knowledge store are never used concurrently, so inserts stay serialized and idempotent. `ingestOneSource` split into `fetchSourceItems` (fetch+parse, stage-typed errors) and `ingestParsedSource` (archive + normalize + insert + health). Each fetch task owns its arena + its own `std.Io.Threaded` instance: `HostName.connect` resolves DNS through `io.async`, which is only reliable from the owning thread. Live smoke test (`pulse worker --once`, 2026-11-13 ~03:05): docs 2 → 82 in 34s — Daily Observer 50/50, New Dawn 10/10, GNN Liberia 10/10, The News 10/10, Liberian Investigator 0/1 error, Facebook skipped (unconfigured).
+- **`pulse loadtest` CLI** (`src/cli/loadtest.zig`): N threads x M requests against a running server (default http://127.0.0.1:9000), fresh connection per request, p50/p95/max/mean for GET /v1/health and POST /v1/query plus calls/s. Plain `std.Io.net` sockets per worker thread (each with its own Threaded io), literal IP only, HTTP only, 10s receive timeout. Live runs against the smoke-test server: 4 threads x 25 requests = 200 calls, 0 errors, health p50 122.8ms / query p50 82.2ms, 48.2 calls/s; 2 x 10 = 40 calls, 0 errors, health p50 81.8ms / query p50 41.2ms, 46.3 calls/s.
+- **Memory (4.5 pass):** no unbounded in-process growth identified. Bounded: pool 1..32 connections, cache 64 KB/response + 300s TTL, one arena per request, one arena per worker iteration, briefing = one Redis key. The query cache has no count bound — keys accumulate until TTL expiry; the operator-side bound is a Redis `maxmemory` policy (Roadmap 5.4).
+
+### 4.6 Intelligence quality (`4ec4c30`)
+
+- `src/intelligence/quality.zig` (pure, no I/O): freshnessScore (half-life decay: 1.0 fresh, 0.5 at 24h, ~0.125 at 7d); calibrateReliability (design-doc grade penalised by consecutive failures and stale last-success, clamped 0.05..0.95; a never-run source keeps its grade but is reported missing); eventConfidence (half reliability + half corroboration, scaled by freshness, cut hard for retracted/divergent); flagEvent — misinformation indicators: single_source, conflicting_reports, retracted, stale, low_reliability, uncorroborated_old. Flags are warnings for a human to check, never verdicts; the response says so in its `note` field.
+- `GET /v1/quality`: per-source quality for all 10 registry sources (stale = no success in 24h, missing = no health record) + the newest 100 events with confidence/freshness/flags + summary counts. Live smoke test: summary stale_sources 6, missing_sources 5, flagged_events 27 (of 34 events, mostly single_source); Liberian Investigator calibrated 0.47 after its failed run (0.70 − 0.08 failure − 0.15 never-succeeded); sample event confidence 0.45, freshness 0.83, flags [single_source].
+
+### Roadmap 4 honest gaps
+
+1. **Liberian Investigator errored in the smoke-test worker run** (fetched 0, errors 1) — the same intermittency as Roadmap 3's 4-source errors; not investigated (transient vs persistent unknown).
+2. **Briefing empty on the smoke test** (top_stories/breaking/geez all 0) — correct behaviour given the feeds' latest items are dated 2026-11-12; the non-empty live path is unit-tested only.
+3. **Geo trends empty on the smoke test** — no county name matched in the fetched docs' title+text; the geo logic is unit-tested, live geo coverage unproven.
+4. **Conflict detection reads 'divergent' for topic buckets** whose docs are different stories (4.1, carried from above).
+5. **The stream only carries document.collected**; event-driven indexing is cache invalidation + epoch bump, not a re-index.
+6. **Query cache has no count bound** — keys accumulate until TTL; needs a Redis `maxmemory` policy in deployment (Roadmap 5.4).
+7. **Loadtest latencies are high-ish** (health p50 ~80–120ms, query p50 ~40–80ms) — single-threaded server + fresh connection per request on a 2-CPU VM. These are measurements, not a regression (no baseline existed).
+8. **The live knowledge test is state-dependent** — fixed by raising its listEvents limit from 10 to 1000 (`51ad74e`); real worker events had pushed the 2023 fixture out of the top 10.
+9. **`zig build test` does NOT analyse uncalled function bodies** (lazy analysis): 3 loadtest compile errors (`std.time.nanoTimestamp` does not exist in 0.17.1, `ArrayList.writer` does not exist, `stream.read` wants `[][]u8` not `*const [1][]u8`) were only caught by `zig build`. The exe build is the real gate for CLI code.
+10. **PgPool stale-allocator bug (2026-11-13, found + fixed during 4.5):** `PgPool.init` returned the pool by value after handing out `gpa.allocator()` — every PgClient stored a pointer to the GPA's stack location in `init`, and the first pool ping allocated an arena from the dead slot and hit a `DebugAllocator` bucket assert; the live test's teardown hung on a corrupted futex for the same reason. Fixed by heap-allocating the GPA (stable address). Lesson: never move a struct after taking its `.allocator()` — the same applies to any struct that hands out a self-referencing allocator.
