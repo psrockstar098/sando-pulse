@@ -1,0 +1,24 @@
+# Alertmanager config (Roadmap 5.4). SHIPPED WITH NO REAL RECEIVER:
+# alerts are routed to `default`, which has no destination, so nothing
+# is sent until the operator configures one. To enable alerting, replace
+# the receiver below with a real one — for example a webhook:
+#
+# receivers:
+#   - name: ops-webhook
+#     webhook_configs:
+#       - url: "https://hooks.example.invalid/pulse-alerts"
+#         send_resolved: true
+#
+# ...and point the route at it. Then start the profile:
+#   docker compose --profile alerts up -d
+global:
+  resolve_timeout: 5m
+route:
+  group_by: ["alertname"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  receiver: default
+receivers:
+  - name: default
+    # No destination configured on purpose — see the comment above.

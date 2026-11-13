@@ -2,6 +2,16 @@ global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
+# Alert rules (Roadmap 5.4). Prometheus evaluates alerts.yml and
+# sends firing alerts to Alertmanager when the alerts profile is on.
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+
 scrape_configs:
   - job_name: pulse-api
     static_configs:
@@ -15,6 +25,10 @@ scrape_configs:
   - job_name: redis-exporter
     static_configs:
       - targets: ['redis-exporter:9121']
+
+  - job_name: node-exporter
+    static_configs:
+      - targets: ['node-exporter:9100']
 
   - job_name: prometheus
     static_configs:

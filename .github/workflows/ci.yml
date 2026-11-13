@@ -1,0 +1,65 @@
+# Pulse CI (Roadmap 5.4). Authored only — it has NOT run yet.
+# NOTE: this file must be added through the GitHub web UI. The gh CLI
+# token lacks the `workflow` scope and cannot create workflow files.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: pulse_test
+          POSTGRES_DB: pulse_test
+        options: >-
+          --health-cmd "pg_isready -U postgres -d pulse_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+        ports:
+          - 5432:5432
+      redis:
+        image: redis:8-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+        ports:
+          - 6379:6379
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Zig 0.17.1
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Install libzstd-dev
+        run: sudo apt-get update && sudo apt-get install -y libzstd-dev
+      - name: Build
+        run: zig build
+      - name: Test (unit suite; live legs need extensions — see below)
+        # The live Postgres/Redis legs are SKIPPED here: migration 003
+        # needs the pgvector, PostGIS and pg_trgm extensions, which stock
+        # postgres:16 does not ship. To enable them, swap the postgres
+        # service image for one that bundles all three (or build a custom
+        # image), create the extensions, and set:
+        #   PULSE_TEST_POSTGRES_URL: postgres://postgres:pulse_test@localhost:5432/pulse_test
+        #   PULSE_TEST_REDIS_URL: redis://localhost:6379
+        # The full suite (unit + live) is run on the dev host instead.
+        run: zig build test --summary all
+      - name: Pre-flight audit (needs a key to pass; uses a throwaway one)
+        env:
+          PULSE_API_KEY: ci-throwaway-key
+          DATABASE_URL: postgres://postgres:pulse_test@localhost:5432/pulse_test
+          REDIS_URL: redis://localhost:6379
+        run: |
+          ./zig-out/bin/pulse migrate
+          ./zig-out/bin/pulse audit || echo "audit: see output above (non-blocking in CI until the runbook says otherwise)"

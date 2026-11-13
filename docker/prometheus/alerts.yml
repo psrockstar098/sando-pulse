@@ -1,0 +1,76 @@
+# Pulse alert rules (Roadmap 5.4). All series referenced here are real:
+# pulse_* from Pulse's own /metrics, up from Prometheus scrapes,
+# redis_memory_* from redis_exporter, pg_up from postgres_exporter.
+# Loaded by Prometheus via rule_files in prometheus.yml.
+groups:
+  - name: pulse
+    rules:
+      - alert: PulseDown
+        expr: up{job="pulse-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Pulse API is down
+          description: "The Pulse API has not responded to scrapes for 1 minute. Check `docker compose ps` and the api logs."
+
+      - alert: PulseHigh5xx
+        expr: |
+          rate(pulse_http_requests_5xx_total[5m])
+          / rate(pulse_http_requests_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Pulse 5xx rate above 5%
+          description: "More than 5% of requests are failing with 5xx over the last 5 minutes. Check the api logs and the database."
+
+      - alert: PulseSlowResponses
+        expr: |
+          rate(pulse_http_request_duration_ms_total[5m])
+          / rate(pulse_http_requests_total[5m]) > 500
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Pulse average response time above 500ms
+          description: "Average request latency has been above 500ms for 10 minutes. Check Postgres/Redis latency and the query cache hit ratio."
+
+      - alert: PulseIngestFailing
+        expr: increase(pulse_ingest_errors_total[1h]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: Ingestion runs are erroring
+          description: "At least one ingestion run errored in the last hour. Check the worker logs — a source feed may be down or changed."
+
+      - alert: PulseCacheCold
+        expr: |
+          rate(pulse_queries_cache_hits_total[10m])
+          / rate(pulse_queries_total[10m]) < 0.1
+          and rate(pulse_queries_total[10m]) > 0.1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Query cache hit ratio below 10%
+          description: "The Redis query cache is barely hitting. Check that REDIS_URL is set on the api service and Redis is healthy."
+
+      - alert: RedisMemoryHigh
+        expr: redis_memory_used_bytes / redis_memory_max_bytes > 0.85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Redis memory above 85% of maxmemory
+          description: "Redis is near its 256mb maxmemory limit; allkeys-lru is evicting. Consider raising the limit in docker-compose.yml."
+
+      - alert: PostgresDown
+        expr: up{job="postgres-exporter"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Postgres exporter is down
+          description: "Postgres (or its exporter) has not responded for 1 minute. Check the postgres service and disk space."

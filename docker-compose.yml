@@ -6,6 +6,15 @@
 # Secrets come from the environment / a gitignored .env file — NEVER from
 # this file. Copy .env.example to .env and fill it in.
 
+# Log rotation for every service (Roadmap 5.4): json-file driver, 10 MB
+# per file, 3 files kept. Without this a long-running container fills
+# the host disk with logs.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   api:
     build:
@@ -17,6 +26,10 @@ services:
       PULSE_HOST: "0.0.0.0"
       PULSE_PORT: "9000"
       PULSE_API_KEY: "${PULSE_API_KEY:-}"
+      PULSE_API_KEY_PREVIOUS: "${PULSE_API_KEY_PREVIOUS:-}"
+      PULSE_CONSUMERS: "${PULSE_CONSUMERS:-}"
+      PULSE_AUDIT_LOG: "${PULSE_AUDIT_LOG:-}"
+      PULSE_BEHIND_TLS_PROXY: "${PULSE_BEHIND_TLS_PROXY:-1}"
       PULSE_LOG_LEVEL: "${PULSE_LOG_LEVEL:-info}"
       DATABASE_URL: "postgres://pulse:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/pulse"
       REDIS_URL: "redis://redis:6379"
@@ -26,6 +39,8 @@ services:
       MINIO_BUCKET: "pulse-raw"
     ports:
       - "9000:9000"
+    volumes:
+      - pulse-backups:/app/backups
     depends_on:
       postgres:
         condition: service_healthy
@@ -33,6 +48,7 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    logging: *default-logging
     networks:
       - pulse-net
     restart: unless-stopped
@@ -46,6 +62,7 @@ services:
       PULSE_API_KEY: "${PULSE_API_KEY:-}"
       PULSE_LOG_LEVEL: "${PULSE_LOG_LEVEL:-info}"
       PULSE_INGEST_INTERVAL_S: "${PULSE_INGEST_INTERVAL_S:-300}"
+      PULSE_WORKER_ID: "${PULSE_WORKER_ID:-worker-1}"
       DATABASE_URL: "postgres://pulse:${POSTGRES_PASSWORD}@postgres:5432/pulse"
       REDIS_URL: "redis://redis:6379"
       MINIO_ENDPOINT: "http://minio:9000"
@@ -59,9 +76,57 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    logging: *default-logging
     networks:
       - pulse-net
     restart: unless-stopped
+
+  # Second worker (Roadmap 5.4): same code, distinct PULSE_WORKER_ID so
+  # the two workers are separate Redis Streams consumers and split the
+  # realtime work. Start with: docker compose --profile scale up -d
+  worker-2:
+    profiles: ["scale"]
+    image: pulse-api:0.1.0
+    command: ["worker"]
+    environment:
+      PULSE_LOG_LEVEL: "${PULSE_LOG_LEVEL:-info}"
+      PULSE_INGEST_INTERVAL_S: "${PULSE_INGEST_INTERVAL_S:-300}"
+      PULSE_WORKER_ID: "worker-2"
+      DATABASE_URL: "postgres://pulse:${POSTGRES_PASSWORD}@postgres:5432/pulse"
+      REDIS_URL: "redis://redis:6379"
+      MINIO_ENDPOINT: "http://minio:9000"
+      MINIO_ACCESS_KEY: "${MINIO_ACCESS_KEY}"
+      MINIO_SECRET_KEY: "${MINIO_SECRET_KEY}"
+      MINIO_BUCKET: "pulse-raw"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    logging: *default-logging
+    networks:
+      - pulse-net
+    restart: unless-stopped
+
+  # One-shot backup (Roadmap 5.4): runs `pulse backup` and exits.
+  # Run with: docker compose --profile backup run --rm backup
+  # The backup lands in the pulse-backups volume (/app/backups).
+  backup:
+    profiles: ["backup"]
+    image: pulse-api:0.1.0
+    command: ["backup"]
+    environment:
+      DATABASE_URL: "postgres://pulse:${POSTGRES_PASSWORD}@postgres:5432/pulse"
+    volumes:
+      - pulse-backups:/app/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging: *default-logging
+    networks:
+      - pulse-net
 
   postgres:
     image: postgres:16-alpine
@@ -76,13 +141,14 @@ services:
       interval: 5s
       timeout: 3s
       retries: 12
+    logging: *default-logging
     networks:
       - pulse-net
     restart: unless-stopped
 
   redis:
     image: redis:8-alpine
-    command: ["redis-server", "--appendonly", "yes"]
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
     volumes:
       - pulse-redisdata:/data
     healthcheck:
@@ -90,6 +156,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 12
+    logging: *default-logging
     networks:
       - pulse-net
     restart: unless-stopped
@@ -107,6 +174,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 12
+    logging: *default-logging
     networks:
       - pulse-net
     restart: unless-stopped
@@ -115,6 +183,7 @@ services:
     image: prom/prometheus:latest
     volumes:
       - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./docker/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
       - pulse-promdata:/prometheus
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
@@ -126,6 +195,43 @@ services:
       - api
       - postgres-exporter
       - redis-exporter
+      - node-exporter
+    logging: *default-logging
+    networks:
+      - pulse-net
+    restart: unless-stopped
+
+  # Host resource metrics (Roadmap 5.4): CPU, memory, disk, network.
+  node-exporter:
+    image: prom/node-exporter:latest
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--path.rootfs=/rootfs"
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+    logging: *default-logging
+    networks:
+      - pulse-net
+    restart: unless-stopped
+
+  # Alertmanager (Roadmap 5.4): only started with the alerts profile.
+  # Configure a real receiver in docker/alertmanager/alertmanager.yml
+  # (email/Slack/webhook) before enabling it — the shipped config sends
+  # alerts nowhere.
+  #   docker compose --profile alerts up -d
+  alertmanager:
+    profiles: ["alerts"]
+    image: prom/alertmanager:latest
+    volumes:
+      - ./docker/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+    logging: *default-logging
     networks:
       - pulse-net
     restart: unless-stopped
@@ -137,6 +243,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    logging: *default-logging
     networks:
       - pulse-net
     restart: unless-stopped
@@ -148,6 +255,7 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    logging: *default-logging
     networks:
       - pulse-net
     restart: unless-stopped
@@ -167,11 +275,13 @@ services:
     #   - "3000:3000"
     depends_on:
       - prometheus
+    logging: *default-logging
     networks:
       - pulse-net
     restart: unless-stopped
 
 volumes:
+  pulse-backups:
   pulse-pgdata:
   pulse-redisdata:
   pulse-miniodata:
