@@ -1,6 +1,6 @@
 //! Pulse CLI: `pulse serve` | `pulse worker [--once]` | `pulse migrate` |
 //! `pulse status` | `pulse keygen` | `pulse maintenance` | `pulse seed` |
-//! `pulse briefing` | `pulse loadtest [--url ...] [--threads N] [--requests N] [--query ...]` |
+//! `pulse briefing` | `pulse alerts` | `pulse loadtest [--url ...] [--threads N] [--requests N] [--query ...]` |
 //! `pulse audit` | `pulse backup [--out <path>] [--keep N]` | `pulse restore --in <path>`.
 //!
 //! Zig 0.17.1 entry point: main takes `std.process.Init`, which carries the
@@ -186,8 +186,8 @@ pub fn main(init: std.process.Init) !void {
 
     const is_worker = std.mem.eql(u8, cmd, "worker");
     const once = is_worker and (cmd_arg != null and std.mem.eql(u8, cmd_arg.?, "--once"));
-    if (!std.mem.eql(u8, cmd, "serve") and !is_worker and !std.mem.eql(u8, cmd, "maintenance") and !std.mem.eql(u8, cmd, "seed") and !std.mem.eql(u8, cmd, "briefing") and !std.mem.eql(u8, cmd, "loadtest") and !std.mem.eql(u8, cmd, "audit") and !std.mem.eql(u8, cmd, "backup") and !std.mem.eql(u8, cmd, "restore") and !std.mem.eql(u8, cmd, "mock-sando") and !std.mem.eql(u8, cmd, "reindex")) {
-        logging.err("unknown command (serve | worker [--once] | migrate | status | keygen | maintenance | seed | briefing | loadtest | audit | backup | restore | mock-sando | reindex)", &.{});
+    if (!std.mem.eql(u8, cmd, "serve") and !is_worker and !std.mem.eql(u8, cmd, "maintenance") and !std.mem.eql(u8, cmd, "seed") and !std.mem.eql(u8, cmd, "briefing") and !std.mem.eql(u8, cmd, "alerts") and !std.mem.eql(u8, cmd, "loadtest") and !std.mem.eql(u8, cmd, "audit") and !std.mem.eql(u8, cmd, "backup") and !std.mem.eql(u8, cmd, "restore") and !std.mem.eql(u8, cmd, "mock-sando") and !std.mem.eql(u8, cmd, "reindex")) {
+        logging.err("unknown command (serve | worker [--once] | migrate | status | keygen | maintenance | seed | briefing | alerts | loadtest | audit | backup | restore | mock-sando | reindex)", &.{});
         std.process.exit(2);
     }
 
@@ -345,6 +345,41 @@ pub fn main(init: std.process.Init) !void {
         const b = try precomputed.computeBriefing(alloc, repo, ks, timex.nowSeconds(io));
         const payload = try precomputed.renderBriefing(alloc, b);
         std.debug.print("{s}\n", .{payload});
+        return;
+    }
+
+    if (std.mem.eql(u8, cmd, "alerts")) {
+        // Roadmap 7.3: read the breaking-alert stream back, newest
+        // first. An empty stream is a real answer (nothing breaking
+        // has been published), not an error.
+        const alerts_mod = @import("intelligence/alerts.zig");
+        const c = redis_client orelse {
+            std.debug.print("alerts: no redis configured (REDIS_URL unset) — stream unavailable\n", .{});
+            return;
+        };
+        const entries = c.xrevrange(alloc, alerts_mod.alert_stream, 20) catch |err| {
+            std.debug.print("alerts: failed to read stream {s}: {s}\n", .{ alerts_mod.alert_stream, @errorName(err) });
+            return;
+        };
+        if (entries.len == 0) {
+            std.debug.print("alerts: no alerts in stream {s}\n", .{alerts_mod.alert_stream});
+            return;
+        }
+        for (entries) |e| {
+            var kind: []const u8 = "?";
+            var title: []const u8 = "?";
+            var srcs: []const u8 = "?";
+            var docs: []const u8 = "?";
+            var imp: []const u8 = "?";
+            for (e.fields) |f| {
+                if (std.mem.eql(u8, f.name, "kind")) kind = f.value;
+                if (std.mem.eql(u8, f.name, "title")) title = f.value;
+                if (std.mem.eql(u8, f.name, "sources")) srcs = f.value;
+                if (std.mem.eql(u8, f.name, "doc_count")) docs = f.value;
+                if (std.mem.eql(u8, f.name, "importance")) imp = f.value;
+            }
+            std.debug.print("{s} [{s}] {s} sources={s} docs={s} importance={s}\n", .{ e.id, kind, title, srcs, docs, imp });
+        }
         return;
     }
 

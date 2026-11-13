@@ -486,6 +486,53 @@ pub fn buildEventDetailResponse(
 const trending = @import("../intelligence/trending.zig");
 const forecast_mod = @import("../intelligence/forecast.zig");
 const statanswer = @import("../intelligence/statanswer.zig");
+const alerts_mod = @import("../intelligence/alerts.zig");
+
+/// GET /v1/alerts — breaking alerts (Roadmap 7.3): merged
+/// incidents from the knowledge store's breaking events, kinds
+/// classified rules-based from the reports' own words, every
+/// source cited. `stream_available` says whether the
+/// `pulse:alerts` Redis stream exists for Sando to subscribe to;
+/// the alerts in this response are computed live either way, so
+/// the endpoint never depends on the stream.
+pub fn buildAlertsResponse(
+    alloc: std.mem.Allocator,
+    req_id: []const u8,
+    now: i64,
+    alerts: []const alerts_mod.MergedAlert,
+    stream_available: bool,
+) ![]u8 {
+    var list: std.ArrayList(struct {
+        kind: []const u8,
+        title: []const u8,
+        event_ids: []const []const u8,
+        sources: []const []const u8,
+        doc_count: usize,
+        importance: f64,
+        first_seen: i64,
+        last_seen: i64,
+    }) = .empty;
+    for (alerts) |a| {
+        try list.append(alloc, .{
+            .kind = a.kind.toString(),
+            .title = a.title,
+            .event_ids = a.event_ids,
+            .sources = a.source_ids,
+            .doc_count = a.doc_count,
+            .importance = a.importance,
+            .first_seen = a.first_seen,
+            .last_seen = a.last_seen,
+        });
+    }
+    return stringifyAlloc(alloc, .{
+        .alerts = list.items,
+        .stream = alerts_mod.alert_stream,
+        .stream_group = alerts_mod.alert_group,
+        .stream_available = stream_available,
+        .computed_at = now,
+        .request_id = req_id,
+    });
+}
 
 /// GET /v1/forecast — predictive trends (Roadmap 7.1): linear
 /// extrapolations + z-score anomalies from monthly aggregates.

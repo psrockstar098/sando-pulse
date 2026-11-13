@@ -173,6 +173,35 @@ pub fn mergeBreakingAlerts(alloc: std.mem.Allocator, events: []const EventWithDo
     return out.toOwnedSlice(alloc);
 }
 
+/// Breaking bar, same thresholds as precomputed.breaking_importance /
+/// breaking_window_s (duplicated here because precomputed imports
+/// this module — the two must stay in sync).
+pub const breaking_importance: f64 = 0.5;
+pub const breaking_window_s: i64 = 6 * 3600;
+
+/// Build the breaking-alert list from the knowledge store's events:
+/// filter to breaking (importance >= 0.5, seen in the last 6 hours,
+/// not retracted), fetch each event's docs, merge by kind + title
+/// similarity. Used by GET /v1/alerts and by refreshBriefing
+/// publishing. Returns an empty list when the store has no breaking
+/// events — an empty alert feed is a real answer, not an error.
+pub fn computeBreakingAlerts(
+    alloc: std.mem.Allocator,
+    ks: knowledge.KnowledgeStore,
+    now: i64,
+) ![]MergedAlert {
+    const evs = try ks.listEvents(alloc, 100);
+    var with_docs: std.ArrayList(EventWithDocs) = .empty;
+    for (evs) |e| {
+        if (std.mem.eql(u8, e.status, "retracted")) continue;
+        if (e.last_seen < now - breaking_window_s) continue;
+        if (events_intel.importanceScore(e.doc_count, e.distinct_sources, now - e.last_seen) < breaking_importance) continue;
+        const docs = try ks.eventDocs(alloc, e.id);
+        try with_docs.append(alloc, .{ .event = e, .docs = docs });
+    }
+    return mergeBreakingAlerts(alloc, with_docs.items, now);
+}
+
 /// Publish merged alerts to the Redis stream (one XADD per alert).
 /// Returns the number published. A Redis failure is an error the
 /// caller logs — the stream is best-effort, never a boot or

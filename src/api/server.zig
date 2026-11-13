@@ -6,6 +6,7 @@
 //!   GET  /v1/events   public — persisted event clusters (Roadmap 3.4)
 //!   GET  /v1/trends   public — Geez + trending engine (Roadmap 4.2)
 //!   GET  /v1/forecast public — predictive trends (Roadmap 7.1)
+//!   GET  /v1/alerts   public — breaking alerts (Roadmap 7.3)
 //!   GET  /v1/briefing public — precomputed intelligence (Roadmap 4.4)
 //!   GET  /v1/quality  public — reliability, confidence, flags (Roadmap 4.6)
 //!   GET  /v1/locations public — reference places (Roadmap 3.6)
@@ -39,6 +40,7 @@ const fb_webhooks = @import("../ingestion/connectors/facebook/webhooks.zig");
 const trending = @import("../intelligence/trending.zig");
 const forecast_mod = @import("../intelligence/forecast.zig");
 const statanswer = @import("../intelligence/statanswer.zig");
+const alerts_mod = @import("../intelligence/alerts.zig");
 const precomputed = @import("../intelligence/precomputed.zig");
 const quality = @import("../intelligence/quality.zig");
 const redis = @import("../storage/redis.zig");
@@ -1239,6 +1241,23 @@ pub const Server = struct {
             return;
         }
 
+        if (method == .GET and std.mem.eql(u8, path, "/v1/alerts")) {
+            // Breaking alerts (Roadmap 7.3): merged incidents from
+            // the knowledge store's breaking events, computed live.
+            // Empty when nothing is breaking — a real answer, not
+            // an error. The stream flag only reports whether the
+            // pulse:alerts Redis stream is available for Sando.
+            const now = timex.nowSeconds(self.io);
+            var alerts_list: []alerts_mod.MergedAlert = &.{};
+            if (self.knowledge) |k| {
+                alerts_list = alerts_mod.computeBreakingAlerts(alloc, k, now) catch &.{};
+            }
+            const body = try query_json.buildAlertsResponse(alloc, req_id, now, alerts_list, self.redis != null);
+            self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+            try respondJson(req, .ok, body, req_id);
+            return;
+        }
+
         if (method == .GET and std.mem.eql(u8, path, "/v1/briefing")) {
             const now = timex.nowSeconds(self.io);
             // Serve the worker's cached payload when fresh; otherwise
@@ -1802,7 +1821,7 @@ pub const Server = struct {
         if ((method == .GET or method == .POST) and
             (std.mem.eql(u8, path, "/v1/health") or std.mem.eql(u8, path, "/v1/sources") or
                 std.mem.eql(u8, path, "/v1/events") or std.mem.eql(u8, path, "/v1/trends") or
-                std.mem.eql(u8, path, "/v1/forecast") or
+                std.mem.eql(u8, path, "/v1/forecast") or std.mem.eql(u8, path, "/v1/alerts") or
                 std.mem.eql(u8, path, "/v1/briefing") or
                 std.mem.eql(u8, path, "/v1/locations") or
                 std.mem.eql(u8, path, "/v1/statistics") or

@@ -20,6 +20,7 @@ const repository = @import("../storage/repository.zig");
 const redis = @import("../storage/redis.zig");
 const events_intel = @import("events.zig");
 const trending = @import("trending.zig");
+const alerts_mod = @import("alerts.zig");
 const entities_mod = @import("../engine/entities.zig");
 
 pub const briefing_key: []const u8 = "pulse:briefing";
@@ -42,6 +43,11 @@ pub const EventRef = struct {
     id: []const u8,
     title: []const u8,
     topic: []const u8,
+    /// Incident kind (Roadmap 7.3): rules-based classification of
+    /// the event title — accident, protest, road_closure, emergency,
+    /// announcement, community_event, unknown. A label for filtering
+    /// and display, never a verdict about what happened.
+    kind: []const u8,
     doc_count: usize,
     distinct_sources: usize,
     status: []const u8,
@@ -62,11 +68,12 @@ pub const Briefing = struct {
     breaking: []EventRef,
 };
 
-fn eventRef(event: knowledge.KnowledgeEvent, now: i64) EventRef {
+fn eventRef(alloc: std.mem.Allocator, event: knowledge.KnowledgeEvent, now: i64) !EventRef {
     return .{
         .id = event.id,
         .title = event.title,
         .topic = event.topic,
+        .kind = (try alerts_mod.classifyIncident(alloc, event.title, "")).toString(),
         .doc_count = event.doc_count,
         .distinct_sources = event.distinct_sources,
         .status = event.status,
@@ -126,7 +133,7 @@ pub fn computeBriefing(
     var entertainment: std.ArrayList(EventRef) = .empty;
     var breaking: std.ArrayList(EventRef) = .empty;
     for (events) |e| {
-        const ref = eventRef(e, now);
+        const ref = try eventRef(alloc, e, now);
         if (e.last_seen >= day_start) try stories.append(alloc, ref);
         if (std.mem.eql(u8, e.topic, "politics")) try political.append(alloc, ref);
         if (std.mem.eql(u8, e.topic, "culture")) try entertainment.append(alloc, ref);
@@ -206,28 +213,29 @@ pub fn renderBriefing(alloc: std.mem.Allocator, b: Briefing) ![]u8 {
         id: []const u8,
         title: []const u8,
         topic: []const u8,
+        kind: []const u8,
         doc_count: usize,
         distinct_sources: usize,
         status: []const u8,
         importance: f64,
     }) = .empty;
     for (b.top_stories) |e| try stories.append(alloc, .{
-        .id = e.id, .title = e.title, .topic = e.topic, .doc_count = e.doc_count,
+        .id = e.id, .title = e.title, .topic = e.topic, .kind = e.kind, .doc_count = e.doc_count,
         .distinct_sources = e.distinct_sources, .status = e.status, .importance = e.importance,
     });
     var political: std.ArrayList(@TypeOf(stories.items[0])) = .empty;
     for (b.popular_political) |e| try political.append(alloc, .{
-        .id = e.id, .title = e.title, .topic = e.topic, .doc_count = e.doc_count,
+        .id = e.id, .title = e.title, .topic = e.topic, .kind = e.kind, .doc_count = e.doc_count,
         .distinct_sources = e.distinct_sources, .status = e.status, .importance = e.importance,
     });
     var entertainment: std.ArrayList(@TypeOf(stories.items[0])) = .empty;
     for (b.popular_entertainment) |e| try entertainment.append(alloc, .{
-        .id = e.id, .title = e.title, .topic = e.topic, .doc_count = e.doc_count,
+        .id = e.id, .title = e.title, .topic = e.topic, .kind = e.kind, .doc_count = e.doc_count,
         .distinct_sources = e.distinct_sources, .status = e.status, .importance = e.importance,
     });
     var breaking: std.ArrayList(@TypeOf(stories.items[0])) = .empty;
     for (b.breaking) |e| try breaking.append(alloc, .{
-        .id = e.id, .title = e.title, .topic = e.topic, .doc_count = e.doc_count,
+        .id = e.id, .title = e.title, .topic = e.topic, .kind = e.kind, .doc_count = e.doc_count,
         .distinct_sources = e.distinct_sources, .status = e.status, .importance = e.importance,
     });
     var trend_list: std.ArrayList(struct {
@@ -289,6 +297,9 @@ fn stringifyAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
 /// Recompute the briefing and store the rendered JSON in Redis
 /// (worker schedule). Returns false when there is no Redis client or
 /// the store fails — the endpoint recomputes live in that case.
+/// Breaking alerts computed from the same briefing (Roadmap 7.3)
+/// are also published to the `pulse:alerts` stream; a publish
+/// failure never fails the refresh — the stream is best-effort.
 pub fn refreshBriefing(
     alloc: std.mem.Allocator,
     client: ?*redis.RedisClient,
@@ -301,6 +312,11 @@ pub fn refreshBriefing(
     const b = computeBriefing(alloc, repo, ks, now) catch return false;
     const payload = renderBriefing(alloc, b) catch return false;
     c.setex(briefing_key, ttl_s, payload) catch return false;
+    if (ks) |k| {
+        if (alerts_mod.computeBreakingAlerts(alloc, k, now)) |list| {
+            _ = alerts_mod.publishAlerts(c, alloc, list) catch 0;
+        } else |_| {}
+    }
     return true;
 }
 
