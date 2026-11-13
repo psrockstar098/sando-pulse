@@ -57,6 +57,15 @@ pub fn parseArgs(alloc: std.mem.Allocator, args: []const []const u8) !Options {
     return opts;
 }
 
+/// Monotonic nanosecond clock for latency measurement (raw syscall,
+/// logging.zig precedent — std.time.nanoTimestamp does not exist in
+/// 0.17.1, and no Io instance is available on worker threads).
+fn nanoNow() i64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return ts.sec * 1_000_000_000 + ts.nsec;
+}
+
 /// Percentile of a SORTED latency array (nanoseconds). p is 0..100.
 pub fn percentile(sorted: []const i64, p: u64) i64 {
     if (sorted.len == 0) return 0;
@@ -65,7 +74,7 @@ pub fn percentile(sorted: []const i64, p: u64) i64 {
 }
 
 fn formatMs(alloc: std.mem.Allocator, ns: i64) ![]u8 {
-    return std.fmt.allocPrint(alloc, "{d}.{d:0>1}ms", .{ @divTrunc(ns, 1_000_000), @divTrunc(@mod(ns, 1_000_000), 100_000) });
+    return std.fmt.allocPrint(alloc, "{d}.{d}ms", .{ @divTrunc(ns, 1_000_000), @divTrunc(@mod(ns, 1_000_000), 100_000) });
 }
 
 /// Escape a query string for the JSON request body.
@@ -136,11 +145,16 @@ fn doRequest(alloc: std.mem.Allocator, io: std.Io, addr: std.Io.net.IpAddress, m
     const tv = std.posix.timeval{ .sec = 10, .usec = 0 };
     std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
 
+    // ArrayList has no .writer in 0.17.1; build with allocPrint.
+    const head = try std.fmt.allocPrint(alloc, "{s} {s} HTTP/1.1\r\nHost: {f}\r\nConnection: close\r\n", .{ method, path, addr });
+    defer alloc.free(head);
     var req: std.ArrayList(u8) = .empty;
     defer req.deinit(alloc);
-    try req.writer(alloc).print("{s} {s} HTTP/1.1\r\nHost: {f}\r\nConnection: close\r\n", .{ method, path, addr });
+    try req.appendSlice(alloc, head);
     if (body) |b| {
-        try req.writer(alloc).print("Content-Type: application/json\r\nContent-Length: {d}\r\n", .{b.len});
+        const cl = try std.fmt.allocPrint(alloc, "Content-Type: application/json\r\nContent-Length: {d}\r\n", .{b.len});
+        defer alloc.free(cl);
+        try req.appendSlice(alloc, cl);
     }
     try req.appendSlice(alloc, "\r\n");
     if (body) |b| try req.appendSlice(alloc, b);
@@ -153,8 +167,9 @@ fn doRequest(alloc: std.mem.Allocator, io: std.Io, addr: std.Io.net.IpAddress, m
     var resp: std.ArrayList(u8) = .empty;
     defer resp.deinit(alloc);
     var chunk: [8192]u8 = undefined;
+    var bufs: [1][]u8 = .{chunk[0..]};
     while (resp.items.len < max_response_bytes) {
-        const n = try stream.read(io, &.{chunk[0..]});
+        const n = try stream.read(io, &bufs);
         if (n == 0) break; // server closed the connection
         try resp.appendSlice(alloc, chunk[0..n]);
         if (responseComplete(resp.items)) break;
@@ -177,15 +192,15 @@ const WorkerCtx = struct {
         defer threaded.deinit();
         const io = threaded.io();
         for (0..self.opts.requests) |i| {
-            const t0 = std.time.nanoTimestamp();
+            const t0 = nanoNow();
             if (doRequest(self.alloc, io, self.addr, "GET", "/v1/health", null)) |status| {
-                self.health_lat[i] = std.time.nanoTimestamp() - t0;
+                self.health_lat[i] = nanoNow() - t0;
                 if (status == 200) self.health_ok += 1 else self.errors += 1;
             } else |_| {
-                self.health_lat[i] = std.time.nanoTimestamp() - t0;
+                self.health_lat[i] = nanoNow() - t0;
                 self.errors += 1;
             }
-            const q0 = std.time.nanoTimestamp();
+            const q0 = nanoNow();
             const escaped = escapeJson(self.alloc, self.opts.query) catch {
                 self.errors += 1;
                 continue;
@@ -197,10 +212,10 @@ const WorkerCtx = struct {
             };
             defer self.alloc.free(body);
             if (doRequest(self.alloc, io, self.addr, "POST", "/v1/query", body)) |status| {
-                self.query_lat[i] = std.time.nanoTimestamp() - q0;
+                self.query_lat[i] = nanoNow() - q0;
                 if (status == 200) self.query_ok += 1 else self.errors += 1;
             } else |_| {
-                self.query_lat[i] = std.time.nanoTimestamp() - q0;
+                self.query_lat[i] = nanoNow() - q0;
                 self.errors += 1;
             }
         }
@@ -226,7 +241,7 @@ pub fn run(alloc: std.mem.Allocator, args: []const []const u8) !void {
     const threads = try alloc.alloc(std.Thread, opts.threads);
     defer alloc.free(threads);
 
-    const t0 = std.time.nanoTimestamp();
+    const t0 = nanoNow();
     for (0..opts.threads) |t| {
         ctxs[t] = .{
             .opts = opts,
@@ -238,7 +253,7 @@ pub fn run(alloc: std.mem.Allocator, args: []const []const u8) !void {
         threads[t] = try std.Thread.spawn(.{}, WorkerCtx.run, .{&ctxs[t]});
     }
     for (threads) |th| th.join();
-    const elapsed_ns = std.time.nanoTimestamp() - t0;
+    const elapsed_ns = nanoNow() - t0;
 
     var health_ok: usize = 0;
     var query_ok: usize = 0;
