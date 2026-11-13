@@ -96,25 +96,25 @@ pub const locations: []const knowledge.LocationRow = &.{
         .{ .name = "Gbarzon", .kind = "district", .county = "Grand Gedeh", .lat = 6.2267419, .lon = -8.4402587, .population = 74255, .source = "Wikipedia Districts of Liberia (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-12" },
         .{ .name = "Konobo", .kind = "district", .county = "Grand Gedeh", .lat = 5.8315731, .lon = -7.8597407, .population = 50161, .source = "Wikipedia Districts of Liberia (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-12" },
         .{ .name = "Tchien", .kind = "district", .county = "Grand Gedeh", .lat = 6.0122573, .lon = -8.1033525, .population = 31976, .source = "Wikipedia Districts of Liberia (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-12" },
-        .{ .name = "Barclayville", .kind = "district", .county = "Grand Kru", .lat = 4.7130757, .lon = -8.2011714, .population = null, .source = "Wikipedia Districts of Liberia (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-12" },
-        .{ .name = "Bleebo", .kind = "district", .county = "Grand Kru", .lat = 4.7448941, .lon = -7.9538209, .population = null, .source = "Wikipedia Districts of Liberia (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-12" },
-        .{ .name = "Bolloh", .kind = "district", .county = "Grand Kru", .lat = 4.9601292, .lon = -8.4126126, .population = null, .source = "Wikipedia Districts of Liberia (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-12" },
-        .{ .name = "Buah", .kind = "district", .county = "Grand Kru", .lat = 4.8594024, .lon = -8.1731224, .population = null, .source = "Wikipedia Districts of Liberia (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-12" },
-        .{ .name = "Dorbor", .kind = "district", .county = "Grand Kru", .lat = 4.9911749, .lon = -8.27047, .population = null, .source = "Wikipedia Districts of Liberia (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-12" },
-        .{ .name = "Dweh", .kind = "district", .county = "Grand Kru", .lat = 5.0725542, .lon = -8.0646997, .population = null, .source = "Wikipedia Districts of Liberia (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-12" },
-        .{ .name = "Felo-Jekwi", .kind = "district", .county = "Grand Kru", .lat = 4.7268088, .lon = -8.365412, .population = null, .source = "Wikipedia Districts of Liberia (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-12" },
-        .{ .name = "Fenetoe", .kind = "district", .county = "Grand Kru", .lat = 4.9091773, .lon = -8.3661682, .population = null, .source = "Wikipedia Districts of Liberia (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-12" },
-        .{ .name = "Forpoh", .kind = "district", .county = "Grand Kru", .lat = 5.1087783, .lon = -8.2363382, .population = null, .source = "Wikipedia Districts of Liberia (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-12" },
-        .{ .name = "Garraway", .kind = "district", .county = "Grand Kru", .lat = 4.5510138, .lon = -7.9149967, .population = null, .source = "Wikipedia Districts of Liberia (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-12" },
-        .{ .name = "Gee", .kind = "district", .county = "Grand Kru", .lat = 4.9360169, .lon = -8.1580761, .population = null, .source = "Wikipedia Districts of Liberia (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-12" },
-        .{ .name = "Grand Cess Wedabo", .kind = "district", .county = "Grand Kru", .lat = 4.6420042, .lon = -8.1248099, .population = null, .source = "Wikipedia Districts of Liberia (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-12" },
-        .{ .name = "Upper Jloh", .kind = "district", .county = "Grand Kru", .lat = 4.8280011, .lon = -8.4583137, .population = null, .source = "Wikipedia Districts of Liberia (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-12" },
-        .{ .name = "Lower Jloh", .kind = "district", .county = "Grand Kru", .lat = 4.8742408, .lon = -8.5634454, .population = null, .source = "Wikipedia Districts of Liberia (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-12" },
-        .{ .name = "Kpi", .kind = "district", .county = "Grand Kru", .lat = 4.9657282, .lon = -8.0859564, .population = null, .source = "Wikipedia Districts of Liberia (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-12" },
-        .{ .name = "Nrokwia-Wesldow", .kind = "district", .county = "Grand Kru", .lat = 4.820544, .lon = -8.3272113, .population = null, .source = "Wikipedia Districts of Liberia (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-12" },
+        .{ .name = "Barclayville", .kind = "district", .county = "Grand Kru", .lat = 4.7130757, .lon = -8.2011714, .population = 10904, .source = "Wikipedia Grand Kru County district table (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-13" },
+        .{ .name = "Bleebo", .kind = "district", .county = "Grand Kru", .lat = 4.7448941, .lon = -7.9538209, .population = 1809, .source = "Wikipedia Grand Kru County district table (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-13" },
+        .{ .name = "Bolloh", .kind = "district", .county = "Grand Kru", .lat = 4.9601292, .lon = -8.4126126, .population = 1891, .source = "Wikipedia Grand Kru County district table (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-13" },
+        .{ .name = "Buah", .kind = "district", .county = "Grand Kru", .lat = 4.8594024, .lon = -8.1731224, .population = 649, .source = "Wikipedia Grand Kru County district table (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-13" },
+        .{ .name = "Dorbor", .kind = "district", .county = "Grand Kru", .lat = 4.9911749, .lon = -8.27047, .population = 1935, .source = "Wikipedia Grand Kru County district table (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-13" },
+        .{ .name = "Dweh", .kind = "district", .county = "Grand Kru", .lat = 5.0725542, .lon = -8.0646997, .population = 935, .source = "Wikipedia Grand Kru County district table (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-13" },
+        .{ .name = "Felo-Jekwi", .kind = "district", .county = "Grand Kru", .lat = 4.7268088, .lon = -8.365412, .population = 2194, .source = "Wikipedia Grand Kru County district table (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-13" },
+        .{ .name = "Fenetoe", .kind = "district", .county = "Grand Kru", .lat = 4.9091773, .lon = -8.3661682, .population = 1742, .source = "Wikipedia Grand Kru County district table (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-13" },
+        .{ .name = "Forpoh", .kind = "district", .county = "Grand Kru", .lat = 5.1087783, .lon = -8.2363382, .population = 1088, .source = "Wikipedia Grand Kru County district table (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-13" },
+        .{ .name = "Garraway", .kind = "district", .county = "Grand Kru", .lat = 4.5510138, .lon = -7.9149967, .population = 9726, .source = "Wikipedia Grand Kru County district table (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-13" },
+        .{ .name = "Gee", .kind = "district", .county = "Grand Kru", .lat = 4.9360169, .lon = -8.1580761, .population = 2522, .source = "Wikipedia Grand Kru County district table (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-13" },
+        .{ .name = "Grand Cess Wedabo", .kind = "district", .county = "Grand Kru", .lat = 4.6420042, .lon = -8.1248099, .population = 10471, .source = "Wikipedia Grand Kru County district table (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-13" },
+        .{ .name = "Upper Jloh", .kind = "district", .county = "Grand Kru", .lat = 4.8280011, .lon = -8.4583137, .population = 1917, .source = "Wikipedia Grand Kru County district table (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-13" },
+        .{ .name = "Lower Jloh", .kind = "district", .county = "Grand Kru", .lat = 4.8742408, .lon = -8.5634454, .population = 1212, .source = "Wikipedia Grand Kru County district table (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-13" },
+        .{ .name = "Kpi", .kind = "district", .county = "Grand Kru", .lat = 4.9657282, .lon = -8.0859564, .population = 1603, .source = "Wikipedia Grand Kru County district table (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-13" },
+        .{ .name = "Nrokwia-Wesldow", .kind = "district", .county = "Grand Kru", .lat = 4.820544, .lon = -8.3272113, .population = 1878, .source = "Wikipedia Grand Kru County district table (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-13" },
         .{ .name = "Penicess", .kind = "district", .county = "Grand Kru", .lat = null, .lon = null, .population = null, .source = "Wikipedia Districts of Liberia (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-12" },
-        .{ .name = "Trenbo", .kind = "district", .county = "Grand Kru", .lat = 4.6639107, .lon = -7.9236422, .population = null, .source = "Wikipedia Districts of Liberia (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-12" },
-        .{ .name = "Wlogba", .kind = "district", .county = "Grand Kru", .lat = 5.0858534, .lon = -8.1716393, .population = null, .source = "Wikipedia Districts of Liberia (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-12" },
+        .{ .name = "Trenbo", .kind = "district", .county = "Grand Kru", .lat = 4.6639107, .lon = -7.9236422, .population = 3912, .source = "Wikipedia Grand Kru County district table (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-13" },
+        .{ .name = "Wlogba", .kind = "district", .county = "Grand Kru", .lat = 5.0858534, .lon = -8.1716393, .population = 688, .source = "Wikipedia Grand Kru County district table (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-13" },
         .{ .name = "Foya", .kind = "district", .county = "Lofa", .lat = 8.3628727, .lon = -10.2123472, .population = 73312, .source = "Wikipedia Districts of Liberia (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-12" },
         .{ .name = "Kolahun", .kind = "district", .county = "Lofa", .lat = 8.1339146, .lon = -10.2705461, .population = 59057, .source = "Wikipedia Districts of Liberia (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-12" },
         .{ .name = "Salayea", .kind = "district", .county = "Lofa", .lat = 7.4709749, .lon = -9.5579644, .population = 23578, .source = "Wikipedia Districts of Liberia (2008 census); coordinates OpenStreetMap Nominatim", .verified_at = "2026-11-12" },
@@ -222,6 +222,7 @@ pub const facilities: []const knowledge.FacilityRow = &.{
         .{ .name = "Curran Lutheran Hospital", .kind = "hospital", .county = "Lofa", .city = "Zorzor", .lat = 7.7752051, .lon = -9.4326659, .source = "OpenStreetMap Nominatim", .verified_at = "2026-11-12" },
         .{ .name = "St. Timothy Hospital", .kind = "hospital", .county = "Grand Cape Mount", .city = "Robertsport", .lat = 6.7502178, .lon = -11.3674753, .source = "OpenStreetMap Nominatim", .verified_at = "2026-11-12" },
         .{ .name = "John F. Kennedy Medical Center", .kind = "hospital", .county = "Montserrado", .city = "Monrovia", .lat = 6.2871673, .lon = -10.773681, .source = "OpenStreetMap Nominatim", .verified_at = "2026-11-12" },
+        .{ .name = "Lott Carey School Clinic", .kind = "clinic", .county = "Montserrado", .city = "Monrovia", .lat = 6.4175663, .lon = -10.7877694, .source = "OpenStreetMap Nominatim", .verified_at = "2026-11-13" },
         .{ .name = "Duala Market", .kind = "market", .county = "Montserrado", .city = "Monrovia", .lat = 6.3724419, .lon = -10.7876196, .source = "OpenStreetMap Nominatim", .verified_at = "2026-11-12" },
         .{ .name = "Waterside Market", .kind = "market", .county = "Montserrado", .city = "Monrovia", .lat = 6.3712169, .lon = -10.7879767, .source = "OpenStreetMap Nominatim", .verified_at = "2026-11-12" },
         .{ .name = "Red Light Market", .kind = "market", .county = "Montserrado", .city = "Paynesville", .lat = 6.2849705, .lon = -10.6906518, .source = "OpenStreetMap Nominatim", .verified_at = "2026-11-12" },
@@ -297,22 +298,26 @@ test "seed: counts and provenance are complete and idempotent" {
     const ks = mk.asKnowledge();
     const r1 = try seed(alloc, ks);
     try std.testing.expectEqual(@as(usize, 166), r1.locations);
-    try std.testing.expectEqual(@as(usize, 46), r1.facilities);
+    try std.testing.expectEqual(@as(usize, 47), r1.facilities);
     try std.testing.expectEqual(@as(usize, 5), r1.statistics);
     const r2 = try seed(alloc, ks);
     try std.testing.expectEqual(r1, r2);
     const c = ks.counts();
     try std.testing.expectEqual(@as(usize, 166), c.locations);
-    try std.testing.expectEqual(@as(usize, 46), c.facilities);
+    try std.testing.expectEqual(@as(usize, 47), c.facilities);
     try std.testing.expectEqual(@as(usize, 5), c.statistics);
     // Every location row has a source and a verification date.
+    // The seed spans two verification dates: the original
+    // 2026-11-12 pass and the Roadmap 7.6 gapfill (2026-11-13).
     for (locations) |row| {
         try std.testing.expect(row.source.len > 0);
-        try std.testing.expectEqualStrings(verification_date, row.verified_at.?);
+        const d = row.verified_at orelse return error.TestExpectedEqual;
+        try std.testing.expect(std.mem.eql(u8, d, verification_date) or std.mem.eql(u8, d, "2026-11-13"));
     }
     for (facilities) |row| {
         try std.testing.expect(row.source.len > 0);
-        try std.testing.expectEqualStrings(verification_date, row.verified_at.?);
+        const d = row.verified_at orelse return error.TestExpectedEqual;
+        try std.testing.expect(std.mem.eql(u8, d, verification_date) or std.mem.eql(u8, d, "2026-11-13"));
     }
     // Spot checks: the capital, the largest city, a district.
     const cities = try ks.listLocations(alloc, "city", 20);
@@ -327,6 +332,29 @@ test "seed: counts and provenance are complete and idempotent" {
     try std.testing.expect(found_monrovia);
     const dists = try ks.listLocations(alloc, "district", 200);
     try std.testing.expectEqual(@as(usize, 127), dists.len);
+    // Roadmap 7.6 gapfill: Grand Kru 2008 populations from the
+    // Wikipedia Grand Kru County district table, verified live
+    // 2026-11-13. Penicess has no published 2008 population in
+    // that source and stays null — never invented.
+    for (dists) |d| {
+        if (std.mem.eql(u8, d.name, "Barclayville")) {
+            try std.testing.expectEqual(@as(?i64, 10904), d.population);
+            try std.testing.expectEqualStrings("2026-11-13", d.verified_at.?);
+        }
+        if (std.mem.eql(u8, d.name, "Penicess")) {
+            try std.testing.expect(d.population == null);
+        }
+    }
+    const facs = try ks.listFacilities(alloc, null, 100);
+    var found_clinic = false;
+    for (facs) |f| {
+        if (std.mem.eql(u8, f.name, "Lott Carey School Clinic")) {
+            found_clinic = true;
+            try std.testing.expectEqualStrings("clinic", f.kind);
+            try std.testing.expect(f.lat != null and f.lon != null);
+        }
+    }
+    try std.testing.expect(found_clinic);
     const st = try ks.listStatistics(alloc);
     var found_2022 = false;
     for (st) |s| {
