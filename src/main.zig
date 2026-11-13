@@ -1,5 +1,5 @@
 //! Pulse CLI: `pulse serve` | `pulse worker [--once]` | `pulse migrate` |
-//! `pulse status` | `pulse keygen` | `pulse maintenance`.
+//! `pulse status` | `pulse keygen` | `pulse maintenance` | `pulse seed`.
 //!
 //! Zig 0.17.1 entry point: main takes `std.process.Init`, which carries the
 //! Io implementation, the allocator, argv, and the environment map — no
@@ -19,6 +19,7 @@ const timex = @import("common/time.zig");
 const config = @import("config/config.zig");
 const repository = @import("storage/repository.zig");
 const knowledge = @import("storage/knowledge.zig");
+const seed = @import("seed/liberia.zig");
 const maintenance = @import("storage/maintenance.zig");
 const memory = @import("storage/memory.zig");
 const postgres = @import("storage/postgres.zig");
@@ -96,8 +97,8 @@ pub fn main(init: std.process.Init) !void {
 
     const is_worker = std.mem.eql(u8, cmd, "worker");
     const once = is_worker and (cmd_arg != null and std.mem.eql(u8, cmd_arg.?, "--once"));
-    if (!std.mem.eql(u8, cmd, "serve") and !is_worker and !std.mem.eql(u8, cmd, "maintenance")) {
-        logging.err("unknown command (serve | worker [--once] | migrate | status | keygen | maintenance)", &.{});
+    if (!std.mem.eql(u8, cmd, "serve") and !is_worker and !std.mem.eql(u8, cmd, "maintenance") and !std.mem.eql(u8, cmd, "seed")) {
+        logging.err("unknown command (serve | worker [--once] | migrate | status | keygen | maintenance | seed)", &.{});
         std.process.exit(2);
     }
 
@@ -205,6 +206,18 @@ pub fn main(init: std.process.Init) !void {
         logging.info("facebook connector ready", &.{
             .{ .key = "registered_pages", .value = try std.fmt.allocPrint(alloc, "{d}", .{fb_connector.registeredPages()}) },
         });
+    }
+
+    if (std.mem.eql(u8, cmd, "seed")) {
+        const report = try seed.seed(alloc, ks.?);
+        std.debug.print("seed: locations={d} facilities={d} statistics={d} store={s} verified_at={s}\n", .{
+            report.locations,
+            report.facilities,
+            report.statistics,
+            store_name,
+            seed.verification_date,
+        });
+        return;
     }
 
     if (std.mem.eql(u8, cmd, "maintenance")) {

@@ -1810,7 +1810,11 @@ test "postgres: live" {
         .embedding = &emb,
     };
     try repo.insertDocument(geo_doc);
-    const geo_found = try repo.search(arena.allocator(), .{ .terms = &.{}, .limit = 10 });
+    // Search by a term the probe doc carries: an unfiltered top-10
+    // search is state-dependent (real worker docs now live in this
+    // DB) and the probe can rank outside it. The term search still
+    // exercises the geo leg — lat/lon + embedding round-trip.
+    const geo_found = try repo.search(arena.allocator(), .{ .terms = &.{"fuel"}, .limit = 10 });
     var saw_geo = false;
     for (geo_found) |d| {
         if (std.mem.eql(u8, d.id, geo_id)) {

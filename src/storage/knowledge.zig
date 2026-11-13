@@ -43,6 +43,9 @@ pub const LocationRow = struct {
     county: ?[]const u8 = null,
     lat: ?f64 = null,
     lon: ?f64 = null,
+    /// Census population when published for this place (2008 census
+    /// for districts/cities); null when not published.
+    population: ?i64 = null,
     source: []const u8 = "",
     verified_at: ?[]const u8 = null, // YYYY-MM-DD
 };
@@ -478,13 +481,20 @@ pub const MemoryKnowledge = struct {
         _ = alloc;
         const self: *MemoryKnowledge = @ptrCast(@alignCast(ptr));
         for (self.locations.items) |*l| {
-            if (std.mem.eql(u8, l.name, row.name) and std.mem.eql(u8, l.kind, row.kind)) {
+            // Identity is (name, kind, county): Liberia has same-named
+            // districts in different counties (Commonwealth x3).
+            const county_eq = if (l.county) |a|
+                if (row.county) |b| std.mem.eql(u8, a, b) else false
+            else
+                row.county == null;
+            if (std.mem.eql(u8, l.name, row.name) and std.mem.eql(u8, l.kind, row.kind) and county_eq) {
                 l.* = .{
                     .name = l.name,
                     .kind = l.kind,
                     .county = if (row.county) |c| try self.alloc.dupe(u8, c) else l.county,
                     .lat = row.lat orelse l.lat,
                     .lon = row.lon orelse l.lon,
+                    .population = row.population orelse l.population,
                     .source = try self.alloc.dupe(u8, row.source),
                     .verified_at = if (row.verified_at) |v| try self.alloc.dupe(u8, v) else l.verified_at,
                 };
@@ -497,6 +507,7 @@ pub const MemoryKnowledge = struct {
             .county = if (row.county) |c| try self.alloc.dupe(u8, c) else null,
             .lat = row.lat,
             .lon = row.lon,
+            .population = row.population,
             .source = try self.alloc.dupe(u8, row.source),
             .verified_at = if (row.verified_at) |v| try self.alloc.dupe(u8, v) else null,
         });
@@ -573,6 +584,7 @@ pub const MemoryKnowledge = struct {
                 .county = if (l.county) |c| try alloc.dupe(u8, c) else null,
                 .lat = l.lat,
                 .lon = l.lon,
+                .population = l.population,
                 .source = try alloc.dupe(u8, l.source),
                 .verified_at = if (l.verified_at) |v| try alloc.dupe(u8, v) else null,
             });

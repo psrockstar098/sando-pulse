@@ -56,6 +56,7 @@ pub const storage_redis = @import("storage/redis.zig");
 pub const storage_repository = @import("storage/repository.zig");
 pub const workers_worker = @import("workers/worker.zig");
 pub const ai_providers = @import("ai/providers.zig");
+pub const seed_liberia = @import("seed/liberia.zig");
 
 test {
     std.testing.refAllDecls(@This());

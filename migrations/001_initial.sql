@@ -125,7 +125,7 @@ INSERT INTO locations (id, name, kind) VALUES
     ('loc_maryland', 'Maryland', 'county'),
     ('loc_montserrado', 'Montserrado', 'county'),
     ('loc_nimba', 'Nimba', 'county'),
-    ('loc_river_cess', 'River Cess', 'county'),
+    ('loc_rivercess', 'Rivercess', 'county'),
     ('loc_river_gee', 'River Gee', 'county'),
     ('loc_sinoe', 'Sinoe', 'county')
 ON CONFLICT (id) DO NOTHING;

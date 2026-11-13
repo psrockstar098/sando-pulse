@@ -116,7 +116,13 @@ pub const PostgresKnowledge = struct {
     /// Deterministic row id from a name: "<kind>:<slug>" — e.g.
     /// "city:monrovia". Lowercase alphanumerics, separators become "_".
     /// The kind prefix keeps two kinds with the same slug distinct.
-    fn slugId(alloc: Allocator, kind: []const u8, name: []const u8) ![]u8 {
+    /// Location id: kind:name[:county]. The county suffix is part of
+    /// the identity — Liberia has same-named districts in different
+    /// counties (Commonwealth in Grand Bassa, Grand Cape Mount and
+    /// Montserrado). Counties themselves have no county field, so
+    /// their ids are unchanged (county:bomi) and match migration 007's
+    /// rename of the 001 seed ids.
+    fn slugId(alloc: Allocator, kind: []const u8, name: []const u8, county: ?[]const u8) ![]u8 {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(alloc);
         try out.appendSlice(alloc, kind);
@@ -128,11 +134,21 @@ pub const PostgresKnowledge = struct {
                 try out.append(alloc, '_');
             }
         }
+        if (county) |co| {
+            try out.append(alloc, ':');
+            for (co) |c| {
+                if (std.ascii.isAlphanumeric(c)) {
+                    try out.append(alloc, std.ascii.toLower(c));
+                } else if (c == ' ' or c == '-' or c == '_') {
+                    try out.append(alloc, '_');
+                }
+            }
+        }
         return out.toOwnedSlice(alloc);
     }
 
     fn bumpEntityLocked(self: *PostgresKnowledge, alloc: Allocator, name: []const u8, kind: []const u8, ts: i64) !void {
-        const id = try slugId(alloc, kind, name);
+        const id = try slugId(alloc, kind, name, null);
         defer alloc.free(id);
         const esc_id = try pg.escapeLiteral(alloc, id);
         defer alloc.free(esc_id);
@@ -367,7 +383,7 @@ pub const PostgresKnowledge = struct {
         const self: *PostgresKnowledge = @ptrCast(@alignCast(ptr));
         self.lock();
         defer self.unlock();
-        const id = try slugId(alloc, row.kind, row.name);
+        const id = try slugId(alloc, row.kind, row.name, row.county);
         defer alloc.free(id);
         const esc_id = try pg.escapeLiteral(alloc, id);
         defer alloc.free(esc_id);
@@ -385,6 +401,8 @@ pub const PostgresKnowledge = struct {
         defer alloc.free(esc_src);
         const esc_ver = try optLit(alloc, row.verified_at);
         defer alloc.free(esc_ver);
+        const pop_s = if (row.population) |p| try std.fmt.allocPrint(alloc, "{d}", .{p}) else try alloc.dupe(u8, "NULL");
+        defer alloc.free(pop_s);
         // Parent link: a non-county place points at its county row when
         // the county is already seeded (counties are seeded first, so
         // this resolves for real seed data; NULL otherwise).
@@ -394,18 +412,21 @@ pub const PostgresKnowledge = struct {
             break :blk try std.fmt.allocPrint(alloc, "(SELECT id FROM locations WHERE name = {s} AND kind = 'county')", .{esc_parent_county});
         } else try alloc.dupe(u8, "NULL");
         defer alloc.free(parent_s);
-        // 001's columns are latitude/longitude; ON CONFLICT (name, kind)
-        // merges with the 001 county seed instead of duplicating it.
+        // The id carries the full identity (kind:name[:county], see
+        // slugId) and migration 007 renamed the 001 county ids to
+        // this form, so ON CONFLICT (id) merges with the 001 seed
+        // instead of duplicating it.
         const sql = try std.fmt.allocPrint(alloc,
-            \\INSERT INTO locations (id, name, kind, county, latitude, longitude, source, verified_at, parent_id)
-            \\VALUES ({s}, {s}, {s}, {s}, {s}, {s}, {s}, {s}, {s})
-            \\ON CONFLICT (name, kind) DO UPDATE SET
+            \\INSERT INTO locations (id, name, kind, county, latitude, longitude, population, source, verified_at, parent_id)
+            \\VALUES ({s}, {s}, {s}, {s}, {s}, {s}, {s}, {s}, {s}, {s})
+            \\ON CONFLICT (id) DO UPDATE SET
             \\  county = COALESCE(EXCLUDED.county, locations.county),
             \\  latitude = COALESCE(EXCLUDED.latitude, locations.latitude),
             \\  longitude = COALESCE(EXCLUDED.longitude, locations.longitude),
+            \\  population = COALESCE(EXCLUDED.population, locations.population),
             \\  source = EXCLUDED.source,
             \\  verified_at = COALESCE(EXCLUDED.verified_at, locations.verified_at)
-        , .{ esc_id, esc_name, esc_kind, esc_county, lat_s, lon_s, esc_src, esc_ver, parent_s });
+        , .{ esc_id, esc_name, esc_kind, esc_county, lat_s, lon_s, pop_s, esc_src, esc_ver, parent_s });
         defer alloc.free(sql);
         try self.execLocked(alloc, sql);
     }
@@ -476,7 +497,7 @@ pub const PostgresKnowledge = struct {
         defer self.unlock();
         var sql: std.ArrayList(u8) = .empty;
         defer sql.deinit(alloc);
-        try sql.appendSlice(alloc, "SELECT name, kind, county, latitude, longitude, source, verified_at::text FROM locations");
+        try sql.appendSlice(alloc, "SELECT name, kind, county, latitude, longitude, population, source, verified_at::text FROM locations");
         if (kind) |k| {
             try sql.appendSlice(alloc, " WHERE kind = ");
             try sql.appendSlice(alloc, try pg.escapeLiteral(alloc, k));
@@ -488,7 +509,7 @@ pub const PostgresKnowledge = struct {
         defer res.deinit(alloc);
         var out: std.ArrayList(knowledge.LocationRow) = .empty;
         for (res.rows) |row| {
-            if (row.cols.len != 7) return error.ProtocolError;
+            if (row.cols.len != 8) return error.ProtocolError;
             const c = row.cols;
             try out.append(alloc, .{
                 .name = try alloc.dupe(u8, c[0] orelse return error.ProtocolError),
@@ -496,8 +517,9 @@ pub const PostgresKnowledge = struct {
                 .county = if (c[2]) |v| try alloc.dupe(u8, v) else null,
                 .lat = if (c[3]) |v| try std.fmt.parseFloat(f64, v) else null,
                 .lon = if (c[4]) |v| try std.fmt.parseFloat(f64, v) else null,
-                .source = try alloc.dupe(u8, c[5] orelse ""),
-                .verified_at = if (c[6]) |v| try alloc.dupe(u8, v) else null,
+                .population = if (c[5]) |v| try std.fmt.parseInt(i64, v, 10) else null,
+                .source = try alloc.dupe(u8, c[6] orelse ""),
+                .verified_at = if (c[7]) |v| try alloc.dupe(u8, v) else null,
             });
         }
         return out.toOwnedSlice(alloc);
