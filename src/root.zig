@@ -61,6 +61,7 @@ pub const ai_providers = @import("ai/providers.zig");
 pub const seed_liberia = @import("seed/liberia.zig");
 pub const intelligence_events = @import("intelligence/events.zig");
 pub const intelligence_trending = @import("intelligence/trending.zig");
+pub const intelligence_precomputed = @import("intelligence/precomputed.zig");
 
 test {
     std.testing.refAllDecls(@This());

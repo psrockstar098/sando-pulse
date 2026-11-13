@@ -5,6 +5,7 @@
 //!   GET  /v1/sources  public — source registry + per-source doc counts
 //!   GET  /v1/events   public — persisted event clusters (Roadmap 3.4)
 //!   GET  /v1/trends   public — Geez + trending engine (Roadmap 4.2)
+//!   GET  /v1/briefing public — precomputed intelligence (Roadmap 4.4)
 //!   GET  /v1/locations public — reference places (Roadmap 3.6)
 //!   GET  /v1/statistics public — seeded statistics (Roadmap 3.6)
 //!   GET  /v1/connectors/facebook public — Facebook connector status (3.2)
@@ -33,6 +34,8 @@ const pipeline = @import("../ingestion/pipeline.zig");
 const facebook = @import("../ingestion/connectors/facebook/facebook.zig");
 const fb_webhooks = @import("../ingestion/connectors/facebook/webhooks.zig");
 const trending = @import("../intelligence/trending.zig");
+const precomputed = @import("../intelligence/precomputed.zig");
+const redis = @import("../storage/redis.zig");
 const providers = @import("../ai/providers.zig");
 const auth = @import("auth.zig");
 const ratelimit = @import("ratelimit.zig");
@@ -59,6 +62,10 @@ pub const Server = struct {
     /// receiver. Always present; it reports unavailable until a
     /// token + registry are configured.
     facebook: ?*facebook.FacebookConnector = null,
+    /// Redis client for the briefing cache (Roadmap 4.4) and the query
+    /// cache (Roadmap 4.5). Null when Redis is not configured — the
+    /// endpoints recompute live instead.
+    redis: ?*redis.RedisClient = null,
 
     pub fn serve(self: *Server) !void {
         const addr = std.Io.net.IpAddress.parse(self.cfg.host, self.cfg.port) catch |e| {
@@ -355,6 +362,35 @@ pub const Server = struct {
             return;
         }
 
+        if (method == .GET and std.mem.eql(u8, path, "/v1/briefing")) {
+            const now = timex.nowSeconds(self.io);
+            // Serve the worker's cached payload when fresh; otherwise
+            // compute live (and refresh the cache best-effort). The
+            // cached flag tells the caller which path served the read.
+            var cached_payload: ?[]u8 = null;
+            if (self.redis) |rc| {
+                cached_payload = rc.get(alloc, precomputed.briefing_key) catch null;
+            }
+            const payload: []const u8 = cached_payload orelse blk: {
+                const b = precomputed.computeBriefing(alloc, self.repo, self.knowledge, now) catch {
+                    self.respondError(req, alloc, req_id, .internal_server_error, "briefing_failed", "Failed to compute briefing");
+                    return;
+                };
+                const rendered = precomputed.renderBriefing(alloc, b) catch {
+                    self.respondError(req, alloc, req_id, .internal_server_error, "briefing_failed", "Failed to render briefing");
+                    return;
+                };
+                if (self.redis) |rc| {
+                    rc.setex(precomputed.briefing_key, self.cfg.precompute_ttl_s, rendered) catch {};
+                }
+                break :blk rendered;
+            };
+            const body = try std.fmt.allocPrint(alloc, "{{\"briefing\":{s},\"cached\":{},\"request_id\":\"{s}\"}}", .{ payload, cached_payload != null, req_id });
+            self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+            try respondJson(req, .ok, body, req_id);
+            return;
+        }
+
         if (method == .GET and std.mem.eql(u8, path, "/v1/locations")) {
             if (self.knowledge) |k| {
                 const q = queryOf(req.head.target);
@@ -608,6 +644,7 @@ pub const Server = struct {
         if ((method == .GET or method == .POST) and
             (std.mem.eql(u8, path, "/v1/health") or std.mem.eql(u8, path, "/v1/sources") or
                 std.mem.eql(u8, path, "/v1/events") or std.mem.eql(u8, path, "/v1/trends") or
+                std.mem.eql(u8, path, "/v1/briefing") or
                 std.mem.eql(u8, path, "/v1/locations") or
                 std.mem.eql(u8, path, "/v1/statistics") or
                 std.mem.eql(u8, path, "/v1/connectors/facebook") or

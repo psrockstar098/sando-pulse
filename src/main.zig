@@ -1,5 +1,6 @@
 //! Pulse CLI: `pulse serve` | `pulse worker [--once]` | `pulse migrate` |
-//! `pulse status` | `pulse keygen` | `pulse maintenance` | `pulse seed`.
+//! `pulse status` | `pulse keygen` | `pulse maintenance` | `pulse seed` |
+//! `pulse briefing`.
 //!
 //! Zig 0.17.1 entry point: main takes `std.process.Init`, which carries the
 //! Io implementation, the allocator, argv, and the environment map — no
@@ -97,8 +98,8 @@ pub fn main(init: std.process.Init) !void {
 
     const is_worker = std.mem.eql(u8, cmd, "worker");
     const once = is_worker and (cmd_arg != null and std.mem.eql(u8, cmd_arg.?, "--once"));
-    if (!std.mem.eql(u8, cmd, "serve") and !is_worker and !std.mem.eql(u8, cmd, "maintenance") and !std.mem.eql(u8, cmd, "seed")) {
-        logging.err("unknown command (serve | worker [--once] | migrate | status | keygen | maintenance | seed)", &.{});
+    if (!std.mem.eql(u8, cmd, "serve") and !is_worker and !std.mem.eql(u8, cmd, "maintenance") and !std.mem.eql(u8, cmd, "seed") and !std.mem.eql(u8, cmd, "briefing")) {
+        logging.err("unknown command (serve | worker [--once] | migrate | status | keygen | maintenance | seed | briefing)", &.{});
         std.process.exit(2);
     }
 
@@ -220,6 +221,14 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, cmd, "briefing")) {
+        const precomputed = @import("intelligence/precomputed.zig");
+        const b = try precomputed.computeBriefing(alloc, repo, ks, timex.nowSeconds(io));
+        const payload = try precomputed.renderBriefing(alloc, b);
+        std.debug.print("{s}\n", .{payload});
+        return;
+    }
+
     if (std.mem.eql(u8, cmd, "maintenance")) {
         const policy = maintenance.RetentionPolicy{
             .docs_retention_days = cfg.retention_days,
@@ -264,6 +273,7 @@ pub fn main(init: std.process.Init) !void {
         .embedder = embedder,
         .knowledge = ks,
         .facebook = &fb_connector,
+        .redis = redis_client,
     };
     try srv.serve();
 }

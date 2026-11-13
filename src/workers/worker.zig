@@ -17,6 +17,7 @@ const providers = @import("../ai/providers.zig");
 const redis = @import("../storage/redis.zig");
 const cache = @import("../api/cache.zig");
 const realtime = @import("realtime.zig");
+const precomputed = @import("../intelligence/precomputed.zig");
 
 pub fn runOnce(
     alloc: std.mem.Allocator,
@@ -58,6 +59,7 @@ pub fn runLoop(
     redis_client: ?*redis.RedisClient,
 ) !void {
     var last_maintenance: ?i64 = null;
+    var last_precompute: ?i64 = null;
     // Real-time stream consumer (Roadmap 4.3): one consumer per worker
     // process, named by PULSE_WORKER_ID. No Redis -> no stream work.
     var consumer: ?realtime.StreamConsumer = null;
@@ -119,6 +121,21 @@ pub fn runLoop(
             _ = maintenance.runMaintenance(arena.allocator(), io, repo, ks, policy, now) catch |e| {
                 logging.err("maintenance run failed", &.{.{ .key = "error", .value = @errorName(e) }});
             };
+        }
+        // Precomputed briefing (Roadmap 4.4): recompute on schedule
+        // and cache in Redis. A stale or missing cache is fine — the
+        // endpoint recomputes live; a failed refresh just retries.
+        const now2 = timex.nowSeconds(io);
+        const precompute_due = last_precompute == null or now2 - last_precompute.? >= @as(i64, @intCast(cfg.precompute_interval_s));
+        if (precompute_due) {
+            last_precompute = now2;
+            if (redis_client) |rc| {
+                if (precomputed.refreshBriefing(arena.allocator(), rc, repo, ks, now2, cfg.precompute_ttl_s)) {
+                    logging.info("briefing refreshed", &.{});
+                } else {
+                    logging.warn("briefing refresh failed", &.{});
+                }
+            }
         }
         try std.Io.sleep(io, .{ .nanoseconds = @intCast(cfg.ingest_interval_s * std.time.ns_per_s) }, .boot);
     }
