@@ -1134,6 +1134,9 @@ pub const PostgresStore = struct {
     io: std.Io,
     conninfo: []const u8,
     pool: PgPool,
+    /// Read-replica pool (Roadmap 5.5). Null = reads use the primary.
+    /// Heap-allocated: a PgPool must never move after init (see PgPool).
+    replica_pool: ?*PgPool = null,
     sql_gpa: std.heap.DebugAllocator(.{ .thread_safe = true }) = .{},
 
     /// SQL-building allocator: thread-safe, so two concurrent store
@@ -1159,9 +1162,59 @@ pub const PostgresStore = struct {
     }
 
     pub fn deinit(self: *PostgresStore) void {
+        if (self.replica_pool) |rp| {
+            rp.deinit();
+            self.alloc.destroy(rp);
+        }
         self.pool.deinit();
         self.alloc.free(self.conninfo);
         _ = self.sql_gpa.deinit();
+    }
+
+    /// Attach a read replica (Roadmap 5.5). Opens a second pool (2
+    /// connections) to `replica_url` and routes the read methods
+    /// (search, countDocuments, countBySource, scanDocuments) to it.
+    /// Writes (insert/delete) always stay on the primary. The pool
+    /// connects eagerly, so a bad URL fails here — the caller logs it
+    /// and keeps serving reads from the primary. Calling twice is an
+    /// error; the first replica stays attached.
+    pub fn setReplica(self: *PostgresStore, replica_url: []const u8) !void {
+        if (self.replica_pool != null) return error.ReplicaAlreadyConfigured;
+        const rp = try self.alloc.create(PgPool);
+        errdefer self.alloc.destroy(rp);
+        rp.* = try PgPool.init(self.alloc, self.io, replica_url, 2);
+        self.replica_pool = rp;
+    }
+
+    pub fn hasReplica(self: *const PostgresStore) bool {
+        return self.replica_pool != null;
+    }
+
+    const ReadConn = struct {
+        client: *PgClient,
+        pool: *PgPool,
+    };
+
+    /// Check a client out for a READ. Prefers the replica pool when one
+    /// is configured; falls back to the primary when the replica checkout
+    /// fails, so a dead replica never takes reads down with it. The
+    /// returned connection must be returned with checkinRead (or
+    /// dropRead on query error) — never with the primary pool's methods.
+    /// Reads from a replica may lag the primary by the replication delay;
+    /// that staleness is acceptable for search, counts and scans.
+    fn checkoutRead(self: *PostgresStore) !ReadConn {
+        if (self.replica_pool) |rp| {
+            if (rp.checkout()) |c| return .{ .client = c, .pool = rp } else |_| {}
+        }
+        return .{ .client = try self.pool.checkout(), .pool = &self.pool };
+    }
+
+    fn checkinRead(_: *PostgresStore, conn: ReadConn) void {
+        conn.pool.checkin(conn.client);
+    }
+
+    fn dropRead(_: *PostgresStore, conn: ReadConn) void {
+        conn.pool.drop(conn.client);
     }
 
     pub fn repository(self: *PostgresStore) repo_mod.Repository {
@@ -1337,10 +1390,10 @@ pub const PostgresStore = struct {
     /// `source_id` or source name; counties have no column in the schema, so
     /// they match as ILIKE terms against title/text (coarse fallback).
     pub fn search(self: *PostgresStore, alloc: Allocator, q: types.SearchQuery) ![]types.Document {
-        const client = try self.checkout();
-        errdefer self.pool.drop(client);
-        defer self.pool.checkin(client);
-        return self.searchLocked(client, alloc, q);
+        const conn = try self.checkoutRead();
+        errdefer self.dropRead(conn);
+        defer self.checkinRead(conn);
+        return self.searchLocked(conn.client, alloc, q);
     }
 
     fn searchLocked(self: *PostgresStore, client: *PgClient, alloc: Allocator, q: types.SearchQuery) ![]types.Document {
@@ -1508,12 +1561,13 @@ pub const PostgresStore = struct {
     }
 
     pub fn countDocuments(self: *PostgresStore) usize {
-        const client = self.checkout() catch return 0;
-        defer self.pool.checkin(client);
+        const conn = self.checkoutRead() catch return 0;
+        defer self.checkinRead(conn);
+        const client = conn.client;
         var arena = std.heap.ArenaAllocator.init(self.sqlAlloc());
         defer arena.deinit();
         const res = client.query(arena.allocator(), "SELECT count(*) FROM documents") catch {
-            self.pool.drop(client);
+            self.dropRead(conn);
             return 0;
         };
         if (res.rows.len == 0) return 0;
@@ -1525,9 +1579,10 @@ pub const PostgresStore = struct {
     /// limits to documents fetched before the cutoff; null scans all.
     /// `limit` is capped at 1000 per call — retention loops in batches.
     pub fn scanDocuments(self: *PostgresStore, alloc: Allocator, before_ts: ?i64, limit: usize) ![]types.Document {
-        const client = try self.checkout();
-        errdefer self.pool.drop(client);
-        defer self.pool.checkin(client);
+        const conn = try self.checkoutRead();
+        errdefer self.dropRead(conn);
+        defer self.checkinRead(conn);
+        const client = conn.client;
         var sql: std.ArrayList(u8) = .empty;
         defer sql.deinit(alloc);
         try sql.appendSlice(alloc,
@@ -1584,9 +1639,10 @@ pub const PostgresStore = struct {
     }
 
     pub fn countBySource(self: *PostgresStore, alloc: Allocator) ![]types.SourceCount {
-        const client = try self.checkout();
-        errdefer self.pool.drop(client);
-        defer self.pool.checkin(client);
+        const conn = try self.checkoutRead();
+        errdefer self.dropRead(conn);
+        defer self.checkinRead(conn);
+        const client = conn.client;
         var res = try client.query(alloc,
             "SELECT source_id, count(*) FROM documents GROUP BY source_id ORDER BY count(*) DESC",
         );
@@ -2015,6 +2071,83 @@ test "postgres: live" {
 
     // Migrations are idempotent: a second run must not error.
     try runMigrations(alloc, io, url, "/home/hatch/workspace/pulse/migrations");
+}
+
+test "postgres: read replica routes reads, falls back on failure (live)" {
+    const alloc = testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const url = (try getTestEnvVar(alloc, io, "PULSE_TEST_POSTGRES_URL")) orelse {
+        std.debug.print("skip: PULSE_TEST_POSTGRES_URL not set\n", .{});
+        return;
+    };
+    defer alloc.free(url);
+
+    var store = PostgresStore.init(alloc, io, url) catch |err| {
+        std.debug.print("live replica test: store init failed: {any}\n", .{err});
+        return err;
+    };
+    defer store.deinit();
+
+    try testing.expect(!store.hasReplica());
+
+    // The "replica" is a second pool to the same test database: this
+    // proves the routing, not replication. A real replica is a streaming
+    // standby behind PULSE_DATABASE_REPLICA_URL.
+    try store.setReplica(url);
+    try testing.expect(store.hasReplica());
+    // A second attach is an error; the first replica stays attached.
+    try testing.expectError(error.ReplicaAlreadyConfigured, store.setReplica(url));
+
+    // Writes go to the primary; reads route through the replica pool.
+    const id = try types.contentHash(alloc, "new-dawn", "https://example.com/pg-replica", "Replica routing probe");
+    defer alloc.free(id);
+    var repo = store.repository();
+    try repo.insertDocument(.{
+        .id = id,
+        .source_id = "new-dawn",
+        .source_name = "New Dawn",
+        .source_url = "https://thenewdawnliberia.com/",
+        .title = "Replica routing probe",
+        .url = "https://example.com/pg-replica",
+        .text = "A unique replicaquux marker for the replica test.",
+        .published_at = null,
+        .fetched_at = 1762953600,
+        .reliability = 0.70,
+        .topics = &.{"politics"},
+        .content_hash = id,
+    });
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const found = try repo.search(arena.allocator(), .{ .terms = &.{"replicaquux"}, .limit = 10 });
+    var saw_it = false;
+    for (found) |d| {
+        if (std.mem.eql(u8, d.id, id)) saw_it = true;
+    }
+    try testing.expect(saw_it);
+    try testing.expect(repo.countDocuments() >= 1);
+    try testing.expect((try repo.countBySource(arena.allocator())).len >= 1);
+
+    // A store whose replica URL is unreachable fails at attach (any
+    // error is fine — the point is no replica) and keeps serving reads
+    // from the primary.
+    var store2 = PostgresStore.init(alloc, io, url) catch |err| {
+        std.debug.print("live replica test: store2 init failed: {any}\n", .{err});
+        return err;
+    };
+    defer store2.deinit();
+    if (store2.setReplica("postgres://postgres:pulse_test@127.0.0.1:1/pulse_test")) |_| {
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    try testing.expect(!store2.hasReplica());
+    var repo2 = store2.repository();
+    const found2 = try repo2.search(arena.allocator(), .{ .terms = &.{"replicaquux"}, .limit = 10 });
+    var saw_it2 = false;
+    for (found2) |d| {
+        if (std.mem.eql(u8, d.id, id)) saw_it2 = true;
+    }
+    try testing.expect(saw_it2);
 }
 
 test "PgPool: two threads hold two connections at once (live)" {

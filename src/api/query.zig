@@ -276,11 +276,13 @@ pub fn buildHealthResponse(
     doc_count: usize,
     sources_enabled: usize,
     store_name: []const u8,
+    country: []const u8,
 ) ![]u8 {
     return stringifyAlloc(alloc, .{
         .status = "ok",
         .version = "0.1.0",
         .api_version = "1",
+        .country = country,
         .documents = doc_count,
         .sources_enabled = sources_enabled,
         .store = store_name,

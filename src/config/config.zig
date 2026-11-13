@@ -26,6 +26,15 @@ pub const Config = struct {
     /// log only.
     audit_log_path: ?[]const u8 = null,
     database_url: ?[]const u8 = null,
+    /// Read-replica URL (Roadmap 5.5). When set, search reads route to
+    /// a second pool on this URL; writes stay on the primary. Null =
+    /// reads use the primary. A replica that fails to connect is logged
+    /// and ignored — never a boot failure.
+    database_replica_url: ?[]const u8 = null,
+    /// Deployment country, ISO 3166-1 alpha-2 (Roadmap 5.5). Default
+    /// "lr" (Liberia). Reported in /v1/health and `pulse status`;
+    /// the multi-country extension point (see docs/SCALABILITY.md).
+    country: []const u8 = "lr",
     redis_url: ?[]const u8 = null,
     minio_endpoint: ?[]const u8 = null,
     minio_access_key: ?[]const u8 = null,
@@ -137,6 +146,12 @@ pub fn load(alloc: std.mem.Allocator, env_map: *std.process.Environ.Map) !Config
     }
     if (envOwned(alloc, env_map, "DATABASE_URL")) |v| {
         if (v.len > 0) cfg.database_url = v;
+    }
+    if (envOwned(alloc, env_map, "PULSE_DATABASE_REPLICA_URL")) |v| {
+        if (v.len > 0) cfg.database_replica_url = v;
+    }
+    if (envOwned(alloc, env_map, "PULSE_COUNTRY")) |v| {
+        if (v.len > 0) cfg.country = v;
     }
     if (envOwned(alloc, env_map, "REDIS_URL")) |v| {
         if (v.len > 0) cfg.redis_url = v;
@@ -255,4 +270,20 @@ test "load returns defaults without env vars" {
     try std.testing.expectEqual(@as(u32, 365), cfg.retention_days);
     try std.testing.expectEqualStrings("archive", cfg.archive_dir);
     try std.testing.expectEqual(@as(u64, 86400), cfg.maintenance_interval_s);
+    try std.testing.expectEqualStrings("lr", cfg.country);
+    try std.testing.expect(cfg.database_replica_url == null);
+}
+
+test "load reads replica URL and country from env" {
+    const alloc = std.testing.allocator;
+    var map = std.process.Environ.Map.init(alloc);
+    defer map.deinit();
+    try map.put("PULSE_DATABASE_REPLICA_URL", "postgres://replica:5432/pulse");
+    try map.put("PULSE_COUNTRY", "sl");
+    const cfg = try load(alloc, &map);
+    // Both values are dupes owned by the test allocator in this test.
+    defer alloc.free(cfg.database_replica_url.?);
+    defer alloc.free(cfg.country);
+    try std.testing.expectEqualStrings("postgres://replica:5432/pulse", cfg.database_replica_url.?);
+    try std.testing.expectEqualStrings("sl", cfg.country);
 }

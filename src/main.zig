@@ -52,15 +52,17 @@ fn redisSinkPublish(ptr: *anyopaque, alloc: std.mem.Allocator, doc_id: []const u
 
 fn printStatus(cfg: config.Config) void {
     std.debug.print(
-        \\{{"version":"0.1.0","api_version":"1","host":"{s}","port":{d},"auth_configured":{},"key_rotation_configured":{},"store":"{s}","database_configured":{},"redis_configured":{},"minio_configured":{},"sources_total":{d},"sources_enabled":{d},"consumers_configured":{d},"audit_log_file":{}}}
+        \\{{"version":"0.1.0","api_version":"1","country":"{s}","host":"{s}","port":{d},"auth_configured":{},"key_rotation_configured":{},"store":"{s}","database_configured":{},"read_replica_configured":{},"redis_configured":{},"minio_configured":{},"sources_total":{d},"sources_enabled":{d},"consumers_configured":{d},"audit_log_file":{}}}
         \\
     , .{
+        cfg.country,
         cfg.host,
         cfg.port,
         cfg.api_key != null,
         cfg.api_key_previous != null,
         if (cfg.database_url != null) "postgres" else "memory",
         cfg.database_url != null,
+        cfg.database_replica_url != null,
         cfg.redis_url != null,
         cfg.minio_endpoint != null,
         sources.sources.len,
@@ -204,6 +206,16 @@ pub fn main(init: std.process.Init) !void {
         pg.* = try postgres.PostgresStore.initWithPoolSize(alloc, io, url, cfg.pg_pool_size);
         // Fresh `compose up` should just work: migrate on boot.
         try postgres.runMigrations(alloc, io, url, "migrations");
+        // Read replica (Roadmap 5.5): a replica that fails to connect is
+        // logged and ignored — reads stay on the primary.
+        if (cfg.database_replica_url) |replica_url| {
+            pg.setReplica(replica_url) catch |e| {
+                logging.warn("read replica unavailable, reads stay on primary", &.{ .{ .key = "error", .value = @errorName(e) } });
+            };
+            if (pg.hasReplica()) {
+                logging.info("read replica configured: search reads route to the replica", &.{});
+            }
+        }
         pg_store = pg;
         repo = pg.asRepository();
         store_name = "postgres";

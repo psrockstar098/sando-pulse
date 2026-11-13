@@ -373,7 +373,7 @@ pub const Server = struct {
         const path = pathOf(req.head.target);
 
         if (method == .GET and std.mem.eql(u8, path, "/v1/health")) {
-            const body = try query_json.buildHealthResponse(alloc, req_id, self.repo.countDocuments(), sources.enabledCount(), self.store_name);
+            const body = try query_json.buildHealthResponse(alloc, req_id, self.repo.countDocuments(), sources.enabledCount(), self.store_name, self.cfg.country);
             self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
             try respondJson(req, .ok, body, req_id);
             return;
