@@ -370,6 +370,7 @@ pub fn buildLocationsResponse(
         county: ?[]const u8,
         lat: ?f64,
         lon: ?f64,
+        population: ?i64,
         source: []const u8,
         verified_at: ?[]const u8,
     }) = .empty;
@@ -380,6 +381,7 @@ pub fn buildLocationsResponse(
             .county = l.county,
             .lat = l.lat,
             .lon = l.lon,
+            .population = l.population,
             .source = l.source,
             .verified_at = l.verified_at,
         });

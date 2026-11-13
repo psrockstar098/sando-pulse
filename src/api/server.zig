@@ -209,6 +209,19 @@ pub const Server = struct {
         return null;
     }
 
+    /// One query-string parameter value (e.g. kind=city in
+    /// "?kind=city&limit=20"), or null when absent. No URL-decoding:
+    /// our parameter values (kind names, integers) never need it.
+    fn queryParam(query: ?[]const u8, key: []const u8) ?[]const u8 {
+        const q = query orelse return null;
+        var it = std.mem.splitScalar(u8, q, '&');
+        while (it.next()) |pair| {
+            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+            if (std.mem.eql(u8, pair[0..eq], key)) return pair[eq + 1 ..];
+        }
+        return null;
+    }
+
     fn handleRequest(self: *Server, req: *std.http.Server.Request) !void {
         const start_ms = timex.nowMillis(self.io);
         var arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -250,7 +263,13 @@ pub const Server = struct {
 
         if (method == .GET and std.mem.eql(u8, path, "/v1/locations")) {
             if (self.knowledge) |k| {
-                const locs = k.listLocations(alloc, null, 100) catch {
+                const q = queryOf(req.head.target);
+                const kind = queryParam(q, "kind");
+                var limit: usize = 100;
+                if (queryParam(q, "limit")) |ls| {
+                    limit = std.fmt.parseInt(usize, ls, 10) catch 100;
+                }
+                const locs = k.listLocations(alloc, kind, limit) catch {
                     self.respondError(req, alloc, req_id, .internal_server_error, "locations_failed", "Failed to list locations");
                     return;
                 };
@@ -507,3 +526,12 @@ pub const Server = struct {
         self.respondError(req, alloc, req_id, .not_found, "not_found", "No such route");
     }
 };
+
+test "queryParam parses kind and limit" {
+    try std.testing.expectEqualStrings("city", Server.queryParam("kind=city&limit=20", "kind").?);
+    try std.testing.expectEqualStrings("20", Server.queryParam("kind=city&limit=20", "limit").?);
+    try std.testing.expect(Server.queryParam("kind=city", "limit") == null);
+    try std.testing.expect(Server.queryParam(null, "kind") == null);
+    try std.testing.expect(Server.queryParam("kind", "kind") == null);
+    try std.testing.expectEqualStrings("district", Server.queryParam("limit=5&kind=district", "kind").?);
+}
