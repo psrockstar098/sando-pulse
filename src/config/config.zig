@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const logging = @import("../common/logging.zig");
+const usage = @import("../api/usage.zig");
 
 pub const Config = struct {
     host: []const u8 = "0.0.0.0",
@@ -15,6 +16,12 @@ pub const Config = struct {
     /// Previous key, accepted alongside api_key during rotation
     /// (Roadmap 5.1). Remove it once clients have migrated.
     api_key_previous: ?[]const u8 = null,
+    /// Registered API consumers (Roadmap 5.3). Empty = a single implicit
+    /// "default" consumer with all scopes and the global daily limit.
+    consumers: []const usage.Consumer = &.{},
+    /// JSONL audit-log file path (Roadmap 5.3). Null = Postgres + structured
+    /// log only.
+    audit_log_path: ?[]const u8 = null,
     database_url: ?[]const u8 = null,
     redis_url: ?[]const u8 = null,
     minio_endpoint: ?[]const u8 = null,
@@ -110,6 +117,17 @@ pub fn load(alloc: std.mem.Allocator, env_map: *std.process.Environ.Map) !Config
     }
     if (envOwned(alloc, env_map, "PULSE_API_KEY_PREVIOUS")) |v| {
         if (v.len > 0) cfg.api_key_previous = v;
+    }
+    if (envOwned(alloc, env_map, "PULSE_CONSUMERS")) |v| {
+        if (v.len > 0) {
+            cfg.consumers = usage.parseConsumers(alloc, v) catch &.{};
+            if (cfg.consumers.len == 0) {
+                logging.warn("PULSE_CONSUMERS set but no valid entries parsed — falling back to the default consumer", &.{});
+            }
+        }
+    }
+    if (envOwned(alloc, env_map, "PULSE_AUDIT_LOG")) |v| {
+        if (v.len > 0) cfg.audit_log_path = v;
     }
     if (envOwned(alloc, env_map, "DATABASE_URL")) |v| {
         if (v.len > 0) cfg.database_url = v;

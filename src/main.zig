@@ -19,6 +19,8 @@ const std = @import("std");
 const logging = @import("common/logging.zig");
 const timex = @import("common/time.zig");
 const config = @import("config/config.zig");
+const usage = @import("api/usage.zig");
+const auditlog = @import("api/auditlog.zig");
 const loadtest = @import("cli/loadtest.zig");
 const audit = @import("cli/audit.zig");
 const backup_cli = @import("cli/backup.zig");
@@ -49,18 +51,21 @@ fn redisSinkPublish(ptr: *anyopaque, alloc: std.mem.Allocator, doc_id: []const u
 
 fn printStatus(cfg: config.Config) void {
     std.debug.print(
-        \\{{"version":"0.1.0","host":"{s}","port":{d},"auth_configured":{},"store":"{s}","database_configured":{},"redis_configured":{},"minio_configured":{},"sources_total":{d},"sources_enabled":{d}}}
+        \\{{"version":"0.1.0","api_version":"1","host":"{s}","port":{d},"auth_configured":{},"key_rotation_configured":{},"store":"{s}","database_configured":{},"redis_configured":{},"minio_configured":{},"sources_total":{d},"sources_enabled":{d},"consumers_configured":{d},"audit_log_file":{}}}
         \\
     , .{
         cfg.host,
         cfg.port,
         cfg.api_key != null,
+        cfg.api_key_previous != null,
         if (cfg.database_url != null) "postgres" else "memory",
         cfg.database_url != null,
         cfg.redis_url != null,
         cfg.minio_endpoint != null,
         sources.sources.len,
         sources.enabledCount(),
+        cfg.consumers.len,
+        cfg.audit_log_path != null,
     });
 }
 
@@ -327,6 +332,45 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // Usage tracking (Roadmap 5.3): Redis-backed when a client is
+    // configured, in-memory otherwise. Process-lifetime.
+    var usage_tracker = usage.UsageTracker.init(alloc, redis_client);
+
+    // Audit sink (Roadmap 5.3): Postgres audit_log table (migration 011)
+    // + optional JSONL file + structured log. Best-effort: a sink that
+    // cannot connect degrades to log-only rather than failing boot.
+    var audit_pg: ?*postgres.PgClient = null;
+    var audit_pg_owned: ?*postgres.PgClient = null;
+    if (cfg.database_url) |url| {
+        const holder = alloc.create(postgres.PgClient) catch null;
+        if (holder) |h| {
+            if (postgres.PgClient.connect(alloc, io, url)) |connected| {
+                h.* = connected;
+                audit_pg = h;
+                audit_pg_owned = h;
+            } else |_| {
+                logging.warn("audit: postgres unavailable, audit records go to log/file only", &.{});
+                alloc.destroy(h);
+            }
+        }
+    }
+    defer if (audit_pg_owned) |h| alloc.destroy(h);
+    var audit_file: ?std.Io.File = null;
+    var audit_file_len: u64 = 0;
+    if (cfg.audit_log_path) |p| {
+        var cwd = std.Io.Dir.cwd();
+        if (cwd.createFile(io, p, .{ .truncate = false })) |f| {
+            audit_file = f;
+            if (f.stat(io)) |st| {
+                audit_file_len = @intCast(st.size);
+            } else |_| {}
+        } else |e| {
+            logging.warn("audit: cannot open audit log file", &.{ .{ .key = "error", .value = @errorName(e) } });
+        }
+    }
+    defer if (audit_file) |f| f.close(io);
+    var audit_sink = auditlog.AuditSink.init(alloc, io, audit_pg, audit_file, audit_file_len);
+
     var srv = server.Server{
         .alloc = alloc,
         .io = io,
@@ -340,6 +384,8 @@ pub fn main(init: std.process.Init) !void {
         .knowledge = ks,
         .facebook = &fb_connector,
         .redis = redis_client,
+        .usage_tracker = &usage_tracker,
+        .audit_sink = &audit_sink,
     };
     try srv.serve();
 }

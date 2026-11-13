@@ -43,6 +43,8 @@ const auth = @import("auth.zig");
 const ratelimit = @import("ratelimit.zig");
 const metrics = @import("metrics.zig");
 const cache = @import("cache.zig");
+const usage = @import("usage.zig");
+const auditlog = @import("auditlog.zig");
 const timex = @import("../common/time.zig");
 const query_json = @import("query.zig");
 
@@ -69,6 +71,13 @@ pub const Server = struct {
     /// cache (Roadmap 4.5). Null when Redis is not configured — the
     /// endpoints recompute live instead.
     redis: ?*redis.RedisClient = null,
+    /// Usage tracking (Roadmap 5.3): per-consumer counters, Redis-backed
+    /// when a client is configured, in-memory otherwise. Always present.
+    usage_tracker: *usage.UsageTracker,
+    /// Audit sink (Roadmap 5.3): Postgres + JSONL + structured log.
+    /// Always present; the sink degrades to log-only when neither
+    /// Postgres nor a file is configured.
+    audit_sink: *auditlog.AuditSink,
 
     pub fn serve(self: *Server) !void {
         const addr = std.Io.net.IpAddress.parse(self.cfg.host, self.cfg.port) catch |e| {
@@ -144,6 +153,7 @@ pub const Server = struct {
                 .{ .name = "content-type", .value = "application/json" },
                 .{ .name = "x-request-id", .value = req_id },
                 .{ .name = "x-pulse-cached", .value = if (cached) "true" else "false" },
+                .{ .name = "x-pulse-api-version", .value = "1" },
             },
         });
     }
@@ -162,6 +172,7 @@ pub const Server = struct {
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "application/json" },
                 .{ .name = "x-request-id", .value = req_id },
+                .{ .name = "x-pulse-api-version", .value = "1" },
             },
         });
     }
@@ -177,6 +188,7 @@ pub const Server = struct {
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "application/json" },
                 .{ .name = "x-request-id", .value = req_id },
+                .{ .name = "x-pulse-api-version", .value = "1" },
             },
         }) catch {};
     }
@@ -193,15 +205,90 @@ pub const Server = struct {
         return reader.readAllocAll(arena, @intCast(len));
     }
 
-    fn checkAuthAndRate(self: *Server, req: *std.http.Server.Request, arena: std.mem.Allocator, req_id: []const u8) bool {
+    /// The consumer named by X-Pulse-Consumer, or "default" when the
+    /// header is absent. Callers only reach this after checkAuthAndRate
+    /// validated the name.
+    fn consumerOf(req: *std.http.Server.Request) []const u8 {
+        return headerValue(req.head_buffer, "x-pulse-consumer") orelse usage.default_consumer_name;
+    }
+
+    fn keyFpOf(self: *Server, req: *std.http.Server.Request, arena: std.mem.Allocator) []const u8 {
+        _ = self;
+        const presented = auth.presentedToken(headerValue(req.head_buffer, "authorization"));
+        return auditlog.keyFingerprint(arena, presented) catch "anonymous";
+    }
+
+    /// Write one audit record for this request (best-effort, never fails
+    /// the request). `status` is the final HTTP status.
+    fn auditCall(self: *Server, req: *std.http.Server.Request, arena: std.mem.Allocator, req_id: []const u8, status: u16) void {
+        self.audit_sink.record(.{
+            .ts = timex.nowSeconds(self.io),
+            .consumer = consumerOf(req),
+            .key_fingerprint = keyFpOf(self, req, arena),
+            .route = pathOf(req.head.target),
+            .method = @tagName(req.head.method),
+            .status = status,
+            .request_id = req_id,
+        });
+    }
+
+    /// Count one completed query/ingest call against the consumer's
+    /// daily usage. Best-effort: a tracking failure never fails the
+    /// request (the quota check reads the same counter, so a lost
+    /// increment only ever under-counts).
+    fn recordUsage(self: *Server, req: *std.http.Server.Request, kind: usage.UsageKind) void {
+        const day = usage.dayOf(self.alloc, timex.nowSeconds(self.io)) catch return;
+        defer self.alloc.free(day);
+        self.usage_tracker.record(consumerOf(req), kind, day) catch {};
+    }
+
+    /// Auth + scope + rate limit + quota gate (Roadmap 5.3).
+    /// `kind` is the usage kind being gated, or null for the admin
+    /// endpoint (/v1/usage), which is rate-limited but not quota-counted.
+    /// Denials are audit-recorded with their status before responding.
+    fn checkAuthAndRate(self: *Server, req: *std.http.Server.Request, arena: std.mem.Allocator, req_id: []const u8, kind: ?usage.UsageKind) bool {
         const auth_header = headerValue(req.head_buffer, "authorization");
+        // Consumer resolution: unknown names and malformed names are
+        // denials, not defaults — a typo'd consumer must not silently
+        // spend the default consumer's quota.
+        const consumer_name = consumerOf(req);
+        if (!usage.validConsumerName(consumer_name)) {
+            self.auditCall(req, arena, req_id, 400);
+            self.respondError(req, arena, req_id, .bad_request, "invalid_consumer", "X-Pulse-Consumer must be 1-64 chars of [a-z0-9_-]");
+            return false;
+        }
+        var default_consumer = usage.Consumer{
+            .name = usage.default_consumer_name,
+            .scopes = &.{ .query, .ingest, .admin },
+            .quota_per_day = 0,
+        };
+        const consumer: *const usage.Consumer = if (self.cfg.consumers.len == 0)
+            &default_consumer
+        else if (usage.findConsumer(self.cfg.consumers, consumer_name)) |c|
+            c
+        else {
+            self.auditCall(req, arena, req_id, 401);
+            self.respondError(req, arena, req_id, .unauthorized, "unknown_consumer", "No such consumer is registered");
+            return false;
+        };
+        const needed: usage.Scope = if (kind) |k| switch (k) {
+            .query => .query,
+            .ingest => .ingest,
+        } else .admin;
+        if (!usage.consumerHasScope(consumer, needed)) {
+            self.auditCall(req, arena, req_id, 403);
+            self.respondError(req, arena, req_id, .forbidden, "forbidden_scope", "This consumer does not hold the scope for this endpoint");
+            return false;
+        }
         switch (auth.authenticateRotated(self.cfg.api_key, self.cfg.api_key_previous, auth_header)) {
             .open, .ok => {},
             .missing => {
+                self.auditCall(req, arena, req_id, 401);
                 self.respondError(req, arena, req_id, .unauthorized, "auth_required", "Missing Authorization: Bearer <api-key> header");
                 return false;
             },
             .invalid => {
+                self.auditCall(req, arena, req_id, 401);
                 self.respondError(req, arena, req_id, .unauthorized, "auth_invalid", "Invalid API key");
                 return false;
             },
@@ -210,24 +297,45 @@ pub const Server = struct {
         // budget during rotation); "anonymous" in open dev mode.
         const key = auth.presentedToken(auth_header) orelse "anonymous";
         const check = self.limiter.check(key, timex.nowMillis(self.io)) catch {
+            self.auditCall(req, arena, req_id, 429);
             self.respondError(req, arena, req_id, .too_many_requests, "rate_limited", "Rate limit exceeded");
             return false;
         };
         if (!check.allowed) {
             const body = query_json.buildErrorResponse(arena, req_id, "rate_limited", "Rate limit exceeded") catch {
+                self.auditCall(req, arena, req_id, 429);
                 self.respondError(req, arena, req_id, .too_many_requests, "rate_limited", "Rate limit exceeded");
                 return false;
             };
             self.metrics.observeRequest(429, 0);
+            self.auditCall(req, arena, req_id, 429);
             req.respond(body, .{
                 .status = .too_many_requests,
                 .extra_headers = &.{
                     .{ .name = "content-type", .value = "application/json" },
                     .{ .name = "x-request-id", .value = req_id },
                     .{ .name = "retry-after", .value = std.fmt.allocPrint(arena, "{d}", .{check.retry_after_s}) catch "60" },
+                    .{ .name = "x-pulse-api-version", .value = "1" },
                 },
             }) catch {};
             return false;
+        }
+        // Per-consumer daily quota (query/ingest only). The effective
+        // quota is the consumer's own, or the global daily limit when
+        // the consumer's is 0 (unset).
+        if (kind) |k| {
+            const effective = if (consumer.quota_per_day > 0) consumer.quota_per_day else self.cfg.rate_limit_per_day;
+            const day = usage.dayOf(arena, timex.nowSeconds(self.io)) catch {
+                self.auditCall(req, arena, req_id, 429);
+                self.respondError(req, arena, req_id, .too_many_requests, "quota_exceeded", "Daily quota exceeded");
+                return false;
+            };
+            const used = self.usage_tracker.count(arena, consumer.name, k, day);
+            if (used >= effective) {
+                self.auditCall(req, arena, req_id, 429);
+                self.respondError(req, arena, req_id, .too_many_requests, "quota_exceeded", "Daily quota exceeded for this consumer");
+                return false;
+            }
         }
         return true;
     }
@@ -484,7 +592,7 @@ pub const Server = struct {
         }
 
         if (method == .POST and std.mem.eql(u8, path, "/v1/query")) {
-            if (!self.checkAuthAndRate(req, alloc, req_id)) return;
+            if (!self.checkAuthAndRate(req, alloc, req_id, .query)) return;
             const body = readBody(req, alloc) catch {
                 self.respondError(req, alloc, req_id, .bad_request, "invalid_request", "Request body too large or unreadable");
                 return;
@@ -514,6 +622,8 @@ pub const Server = struct {
                                 self.metrics.observeCacheHit();
                                 self.metrics.observeQuery(cachedSufficient(stamped_body) orelse true);
                                 self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+                                self.recordUsage(req, .query);
+                                self.auditCall(req, alloc, req_id, 200);
                                 try respondJsonCached(req, .ok, stamped_body, req_id, true);
                                 return;
                             }
@@ -551,12 +661,14 @@ pub const Server = struct {
                 }
             }
             self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+            self.recordUsage(req, .query);
+            self.auditCall(req, alloc, req_id, 200);
             try respondJsonCached(req, .ok, resp, req_id, false);
             return;
         }
 
         if (method == .POST and std.mem.eql(u8, path, "/v1/ingest")) {
-            if (!self.checkAuthAndRate(req, alloc, req_id)) return;
+            if (!self.checkAuthAndRate(req, alloc, req_id, .ingest)) return;
             const body = readBody(req, alloc) catch {
                 self.respondError(req, alloc, req_id, .bad_request, "invalid_request", "Request body too large or unreadable");
                 return;
@@ -641,7 +753,64 @@ pub const Server = struct {
             self.metrics.setDocumentsIndexed(@intCast(self.repo.countDocuments()));
             const resp = try std.fmt.allocPrint(alloc, "{{\"id\":\"{s}\",\"source_id\":\"{s}\",\"request_id\":\"{s}\"}}", .{ doc.id, doc.source_id, req_id });
             self.metrics.observeRequest(201, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+            self.recordUsage(req, .ingest);
+            self.auditCall(req, alloc, req_id, 201);
             try respondJson(req, .created, resp, req_id);
+            return;
+        }
+
+        // GET /v1/usage — per-consumer daily usage, quotas and remaining
+        // (Roadmap 5.3). Admin scope: consumers registered without the
+        // admin scope cannot read anyone's usage, including their own.
+        if (method == .GET and std.mem.eql(u8, path, "/v1/usage")) {
+            if (!self.checkAuthAndRate(req, alloc, req_id, null)) return;
+            const now = timex.nowSeconds(self.io);
+            const day = usage.dayOf(alloc, now) catch {
+                self.respondError(req, alloc, req_id, .internal_server_error, "usage_failed", "Failed to compute the current day");
+                return;
+            };
+            const filter = queryParam(queryOf(req.head.target), "consumer");
+            var rows: std.ArrayList(usage.UsageRow) = .empty;
+            if (self.cfg.consumers.len == 0) {
+                const q = self.usage_tracker.count(alloc, usage.default_consumer_name, .query, day);
+                const ig = self.usage_tracker.count(alloc, usage.default_consumer_name, .ingest, day);
+                const total = q + ig;
+                rows.append(alloc, .{
+                    .consumer = usage.default_consumer_name,
+                    .queries = q,
+                    .ingests = ig,
+                    .quota_per_day = self.cfg.rate_limit_per_day,
+                    .remaining = self.cfg.rate_limit_per_day - @min(total, self.cfg.rate_limit_per_day),
+                }) catch {
+                    self.respondError(req, alloc, req_id, .internal_server_error, "usage_failed", "Failed to build usage response");
+                    return;
+                };
+            } else {
+                for (self.cfg.consumers) |c| {
+                    if (filter) |f| if (!std.mem.eql(u8, f, c.name)) continue;
+                    const q = self.usage_tracker.count(alloc, c.name, .query, day);
+                    const ig = self.usage_tracker.count(alloc, c.name, .ingest, day);
+                    const quota = if (c.quota_per_day > 0) c.quota_per_day else self.cfg.rate_limit_per_day;
+                    const total = q + ig;
+                    rows.append(alloc, .{
+                        .consumer = c.name,
+                        .queries = q,
+                        .ingests = ig,
+                        .quota_per_day = quota,
+                        .remaining = quota - @min(total, quota),
+                    }) catch {
+                        self.respondError(req, alloc, req_id, .internal_server_error, "usage_failed", "Failed to build usage response");
+                        return;
+                    };
+                }
+            }
+            const body = query_json.buildUsageResponse(alloc, req_id, day, rows.items) catch {
+                self.respondError(req, alloc, req_id, .internal_server_error, "usage_failed", "Failed to render usage response");
+                return;
+            };
+            self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+            self.auditCall(req, alloc, req_id, 200);
+            try respondJson(req, .ok, body, req_id);
             return;
         }
 
@@ -729,6 +898,7 @@ pub const Server = struct {
                 std.mem.eql(u8, path, "/v1/connectors/facebook") or
                 std.mem.eql(u8, path, "/v1/webhooks/facebook") or
                 std.mem.eql(u8, path, "/metrics") or std.mem.eql(u8, path, "/v1/query") or
+                std.mem.eql(u8, path, "/v1/usage") or
                 std.mem.eql(u8, path, "/v1/ingest")))
         {
             self.respondError(req, alloc, req_id, .method_not_allowed, "method_not_allowed", "Method not allowed on this route");

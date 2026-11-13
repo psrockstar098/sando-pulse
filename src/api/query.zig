@@ -280,9 +280,26 @@ pub fn buildHealthResponse(
     return stringifyAlloc(alloc, .{
         .status = "ok",
         .version = "0.1.0",
+        .api_version = "1",
         .documents = doc_count,
         .sources_enabled = sources_enabled,
         .store = store_name,
+        .request_id = req_id,
+    });
+}
+
+/// GET /v1/usage response (Roadmap 5.3): one UsageRow per consumer for
+/// the given UTC day. `usage` is the upstream module to avoid a cycle
+/// between the JSON builders and the tracker.
+pub fn buildUsageResponse(
+    alloc: std.mem.Allocator,
+    req_id: []const u8,
+    day: []const u8,
+    rows: []const @import("usage.zig").UsageRow,
+) ![]u8 {
+    return stringifyAlloc(alloc, .{
+        .day = day,
+        .usage = rows,
         .request_id = req_id,
     });
 }
