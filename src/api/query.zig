@@ -429,6 +429,63 @@ pub fn buildEventDetailResponse(
     });
 }
 
+const trending = @import("../intelligence/trending.zig");
+
+/// GET /v1/trends — Geez and trending engine (Roadmap 4.2): ranked
+/// topics with velocity, geographic trending, and monthly snapshots.
+/// `snapshots` are the latest 3 months present in the aggregates.
+pub fn buildTrendsResponse(
+    alloc: std.mem.Allocator,
+    req_id: []const u8,
+    trends: []const trending.TopicTrend,
+    geo: []const trending.GeoTrend,
+    snapshots: []const trending.MonthSnapshot,
+) ![]u8 {
+    var trend_list: std.ArrayList(struct {
+        topic: []const u8,
+        category: []const u8,
+        recent_count: usize,
+        prior_count: usize,
+        velocity: f64,
+        score: f64,
+    }) = .empty;
+    for (trends) |t| {
+        try trend_list.append(alloc, .{
+            .topic = t.topic,
+            .category = t.category,
+            .recent_count = t.recent_count,
+            .prior_count = t.prior_count,
+            .velocity = t.velocity,
+            .score = t.score,
+        });
+    }
+    var geo_list: std.ArrayList(struct {
+        county: []const u8,
+        doc_count: usize,
+        top_topic: []const u8,
+    }) = .empty;
+    for (geo) |g| {
+        try geo_list.append(alloc, .{
+            .county = g.county,
+            .doc_count = g.doc_count,
+            .top_topic = g.top_topic,
+        });
+    }
+    var snap_list: std.ArrayList(struct {
+        year_month: []const u8,
+        topics: []trending.TopicCount,
+    }) = .empty;
+    for (snapshots) |s| {
+        try snap_list.append(alloc, .{ .year_month = s.year_month, .topics = s.topics });
+    }
+    return stringifyAlloc(alloc, .{
+        .trends = trend_list.items,
+        .geo = geo_list.items,
+        .snapshots = snap_list.items,
+        .request_id = req_id,
+    });
+}
+
 /// GET /v1/locations — seeded + OSM reference places.
 pub fn buildLocationsResponse(
     alloc: std.mem.Allocator,

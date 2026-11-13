@@ -4,6 +4,7 @@
 //!   GET  /v1/health   public — liveness + index size
 //!   GET  /v1/sources  public — source registry + per-source doc counts
 //!   GET  /v1/events   public — persisted event clusters (Roadmap 3.4)
+//!   GET  /v1/trends   public — Geez + trending engine (Roadmap 4.2)
 //!   GET  /v1/locations public — reference places (Roadmap 3.6)
 //!   GET  /v1/statistics public — seeded statistics (Roadmap 3.6)
 //!   GET  /v1/connectors/facebook public — Facebook connector status (3.2)
@@ -31,6 +32,7 @@ const validate = @import("../ingestion/validate.zig");
 const pipeline = @import("../ingestion/pipeline.zig");
 const facebook = @import("../ingestion/connectors/facebook/facebook.zig");
 const fb_webhooks = @import("../ingestion/connectors/facebook/webhooks.zig");
+const trending = @import("../intelligence/trending.zig");
 const providers = @import("../ai/providers.zig");
 const auth = @import("auth.zig");
 const ratelimit = @import("ratelimit.zig");
@@ -278,6 +280,78 @@ pub const Server = struct {
                 return;
             }
             self.respondError(req, alloc, req_id, .internal_server_error, "events_unavailable", "Knowledge store unavailable");
+            return;
+        }
+
+        if (method == .GET and std.mem.eql(u8, path, "/v1/trends")) {
+            const q = queryOf(req.head.target);
+            const window_s = trending.parseWindow(queryParam(q, "window")) orelse {
+                self.respondError(req, alloc, req_id, .bad_request, "invalid_window", "window must be 24h, 7d, or 30d");
+                return;
+            };
+            const category = queryParam(q, "category");
+            const county = queryParam(q, "county");
+            var limit: usize = 10;
+            if (queryParam(q, "limit")) |ls| {
+                limit = std.fmt.parseInt(usize, ls, 10) catch 10;
+                if (limit > 50) limit = 50;
+            }
+            const now = timex.nowSeconds(self.io);
+            const docs = self.repo.scanDocuments(alloc, now, 5000) catch {
+                self.respondError(req, alloc, req_id, .internal_server_error, "trends_failed", "Failed to scan documents");
+                return;
+            };
+            var all_trends = trending.computeTrends(alloc, docs, now, window_s) catch {
+                self.respondError(req, alloc, req_id, .internal_server_error, "trends_failed", "Failed to compute trends");
+                return;
+            };
+            if (category) |cat| {
+                var kept: std.ArrayList(trending.TopicTrend) = .empty;
+                for (all_trends) |t| {
+                    if (std.mem.eql(u8, t.category, cat)) try kept.append(alloc, t);
+                }
+                all_trends = kept.items;
+            }
+            if (all_trends.len > limit) all_trends = all_trends[0..limit];
+            var geo_trends = trending.computeGeoTrends(alloc, docs, now, window_s) catch {
+                self.respondError(req, alloc, req_id, .internal_server_error, "trends_failed", "Failed to compute geographic trends");
+                return;
+            };
+            if (county) |c| {
+                var kept: std.ArrayList(trending.GeoTrend) = .empty;
+                for (geo_trends) |g| {
+                    if (std.mem.eql(u8, g.county, c)) try kept.append(alloc, g);
+                }
+                geo_trends = kept.items;
+            }
+            // Monthly snapshots: the latest 3 months present in the
+            // maintenance aggregates (Roadmap 3.5), newest first.
+            var snapshots: std.ArrayList(trending.MonthSnapshot) = .empty;
+            if (self.knowledge) |k| {
+                const aggs = k.listMonthlyAggregates(alloc, 200) catch &.{};
+                var months: std.ArrayList([]const u8) = .empty;
+                for (aggs) |row| {
+                    var seen = false;
+                    for (months.items) |m| {
+                        if (std.mem.eql(u8, m, row.year_month)) {
+                            seen = true;
+                            break;
+                        }
+                    }
+                    if (!seen) try months.append(alloc, row.year_month);
+                }
+                std.mem.sort([]const u8, months.items, {}, struct {
+                    fn less(_: void, a: []const u8, b: []const u8) bool {
+                        return std.mem.lessThan(u8, b, a);
+                    }
+                }.less);
+                for (months.items[0..@min(months.items.len, 3)]) |m| {
+                    try snapshots.append(alloc, try trending.snapshotFromAggregates(alloc, aggs, m));
+                }
+            }
+            const body = try query_json.buildTrendsResponse(alloc, req_id, all_trends, geo_trends, snapshots.items);
+            self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+            try respondJson(req, .ok, body, req_id);
             return;
         }
 
@@ -533,7 +607,8 @@ pub const Server = struct {
 
         if ((method == .GET or method == .POST) and
             (std.mem.eql(u8, path, "/v1/health") or std.mem.eql(u8, path, "/v1/sources") or
-                std.mem.eql(u8, path, "/v1/events") or std.mem.eql(u8, path, "/v1/locations") or
+                std.mem.eql(u8, path, "/v1/events") or std.mem.eql(u8, path, "/v1/trends") or
+                std.mem.eql(u8, path, "/v1/locations") or
                 std.mem.eql(u8, path, "/v1/statistics") or
                 std.mem.eql(u8, path, "/v1/connectors/facebook") or
                 std.mem.eql(u8, path, "/v1/webhooks/facebook") or

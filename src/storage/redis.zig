@@ -524,6 +524,34 @@ pub const RedisClient = struct {
         count: usize,
         block_ms: u64,
     ) ![]StreamEntry {
+        return self.xreadgroupId(alloc, group, consumer, stream, count, block_ms, ">");
+    }
+
+    /// XREADGROUP with an explicit stream id: ">" for new entries,
+    /// "0" for pending entries this consumer (or the group) has not
+    /// acked yet — the worker-recovery path (Roadmap 4.3). Shares the
+    /// reply parsing with xreadgroup.
+    pub fn xreadPending(
+        self: *RedisClient,
+        alloc: Allocator,
+        group: []const u8,
+        consumer: []const u8,
+        stream: []const u8,
+        count: usize,
+    ) ![]StreamEntry {
+        return self.xreadgroupId(alloc, group, consumer, stream, count, 0, "0");
+    }
+
+    fn xreadgroupId(
+        self: *RedisClient,
+        alloc: Allocator,
+        group: []const u8,
+        consumer: []const u8,
+        stream: []const u8,
+        count: usize,
+        block_ms: u64,
+        stream_id: []const u8,
+    ) ![]StreamEntry {
         var count_buf: [32]u8 = undefined;
         const count_s = std.fmt.bufPrint(&count_buf, "{d}", .{count}) catch return error.InvalidArgument;
         var block_buf: [32]u8 = undefined;
@@ -531,7 +559,7 @@ pub const RedisClient = struct {
         const args = &[_][]const u8{
             "XREADGROUP", "GROUP", group, consumer,
             "COUNT",      count_s, "BLOCK", block_s,
-            "STREAMS",    stream,  ">",
+            "STREAMS",    stream,  stream_id,
         };
         // The server may legitimately hold this call for block_ms.
         const deadline = self.deadlineFromNow(block_ms);
@@ -587,6 +615,127 @@ pub const RedisClient = struct {
             .array => |a| {
                 if (a) |entries| return parseEntries(alloc, entries);
                 return &.{};
+            },
+            .err => return error.RedisError,
+            else => return error.UnexpectedReply,
+        }
+    }
+
+    /// XACK <stream> <group> <ids...>. Returns how many entries were acked.
+    pub fn xack(self: *RedisClient, alloc: Allocator, stream: []const u8, group: []const u8, ids: []const []const u8) !i64 {
+        var args: std.ArrayList([]const u8) = .empty;
+        defer args.deinit(alloc);
+        try args.appendSlice(alloc, &.{ "XACK", stream, group });
+        try args.appendSlice(alloc, ids);
+        const reply = try self.command(alloc, args.items);
+        return switch (reply) {
+            .integer => |n| n,
+            .err => error.RedisError,
+            else => error.UnexpectedReply,
+        };
+    }
+
+    /// XPENDING <stream> <group>: total number of unacked entries in the
+    /// group (the first element of the summary reply). Used by the worker
+    /// to decide whether recovery work is pending (Roadmap 4.3).
+    pub fn xpendingCount(self: *RedisClient, alloc: Allocator, stream: []const u8, group: []const u8) !i64 {
+        const reply = try self.command(alloc, &.{ "XPENDING", stream, group });
+        switch (reply) {
+            .array => |a| {
+                const items = a orelse return error.UnexpectedReply;
+                if (items.len < 1) return error.UnexpectedReply;
+                return switch (items[0]) {
+                    .integer => |n| n,
+                    else => error.UnexpectedReply,
+                };
+            },
+            .err => return error.RedisError,
+            else => return error.UnexpectedReply,
+        }
+    }
+
+    /// DEL <keys...>. Returns how many keys were deleted.
+    pub fn del(self: *RedisClient, alloc: Allocator, keys: []const []const u8) !i64 {
+        var args: std.ArrayList([]const u8) = .empty;
+        defer args.deinit(alloc);
+        try args.append(alloc, "DEL");
+        try args.appendSlice(alloc, keys);
+        const reply = try self.command(alloc, args.items);
+        return switch (reply) {
+            .integer => |n| n,
+            .err => error.RedisError,
+            else => error.UnexpectedReply,
+        };
+    }
+
+    /// INCR <key>. Returns the new value. Used for the query-cache epoch
+    /// (Roadmap 4.5) and per-consumer usage counters (Roadmap 5.3).
+    pub fn incr(self: *RedisClient, alloc: Allocator, key: []const u8) !i64 {
+        const reply = try self.command(alloc, &.{ "INCR", key });
+        return switch (reply) {
+            .integer => |n| n,
+            .err => error.RedisError,
+            else => error.UnexpectedReply,
+        };
+    }
+
+    /// EXPIRE <key> <seconds>. Returns true when the timeout was set.
+    pub fn expire(self: *RedisClient, alloc: Allocator, key: []const u8, seconds: u64) !bool {
+        var secs_buf: [32]u8 = undefined;
+        const secs = std.fmt.bufPrint(&secs_buf, "{d}", .{seconds}) catch return error.InvalidArgument;
+        const reply = try self.command(alloc, &.{ "EXPIRE", key, secs });
+        return switch (reply) {
+            .integer => |n| n == 1,
+            .err => error.RedisError,
+            else => error.UnexpectedReply,
+        };
+    }
+
+    /// LPUSH <key> <values...>. Returns the list length after the push.
+    pub fn lpush(self: *RedisClient, alloc: Allocator, key: []const u8, values: []const []const u8) !i64 {
+        var args: std.ArrayList([]const u8) = .empty;
+        defer args.deinit(alloc);
+        try args.appendSlice(alloc, &.{ "LPUSH", key });
+        try args.appendSlice(alloc, values);
+        const reply = try self.command(alloc, args.items);
+        return switch (reply) {
+            .integer => |n| n,
+            .err => error.RedisError,
+            else => error.UnexpectedReply,
+        };
+    }
+
+    /// LTRIM <key> <start> <stop>. Keeps only that slice of the list.
+    pub fn ltrim(self: *RedisClient, alloc: Allocator, key: []const u8, start: i64, stop: i64) !void {
+        var start_buf: [32]u8 = undefined;
+        var stop_buf: [32]u8 = undefined;
+        const s = std.fmt.bufPrint(&start_buf, "{d}", .{start}) catch return error.InvalidArgument;
+        const e = std.fmt.bufPrint(&stop_buf, "{d}", .{stop}) catch return error.InvalidArgument;
+        const reply = try self.command(alloc, &.{ "LTRIM", key, s, e });
+        switch (reply) {
+            .simple => return,
+            .err => return error.RedisError,
+            else => return error.UnexpectedReply,
+        }
+    }
+
+    /// LRANGE <key> <start> <stop>. All strings owned by `alloc`.
+    pub fn lrange(self: *RedisClient, alloc: Allocator, key: []const u8, start: i64, stop: i64) ![][]const u8 {
+        var start_buf: [32]u8 = undefined;
+        var stop_buf: [32]u8 = undefined;
+        const s = std.fmt.bufPrint(&start_buf, "{d}", .{start}) catch return error.InvalidArgument;
+        const e = std.fmt.bufPrint(&stop_buf, "{d}", .{stop}) catch return error.InvalidArgument;
+        const reply = try self.command(alloc, &.{ "LRANGE", key, s, e });
+        switch (reply) {
+            .array => |a| {
+                const items = a orelse return &.{};
+                var out: std.ArrayList([]const u8) = .empty;
+                errdefer out.deinit(alloc);
+                for (items) |item| {
+                    const b = asBulk(item) orelse return error.UnexpectedReply;
+                    try out.append(alloc, b);
+                }
+                return out.toOwnedSlice(alloc);
             },
             .err => return error.RedisError,
             else => return error.UnexpectedReply,
@@ -1041,4 +1190,71 @@ test "live redis round-trip (gated on PULSE_TEST_REDIS_URL)" {
     try testing.expectEqualStrings(added, read[0].id);
     try testing.expectEqual(@as(usize, 2), read[0].fields.len);
     try testing.expectEqualStrings("doc-live-2", read[0].fields[1].value);
+}
+
+test "live redis streams ack/pending + misc (gated on PULSE_TEST_REDIS_URL)" {
+    const alloc = testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const url = (try testRedisUrl(io, alloc)) orelse {
+        std.debug.print("skip: PULSE_TEST_REDIS_URL not set\n", .{});
+        return;
+    };
+    defer alloc.free(url);
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var client = RedisClient.connect(a, io, url) catch |err| {
+        std.debug.print("live redis test: connect failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer client.close();
+
+    const suffix = unixMillis(io);
+    const stream = try std.fmt.allocPrint(alloc, "pulse:test:ack:{d}", .{suffix});
+    defer alloc.free(stream);
+    try client.xgroupCreate(stream, "workers");
+    const fields = [_]Field{
+        .{ .name = "type", .value = "document.collected" },
+        .{ .name = "document_id", .value = "doc-ack-1" },
+    };
+    const id1 = try client.xadd(a, stream, &fields);
+    const id2 = try client.xadd(a, stream, &fields);
+    // One entry read + acked, one left pending.
+    const read = try client.xreadgroup(a, "workers", "c1", stream, 10, 1000);
+    try testing.expectEqual(@as(usize, 2), read.len);
+    try testing.expectEqual(@as(i64, 1), try client.xack(a, stream, "workers", &.{id1}));
+    try testing.expectEqual(@as(i64, 1), try client.xpendingCount(a, stream, "workers"));
+    // Recovery path: pending entries are re-readable by id "0".
+    const pending = try client.xreadPending(a, "workers", "c1", stream, 10);
+    try testing.expectEqual(@as(usize, 1), pending.len);
+    try testing.expectEqualStrings(id2, pending[0].id);
+    try testing.expectEqual(@as(i64, 1), try client.xack(a, stream, "workers", &.{id2}));
+    try testing.expectEqual(@as(i64, 0), try client.xpendingCount(a, stream, "workers"));
+
+    // INCR / EXPIRE / DEL round-trip.
+    const counter = try std.fmt.allocPrint(alloc, "pulse:test:counter:{d}", .{suffix});
+    defer alloc.free(counter);
+    try testing.expectEqual(@as(i64, 1), try client.incr(a, counter));
+    try testing.expectEqual(@as(i64, 2), try client.incr(a, counter));
+    try testing.expect(try client.expire(a, counter, 60));
+    try testing.expectEqual(@as(i64, 1), try client.del(a, &.{counter}));
+    try testing.expectEqual(@as(i64, 0), try client.del(a, &.{counter}));
+
+    // LPUSH / LRANGE / LTRIM round-trip.
+    const list = try std.fmt.allocPrint(alloc, "pulse:test:list:{d}", .{suffix});
+    defer alloc.free(list);
+    try testing.expectEqual(@as(i64, 2), try client.lpush(a, list, &.{ "b", "a" }));
+    const items = try client.lrange(a, list, 0, -1);
+    try testing.expectEqual(@as(usize, 2), items.len);
+    try testing.expectEqualStrings("a", items[0]);
+    try testing.expectEqualStrings("b", items[1]);
+    try client.ltrim(a, list, 0, 0);
+    const trimmed = try client.lrange(a, list, 0, -1);
+    try testing.expectEqual(@as(usize, 1), trimmed.len);
+    try testing.expectEqual(@as(i64, 1), try client.del(a, &.{list}));
 }
