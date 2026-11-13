@@ -197,7 +197,150 @@ fn storeDocument(
     return true;
 }
 
-fn ingestOneSource(
+/// One source that is due for a fetch, with its per-source item limit
+/// (3.1). Built sequentially in runOnce; the fetch itself is concurrent.
+const DueSource = struct {
+    source: sources.Source,
+    limit: usize,
+};
+
+/// Fetch one URL body. Implemented by the RSS connector in production;
+/// tests inject a fake. Runs on a worker thread with that thread's own
+/// io — never the shared main io (see FetchTask).
+pub const FetchFn = *const fn (ctx: *anyopaque, alloc: std.mem.Allocator, io: std.Io, url: []const u8) anyerror![]u8;
+
+const RssFetchCtx = struct {
+    environ: ?*const std.process.Environ.Map,
+};
+
+fn rssFetchFn(ctx: *anyopaque, alloc: std.mem.Allocator, io: std.Io, url: []const u8) anyerror![]u8 {
+    const c: *RssFetchCtx = @ptrCast(@alignCast(ctx));
+    return connectors.rssConnector().fetch(alloc, io, url, c.environ);
+}
+
+/// One source fetched + parsed on its own thread (Roadmap 4.5).
+/// Each task owns its arena and its own `std.Io.Threaded` instance:
+/// `HostName.connect` resolves DNS through `io.async`, and the
+/// Threaded io's wait machinery is only reliable from the thread that
+/// owns it — sharing the main io across spawned threads deadlocked/
+/// corrupted state (same lesson as the PgPool mutex, 2026-11-13).
+/// Nothing shared is touched on the worker: the repository, event
+/// sink and knowledge store are only used by the main thread when it
+/// processes the fetched results afterwards.
+pub const FetchTask = struct {
+    source: sources.Source,
+    limit: usize,
+    fetch_fn: FetchFn,
+    fetch_ctx: *anyopaque,
+    arena: std.heap.ArenaAllocator,
+    threaded: std.Io.Threaded,
+    body: ?[]u8 = null,
+    items: ?[]rss.RawItem = null,
+    err: ?anyerror = null,
+    err_stage: enum { fetch, parse } = .fetch,
+    duration_ms: i64 = 0,
+    /// Shared concurrency accounting (atomics only — no shared heap).
+    current: *std.atomic.Value(usize),
+    max_seen: *std.atomic.Value(usize),
+
+    fn run(self: *FetchTask) void {
+        const io = self.threaded.io();
+        const start = timex.nowMillis(io);
+        const cur = self.current.fetchAdd(1, .monotonic) + 1;
+        defer _ = self.current.fetchSub(1, .monotonic);
+        var prev = self.max_seen.load(.monotonic);
+        while (cur > prev) {
+            if (self.max_seen.cmpxchgWeak(prev, cur, .monotonic, .monotonic) == null) break;
+            prev = self.max_seen.load(.monotonic);
+        }
+        const alloc = self.arena.allocator();
+        const body = self.fetch_fn(self.fetch_ctx, alloc, io, self.source.feed_url) catch |e| {
+            self.err = e;
+            self.err_stage = .fetch;
+            self.duration_ms = timex.nowMillis(io) - start;
+            return;
+        };
+        self.body = body;
+        const items = rss.parse(alloc, body) catch |e| {
+            self.err = e;
+            self.err_stage = .parse;
+            self.duration_ms = timex.nowMillis(io) - start;
+            return;
+        };
+        self.items = items;
+        self.duration_ms = timex.nowMillis(io) - start;
+    }
+};
+
+/// Fetch a list of due sources concurrently, bounded by `max_concurrent`
+/// (clamped to 1..32), in waves. Returns the tasks in source order; the
+/// caller processes them sequentially and then deinits each task's
+/// `threaded` + `arena` and frees the slice.
+pub fn fetchConcurrent(
+    alloc: std.mem.Allocator,
+    due: []const DueSource,
+    fetch_fn: FetchFn,
+    fetch_ctx: *anyopaque,
+    max_concurrent: usize,
+    current: *std.atomic.Value(usize),
+    max_seen: *std.atomic.Value(usize),
+) ![]FetchTask {
+    const tasks = try alloc.alloc(FetchTask, due.len);
+    for (due, 0..) |d, i| {
+        tasks[i] = .{
+            .source = d.source,
+            .limit = d.limit,
+            .fetch_fn = fetch_fn,
+            .fetch_ctx = fetch_ctx,
+            .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            .threaded = std.Io.Threaded.init(std.heap.page_allocator, .{}),
+            .current = current,
+            .max_seen = max_seen,
+        };
+    }
+    errdefer {
+        for (tasks) |*t| {
+            t.threaded.deinit();
+            t.arena.deinit();
+        }
+        alloc.free(tasks);
+    }
+    const n = @max(1, @min(max_concurrent, 32));
+    var start: usize = 0;
+    while (start < tasks.len) {
+        const end = @min(tasks.len, start + n);
+        const wave = tasks[start..end];
+        const threads = try alloc.alloc(std.Thread, wave.len);
+        defer alloc.free(threads);
+        var spawned: usize = 0;
+        for (wave, 0..) |*t, i| {
+            threads[i] = std.Thread.spawn(.{}, FetchTask.run, .{t}) catch |e| {
+                for (threads[0..spawned]) |th| th.join();
+                return e;
+            };
+            spawned += 1;
+        }
+        for (threads) |th| th.join();
+        start = end;
+    }
+    return tasks;
+}
+
+/// Fetch + parse one source through the RSS connector. The error set
+/// keeps the stage: FetchFailed vs ParseFailed, so health records and
+/// the concurrent collector can tell them apart.
+fn fetchSourceItems(alloc: std.mem.Allocator, io: std.Io, source: sources.Source, environ: ?*const std.process.Environ.Map) error{ FetchFailed, ParseFailed }!struct { body: []u8, items: []rss.RawItem } {
+    const body = connectors.rssConnector().fetch(alloc, io, source.feed_url, environ) catch return error.FetchFailed;
+    const items = rss.parse(alloc, body) catch return error.ParseFailed;
+    return .{ .body = body, .items = items };
+}
+
+/// Archive + normalize + insert for an already-fetched source (Roadmap
+/// 4.5 split). `body`/`items` are owned by the caller — in the
+/// concurrent path they live in the fetch task's arena, which stays
+/// alive until this returns. `fetch_ms` is the fetch phase's duration.
+/// The sequential wrapper below reuses this unchanged.
+fn ingestParsedSource(
     alloc: std.mem.Allocator,
     io: std.Io,
     repo: repository.Repository,
@@ -205,26 +348,20 @@ fn ingestOneSource(
     sink: ?EventSink,
     archiver: ?*object_store.S3Client,
     now: i64,
-    environ: ?*const std.process.Environ.Map,
     embedder: ?providers.EmbeddingProvider,
     ks: ?knowledge.KnowledgeStore,
+    body: []const u8,
+    items: []const rss.RawItem,
     limit: usize,
+    fetch_ms: i64,
 ) SourceReport {
     const start = timex.nowMillis(io);
     var report = SourceReport{
         .source_id = source.id,
-        .fetched = 0,
+        .fetched = items.len,
         .inserted = 0,
         .errors = 0,
         .duration_ms = 0,
-    };
-    // Fetch through the RSS connector (3.2 framework); the connector
-    // is the single place where fetch policy lives.
-    const body = connectors.rssConnector().fetch(alloc, io, source.feed_url, environ) catch {
-        report.errors += 1;
-        report.duration_ms = timex.nowMillis(io) - start;
-        if (ks) |k| recordHealth(k, alloc, source.id, now, false, "fetch failed", 0);
-        return report;
     };
     // Archive the raw feed, compressed (best effort). A compression
     // failure falls back to the raw body — archiving never blocks
@@ -248,13 +385,6 @@ fn ingestOneSource(
             }
         }
     }
-    const items = rss.parse(alloc, body) catch {
-        report.errors += 1;
-        report.duration_ms = timex.nowMillis(io) - start;
-        if (ks) |k| recordHealth(k, alloc, source.id, now, false, "parse failed", 0);
-        return report;
-    };
-    report.fetched = items.len;
     // Per-source collection limit (3.1): only the first N items of a
     // run are processed; the rest wait for the next run.
     const limited = items[0..@min(items.len, limit)];
@@ -275,11 +405,42 @@ fn ingestOneSource(
         }
         report.inserted += 1;
     }
-    report.duration_ms = timex.nowMillis(io) - start;
+    report.duration_ms = fetch_ms + (timex.nowMillis(io) - start);
     // Reached only when fetch + parse succeeded: the source is healthy
     // even if individual items failed validation/storage.
     if (ks) |k| recordHealth(k, alloc, source.id, now, true, null, report.inserted);
     return report;
+}
+
+fn ingestOneSource(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    repo: repository.Repository,
+    source: sources.Source,
+    sink: ?EventSink,
+    archiver: ?*object_store.S3Client,
+    now: i64,
+    environ: ?*const std.process.Environ.Map,
+    embedder: ?providers.EmbeddingProvider,
+    ks: ?knowledge.KnowledgeStore,
+    limit: usize,
+) SourceReport {
+    const start = timex.nowMillis(io);
+    // Fetch through the RSS connector (3.2 framework); the connector
+    // is the single place where fetch policy lives.
+    const fetched = fetchSourceItems(alloc, io, source, environ) catch |e| {
+        var report = SourceReport{
+            .source_id = source.id,
+            .fetched = 0,
+            .inserted = 0,
+            .errors = 1,
+            .duration_ms = 0,
+        };
+        report.duration_ms = timex.nowMillis(io) - start;
+        if (ks) |k| recordHealth(k, alloc, source.id, now, false, if (e == error.FetchFailed) "fetch failed" else "parse failed", 0);
+        return report;
+    };
+    return ingestParsedSource(alloc, io, repo, source, sink, archiver, now, embedder, ks, fetched.body, fetched.items, limit, timex.nowMillis(io) - start);
 }
 
 /// Facebook leg (Roadmap 3.2): poll due registered pages through
@@ -348,6 +509,8 @@ pub fn runOnce(
     embedder: ?providers.EmbeddingProvider,
     ks: ?knowledge.KnowledgeStore,
     default_interval_s: u64,
+    /// Bounded worker concurrency for the fetch phase (Roadmap 4.5).
+    max_concurrent_sources: usize,
     /// Facebook connector (null when the process runs without one).
     /// Its collect() is a no-op while unconfigured.
     fb: ?*facebook.FacebookConnector,
@@ -357,6 +520,10 @@ pub fn runOnce(
     const before = repo.countDocuments();
     var reports: std.ArrayList(SourceReport) = .empty;
     var had_error = false;
+    // 1. Due list, sequential: config resolution and the interval check
+    // read the knowledge store and must not run concurrently.
+    var due: std.ArrayList(DueSource) = .empty;
+    defer due.deinit(alloc);
     for (sources.sources) |source| {
         // Per-source runtime config (3.1): env overrides, auth state,
         // interval scheduling against the recorded last run.
@@ -395,10 +562,39 @@ pub fn runOnce(
                 continue;
             }
         }
-        const r = ingestOneSource(alloc, io, repo, source, sink, archiver, now, environ, embedder, ks, rt.limit);
+        try due.append(alloc, .{ .source = source, .limit = rt.limit });
+    }
+    // 2. Fetch the due sources concurrently (bounded waves). Each task
+    // owns its arena + its own Threaded io; nothing shared is touched.
+    var current: std.atomic.Value(usize) = .init(0);
+    var max_seen: std.atomic.Value(usize) = .init(0);
+    var rss_ctx = RssFetchCtx{ .environ = environ };
+    const tasks = try fetchConcurrent(alloc, due.items, rssFetchFn, &rss_ctx, max_concurrent_sources, &current, &max_seen);
+    defer {
+        for (tasks) |*t| {
+            t.threaded.deinit();
+            t.arena.deinit();
+        }
+        alloc.free(tasks);
+    }
+    // 3. Process each fetched source sequentially on this thread: the
+    // repository, event sink and knowledge store are never used
+    // concurrently, so inserts stay serialized and idempotent.
+    for (tasks) |*t| {
+        const r = if (t.err) |_| blk: {
+            const report = SourceReport{
+                .source_id = t.source.id,
+                .fetched = 0,
+                .inserted = 0,
+                .errors = 1,
+                .duration_ms = t.duration_ms,
+            };
+            if (ks) |k| recordHealth(k, alloc, t.source.id, now, false, if (t.err_stage == .fetch) "fetch failed" else "parse failed", 0);
+            break :blk report;
+        } else ingestParsedSource(alloc, io, repo, t.source, sink, archiver, now, embedder, ks, t.body.?, t.items.?, t.limit, t.duration_ms);
         if (r.errors > 0) had_error = true;
         logging.info("ingest source done", &.{
-            .{ .key = "source", .value = source.id },
+            .{ .key = "source", .value = t.source.id },
             .{ .key = "fetched", .value = try std.fmt.allocPrint(alloc, "{d}", .{r.fetched}) },
             .{ .key = "inserted", .value = try std.fmt.allocPrint(alloc, "{d}", .{r.inserted}) },
             .{ .key = "errors", .value = try std.fmt.allocPrint(alloc, "{d}", .{r.errors}) },
@@ -424,4 +620,52 @@ pub fn runOnce(
         .duration_ms = timex.nowMillis(io) - start,
         .had_error = had_error,
     };
+}
+
+/// Fake fetch for the concurrency test: sleeps `ms` (a raw nanosleep —
+/// no Io instance exists on the worker thread) then returns a canned
+/// one-item RSS feed. The sleep forces real overlap between waves.
+fn fakeFetchSleep(ctx: *anyopaque, alloc: std.mem.Allocator, io: std.Io, url: []const u8) anyerror![]u8 {
+    _ = io;
+    _ = url;
+    const ms: *const u64 = @ptrCast(@alignCast(ctx));
+    var req = std.os.linux.timespec{ .sec = @intCast(ms.* / 1000), .nsec = @intCast((ms.* % 1000) * 1_000_000) };
+    _ = std.os.linux.nanosleep(&req, null);
+    return alloc.dupe(u8,
+        \\<?xml version="1.0"?><rss><channel>
+        \\<item><title>Boakai signs budget</title><link>https://example.com/a</link><description>Budget signed.</description><pubDate>Thu, 12 Nov 2026 10:00:00 +0000</pubDate></item>
+        \\</channel></rss>
+    );
+}
+
+test "fetchConcurrent: bounded concurrency, source order, real parse" {
+    const alloc = std.testing.allocator;
+    const due = [_]DueSource{
+        .{ .source = .{ .id = "s1", .name = "S1", .home_url = "https://example.com/", .feed_url = "https://example.com/1.xml", .reliability = 0.7, .enabled = true }, .limit = 10 },
+        .{ .source = .{ .id = "s2", .name = "S2", .home_url = "https://example.com/", .feed_url = "https://example.com/2.xml", .reliability = 0.7, .enabled = true }, .limit = 10 },
+        .{ .source = .{ .id = "s3", .name = "S3", .home_url = "https://example.com/", .feed_url = "https://example.com/3.xml", .reliability = 0.7, .enabled = true }, .limit = 10 },
+        .{ .source = .{ .id = "s4", .name = "S4", .home_url = "https://example.com/", .feed_url = "https://example.com/4.xml", .reliability = 0.7, .enabled = true }, .limit = 10 },
+        .{ .source = .{ .id = "s5", .name = "S5", .home_url = "https://example.com/", .feed_url = "https://example.com/5.xml", .reliability = 0.7, .enabled = true }, .limit = 10 },
+        .{ .source = .{ .id = "s6", .name = "S6", .home_url = "https://example.com/", .feed_url = "https://example.com/6.xml", .reliability = 0.7, .enabled = true }, .limit = 10 },
+    };
+    var current: std.atomic.Value(usize) = .init(0);
+    var max_seen: std.atomic.Value(usize) = .init(0);
+    const sleep_ms: u64 = 100;
+    const tasks = try fetchConcurrent(alloc, &due, fakeFetchSleep, @constCast(&sleep_ms), 2, &current, &max_seen);
+    defer {
+        for (tasks) |*t| {
+            t.threaded.deinit();
+            t.arena.deinit();
+        }
+        alloc.free(tasks);
+    }
+    try std.testing.expectEqual(@as(usize, 6), tasks.len);
+    // 6 sources x 100ms at concurrency 2: at most 2 ever ran at once.
+    try std.testing.expectEqual(@as(usize, 2), max_seen.load(.monotonic));
+    for (tasks, 0..) |*t, i| {
+        try std.testing.expect(t.err == null);
+        try std.testing.expect(t.items != null);
+        try std.testing.expectEqual(@as(usize, 1), t.items.?.len);
+        try std.testing.expectEqualStrings(due[i].source.id, t.source.id);
+    }
 }

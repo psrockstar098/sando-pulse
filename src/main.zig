@@ -1,6 +1,6 @@
 //! Pulse CLI: `pulse serve` | `pulse worker [--once]` | `pulse migrate` |
 //! `pulse status` | `pulse keygen` | `pulse maintenance` | `pulse seed` |
-//! `pulse briefing`.
+//! `pulse briefing` | `pulse loadtest [--url ...] [--threads N] [--requests N] [--query ...]`.
 //!
 //! Zig 0.17.1 entry point: main takes `std.process.Init`, which carries the
 //! Io implementation, the allocator, argv, and the environment map — no
@@ -18,6 +18,7 @@ const std = @import("std");
 const logging = @import("common/logging.zig");
 const timex = @import("common/time.zig");
 const config = @import("config/config.zig");
+const loadtest = @import("cli/loadtest.zig");
 const repository = @import("storage/repository.zig");
 const knowledge = @import("storage/knowledge.zig");
 const seed = @import("seed/liberia.zig");
@@ -78,6 +79,14 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, cmd, "loadtest")) {
+        var rest: std.ArrayList([]const u8) = .empty;
+        if (cmd_arg) |a| try rest.append(alloc, a);
+        while (args_it.next()) |a| try rest.append(alloc, a);
+        try loadtest.run(alloc, rest.items);
+        return;
+    }
+
     const cfg = try config.load(alloc, init.environ_map);
     logging.setLevel(logging.parseLevel(cfg.log_level));
 
@@ -98,8 +107,8 @@ pub fn main(init: std.process.Init) !void {
 
     const is_worker = std.mem.eql(u8, cmd, "worker");
     const once = is_worker and (cmd_arg != null and std.mem.eql(u8, cmd_arg.?, "--once"));
-    if (!std.mem.eql(u8, cmd, "serve") and !is_worker and !std.mem.eql(u8, cmd, "maintenance") and !std.mem.eql(u8, cmd, "seed") and !std.mem.eql(u8, cmd, "briefing")) {
-        logging.err("unknown command (serve | worker [--once] | migrate | status | keygen | maintenance | seed | briefing)", &.{});
+    if (!std.mem.eql(u8, cmd, "serve") and !is_worker and !std.mem.eql(u8, cmd, "maintenance") and !std.mem.eql(u8, cmd, "seed") and !std.mem.eql(u8, cmd, "briefing") and !std.mem.eql(u8, cmd, "loadtest")) {
+        logging.err("unknown command (serve | worker [--once] | migrate | status | keygen | maintenance | seed | briefing | loadtest)", &.{});
         std.process.exit(2);
     }
 
@@ -248,7 +257,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (is_worker) {
         if (once) {
-            const report = try worker.runOnce(alloc, io, repo, sink, if (archiver) |*a| a else null, &m, init.environ_map, embedder, ks, cfg.ingest_interval_s, &fb_connector);
+            const report = try worker.runOnce(alloc, io, repo, sink, if (archiver) |*a| a else null, &m, init.environ_map, embedder, ks, cfg.ingest_interval_s, cfg.max_concurrent_sources, &fb_connector);
             std.debug.print("ingest once: docs {d} -> {d}, {d} sources, had_error={}\n", .{
                 report.docs_before,
                 report.docs_after,

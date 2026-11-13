@@ -131,7 +131,7 @@ pub fn load(alloc: std.mem.Allocator, env_map: *std.process.Environ.Map) !Config
         cfg.query_cache_ttl_s = parseU64(v) orelse 300;
     }
     if (envOwned(alloc, env_map, "PULSE_MAX_CONCURRENT_SOURCES")) |v| {
-        cfg.max_concurrent_sources = @intCast(parseU64(v) orelse 4);
+        cfg.max_concurrent_sources = @intCast(@max(1, @min(parseU64(v) orelse 4, 8)));
     }
     if (envOwned(alloc, env_map, "PULSE_PG_POOL_SIZE")) |v| {
         cfg.pg_pool_size = @intCast(parseU64(v) orelse 1);
