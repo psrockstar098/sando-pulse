@@ -468,11 +468,13 @@ Server started with `PULSE_API_KEY=<keygen>`, `PULSE_CONSUMERS=sando:query,admin
 7. **CI live legs are skipped** until a combined pgvector+PostGIS image is chosen (5.4).
 8. **The smoke-test server crashed once** (the `readBody` head-invalidation bug) before the fix — the fix is committed (`4bc562c`) and the exact crashing request now returns 200 with the server alive; no in-suite server-level test exists, the live smoke test is the regression check.
 
-## Roadmap 6 — Performance Core (in progress, 2026-11-13)
+## Roadmap 6 — Performance Core (DONE, 2026-11-13)
 
 Baseline at start: `zig build` passes, 204/204 tests, origin/main `61d186a`.
 Constraints: Zig 0.17.1, REST only, raw std.http only (NO httpz — owner's
 direct order 2026-11-13), real data only, docs in the same commits.
+Final state: `zig build` passes, **255/255 tests** (51 new), all sections
+6.1–6.13 done + the added RAM/CPU optimization scope. Head `0605090`.
 
 ### 6.2 L1 in-process cache — DONE (2026-11-13 ~14:20)
 
@@ -1051,3 +1053,41 @@ Full tables in `docs/PERFORMANCE.md`; the short version:
   test fails only while benchmark scale docs sit in the shared
   test DB — they are removed after the benchmarks, and the
   suite is re-run clean).
+
+### 6.13 Docs + verification — DONE (2026-11-13 ~20:30)
+
+- README.md: new "Performance (Roadmap 6)" section (three
+  paths table, cache layers, index design, measured latency
+  table, the 5 ms target called a target not a result, how to
+  benchmark with `pulse loadtest`, what the VM can/cannot
+  prove) + the Query response example now shows `path`,
+  `latency_ms`, `routing_reason`.
+- docs/PERFORMANCE.md: new "Architecture" section (cache
+  layers table, index design, routing rules, service
+  objectives, scaling guide pointer to docs/SCALABILITY.md,
+  auto-tuning knobs + bounds table). The file now covers
+  method, architecture, 6.11 measured-first decisions,
+  optimization scope, and the 6.12 benchmark tables.
+- docs/API.md: new "Query response fields" section (`path`,
+  `latency_ms`, `routing_reason`, `options.limit` 1–20 default
+  10 — including that a top-level `"limit"` is ignored and the
+  6.12 fix that made the limit actually work).
+- docs/OPERATIONS.md: new "Benchmarking" bullet under Health
+  monitoring (`pulse loadtest` flags, `pulse reindex` + its
+  ~89 s / 10k docs cost, the VM floor warning).
+- docs/openapi.yaml: QueryResponse gains `path` (enum
+  instant/fast/deep), `latency_ms`, `routing_reason`
+  (`options.limit` 1–20 default 10 was already documented).
+- Honest gaps carried forward (not fixed in R6): the ~42 ms
+  per-request floor on this VM (std dispatch latency,
+  re-measure on real hardware); the 5 ms hot-path target
+  unmet here; 1K/10K concurrency and 1M/10M+ index milestones
+  untested (need a real host); the threaded accept loop
+  (head-of-line blocking, measured at 50 threads and during
+  ingest); the memindex >1000-same-second boundary edge (a
+  (timestamp, id) cursor would close it); `reindex`
+  duration_ms always 0 (reporting bug); the embedding
+  breaker's live close unproven (no working external provider).
+- Verified: `zig build` passes; **255/255 tests pass** on a
+  clean DB. Full R6 verification (build + suite + live smoke)
+  is in the R6 closeout below.

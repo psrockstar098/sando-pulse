@@ -111,6 +111,21 @@ backup instead.
   check (index counts, never-scanned indexes, `documents` last
   ANALYZE). A WARN there means: run `pulse maintenance`, or review
   an index that has never been scanned.
+- Benchmarking (Roadmap 6.12): `pulse loadtest` hammers a running
+  server and reports p50/p95/p99/p99.9 for health + query, plus RSS
+  and CPU when given the server pid:
+  `pulse loadtest --url http://127.0.0.1:9000 --threads 1
+  --requests 250 --query "fuel shortage in Monrovia" --distinct
+  --server-pid <pid> --api-key <key>` (`--distinct` makes every
+  query unique — the fast path; without it the run measures the
+  instant path after warm-up. `--limit 1..20` sets
+  `options.limit`). `pulse reindex` rebuilds the in-memory index
+  from the store and reports docs added/terms (~89 s per 10k docs
+  on the dev VM; the server rebuilds at boot the same way). Full
+  method + latest numbers: `docs/PERFORMANCE.md`. Do not read
+  absolute latencies off the dev VM as production numbers — the
+  ~42 ms per-request floor there is the VM's `std.Io.Threaded`
+  dispatch latency, not Pulse (same doc).
 - Prometheus scrapes the API, postgres-exporter, redis-exporter and
   node-exporter every 15s; rules live in
   `docker/prometheus/alerts.yml` (API down, 5xx rate, slow responses,

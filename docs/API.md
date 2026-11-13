@@ -109,6 +109,31 @@ evidence. That is a valid 200 response, not an error — treat it as "I
 don't know" and never fill the gap with invented content. The answer
 text is extractive: it is built only from the cited `results`.
 
+## Query response fields (Roadmap 6.1, 6.12)
+
+Every `POST /v1/query` 200 carries, alongside the answer:
+
+- `path` — the execution path that served this response:
+  `instant` (L1/L2 cache hit only — no store work),
+  `fast` (memindex shortlist + store search, the default), or
+  `deep` (research/compare/historical intents: whole candidate
+  set + fuzzy second pass).
+- `latency_ms` — measured server-side latency (fractional). This
+  is the handler's time only; client-measured latency is higher
+  (connection setup + the per-request floor on the dev VM — see
+  `docs/PERFORMANCE.md`).
+- `routing_reason` — why the router chose the path
+  (`l1_hit`, `l2_hit`, `default_fast`, `intent_deep`,
+  `strategy_deep`, `semantic_only`).
+- `options.limit` (request, 1–20, default 10) controls how many
+  results the response carries. It was a no-op before Roadmap
+  6.12 (always 10 results); since 6.12 it threads through the
+  search and the renderer — limit=20 returns 20 results,
+  limit=5 returns 5, and the two are distinct cache keys. A
+  top-level `"limit"` field is ignored: send it under
+  `"options"` (`{"query": "...", "options": {"limit": 20}}`).
+  Outside 1–20 the request is a 400.
+
 ## Popular searches and freshness (Roadmap 6.4)
 
 - `GET /v1/popular?limit=N` returns the most-asked queries,

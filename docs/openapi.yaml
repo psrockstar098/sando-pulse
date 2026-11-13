@@ -197,6 +197,16 @@ components:
           type: array
           items:
             type: object
+        path:
+          type: string
+          enum: [instant, fast, deep]
+          description: "Execution path that served this response (Roadmap 6.1): instant = L1/L2 cache hit only; fast = memindex shortlist + store search; deep = research/compare/historical intents, whole candidate set + fuzzy second pass."
+        latency_ms:
+          type: number
+          description: Measured server-side latency in milliseconds (fractional). Client-measured latency is higher (connection + the ~42 ms per-request floor on the dev VM — see docs/PERFORMANCE.md).
+        routing_reason:
+          type: string
+          description: Why the router chose this path (e.g. l1_hit, l2_hit, default_fast, intent_deep, strategy_deep, semantic_only).
         query_plan:
           type: object
           properties:

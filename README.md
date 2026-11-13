@@ -94,11 +94,19 @@ Every response carries a `request_id` (`req-{hex nanos}`). Rate limits:
   "sufficient": true,
   "insufficient_reason": null,
   "confidence": 0.65,
+  "path": "fast",
+  "latency_ms": 85.17,
+  "routing_reason": "default_fast",
   "results": [{ "title": "...", "url": "...", "source": {"name": "New Dawn"}, "score": 0.69 }],
   "query_plan": { "intent": "search", "topics": ["health","politics"], "counties": [], "organizations": [], "sources": ["daily-observer","new-dawn","liberian-investigator","gnn-liberia","the-news"] },
   "meta": { "request_id": "...", "results_count": 1, "sources_checked": 5 }
 }
 ```
+
+`path` is the execution path (`instant` / `fast` / `deep`),
+`latency_ms` the measured server-side latency, `routing_reason`
+why the router chose it. `options.limit` (1–20, default 10)
+controls how many results come back.
 
 **Hard rule:** no answer is better than a wrong answer. When no indexed
 document clears the evidence threshold, the API returns
@@ -118,6 +126,63 @@ built from indexed documents, never invented.
   Confidence = 0.40·agreement + 0.30·consensus + 0.30·freshness.
 - **Search** (`src/engine/search.zig`): lexical search over the document
   store (in-memory or PostgreSQL FTS with tsvector + GIN indexes).
+
+## Performance (Roadmap 6)
+
+Three execution paths, chosen per query by the router
+(`src/engine/router.zig`):
+
+| Path | When | What it does |
+|---|---|---|
+| `instant` | L1 or L2 cache hit | Serves the stored body with only the request id / path / latency spliced in — no store work |
+| `fast` | Everything else (default) | Memindex shortlist (top 50 candidates) resolved via `getDocument`; fewer than 3 usable candidates falls back to the store search |
+| `deep` | Research / compare / historical intents, `strategy: deep`, or no lexical terms | Whole candidate set + semantic/correlation + fuzzy second pass |
+
+Cache layers: L1 in-process (bounded 512 entries / 8 MiB, per-entry
+TTL, consumer-scoped keys, tag invalidation on ingest) in front of
+L2 Redis (query cache, TTL `PULSE_QUERY_CACHE_TTL_S`). The
+in-memory inverted index (`src/engine/memindex.zig`) is built from
+the store at boot and on epoch change (rebuild interval
+`PULSE_REINDEX_INTERVAL_S`, default 3600 s); `pulse reindex`
+rebuilds it on demand. Enrichment (locations + statistics) fans
+out in parallel when `PULSE_PARALLEL_QUERY=1` and the store is
+Postgres. See `docs/PERFORMANCE.md` for the architecture, the
+auto-tuning knobs + bounds, and the scaling guide.
+
+**Measured latencies** (client-measured, `pulse loadtest`,
+threads=1 — full tables in `docs/PERFORMANCE.md`):
+
+| Store | instant p50 | fast p50 | deep p50 |
+|---|---|---|---|
+| 3–5 docs | 42.7 ms | 126.9 ms | 127.1 ms |
+| 10,005 docs | 42.8 ms | 189.1 ms | 151.7 ms |
+
+The spec's 5 ms hot path is a **target, not a result**: the dev
+VM measures a ~42 ms floor on every request (server CPU <1 ms per
+request — the cost is `std.Io.Threaded` socket-op dispatch latency
+under this VM's CPU throttle, not Pulse code). Do not quote VM
+numbers as production numbers; re-measure on a real host.
+
+**How to benchmark:**
+
+```sh
+# Start the server, note its pid, then:
+./zig-out/bin/pulse loadtest --url http://127.0.0.1:9000 \
+  --threads 1 --requests 250 --query "fuel shortage in Monrovia" \
+  --distinct --server-pid <pid> --api-key <key>
+# --distinct: every query unique (fast path). Without it: the instant
+# path after warm-up. --limit 1..20 sets options.limit.
+# Reports p50/p95/p99/p99.9, RSS before/after, CPU per 1k queries.
+```
+
+**What the VM can and cannot prove:** it can prove correctness
+(0 errors at 50-way concurrency), the memory plateau (RSS flat
+over 1,250 sustained queries), the breaker trip/close cycle, and
+the 10k-doc scale point (index build ~89 s, idle RSS 45.2 MiB).
+It cannot prove the 5 ms hot path, 1K/10K concurrency, or the
+1M/10M+ indexed-record milestones — those need a real host (and,
+for concurrency, the threaded accept loop recorded as a gap in
+`docs/PERFORMANCE.md`).
 
 ## Sources (10 Liberian outlets)
 

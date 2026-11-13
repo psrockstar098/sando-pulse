@@ -20,6 +20,102 @@ it) up to that point.
   and after it; an optimization that does not move a measured number
   is recorded as no win, not claimed as one.
 
+## Architecture (Roadmap 6)
+
+### Cache layers
+
+| Layer | Where | Bounds | TTL | Invalidation |
+|---|---|---|---|---|
+| L1 | In-process (`src/api/l1cache.zig`) | 512 entries / 8 MiB (`PULSE_L1_MAX_ENTRIES`, `PULSE_L1_MAX_BYTES`) | 300 s (`PULSE_L1_TTL_S`) | Tag-based on ingest; LRU eviction |
+| L2 | Redis query cache (`src/api/cache.zig`) | Redis `maxmemory` 256 MB in compose (dev Redis unbounded — `pulse audit` warns) | `PULSE_QUERY_CACHE_TTL_S` | Epoch bump on ingest (all cached bodies carry the ingest epoch) |
+| L3 | Postgres (the store itself) | Disk | — | — |
+
+Keys are consumer-scoped; a cached body is stored once with empty
+markers and served with the request id / path / latency spliced in
+(`stampServed`), so a hit never re-renders. A miss computes once
+and stores into L1 + L2.
+
+### Index design
+
+The in-memory inverted index (`src/engine/memindex.zig`) maps
+terms to postings (doc id + score). Tokenization matches the
+planner exactly; title terms weigh double; only the first 4000
+bytes of a document are indexed. Bounds: 50,000 terms / 100,000
+docs / 64 MiB (`PULSE_MEMINDEX_MAX_TERMS` /
+`PULSE_MEMINDEX_MAX_DOCS`, bytes fixed at 64 MiB). Built from the
+store at boot and rebuilt on epoch change, gated by the reindex
+interval (`PULSE_REINDEX_INTERVAL_S`, default 3600 s);
+`pulse reindex` rebuilds on demand. The scan behind the build
+returns newest-first with an inclusive upper bound; the build
+walks backward from the newest (see the 6.12 bug note — the old
+forward walk capped the index at the oldest 1,000 docs).
+Measured: 10,005 docs → 10,035 terms, ~89 s to build, ~32 MiB
+RSS. The store search (Postgres FTS + pg_trgm + vector) is the
+fallback whenever the index is thin, absent, or stale — a query
+never waits for the index.
+
+### Routing rules (`src/engine/router.zig`)
+
+- `instant`: L1 hit only (L2 hits are stamped `instant` too —
+  the response never touches the store).
+- `deep`: planner intent `research` / `compare` / `historical`,
+  or `strategy: deep`, or no lexical terms (semantic-only).
+- `fast`: everything else.
+- Every response carries `path`, measured `latency_ms`, and
+  `routing_reason`. Enrichment (locations + statistics) fans out
+  in parallel only when `PULSE_PARALLEL_QUERY=1` and the store is
+  Postgres; otherwise it runs inline.
+
+### Service objectives
+
+Targets from the spec (not results — the measured numbers are in
+the Benchmarks section below):
+
+| Objective | Target |
+|---|---|
+| Hot path (instant, cached) | 5 ms server-side |
+| Fast path | < 100 ms server-side at small scale |
+| Breaking news detect + index | 5–30 s from source availability |
+| Trends recalc | 15–60 s |
+| Local events | 1–5 min |
+| Ingest → searchable | < 1 s (measured: <1 s via the store search) |
+
+What this VM measured instead: instant p50 42.7 ms
+client-measured (0.2 ms server-side — the gap is the VM's
+per-request floor, see the optimization scope); fast p50 127 ms
+at 5 docs, 189 ms at 10k docs. The 5 ms hot-path target is not
+met on this VM and is not claimed.
+
+### Scaling guide
+
+The statelessness contract and scale-out shape live in
+`docs/SCALABILITY.md` (per-instance state that is safe to lose:
+L1, memindex, popular list, autotuner; the guarantees live in
+Postgres/Redis/MinIO). Compose ships a `scale` profile (second
+API replica + nginx on host 9080). Triggers for the next step
+(Redis Cluster, Postgres partitioning, multi-region) are
+documented there, not built. The known scaling gap is the
+single-threaded accept loop: throughput caps at ~24 calls/s on
+this VM and latency scales linearly with concurrency — a
+threaded accept loop is the follow-up, not part of Roadmap 6.
+
+### Auto-tuning knobs + bounds (Roadmap 6.10)
+
+`GET /v1/autotune` reports the live values; the tuner moves at
+most one knob per 100 queries, only from measured signals, and
+logs every adjustment. `POST /v1/admin/autotune/reset` restores
+the configured defaults. A manual set via
+`POST /v1/admin/config` becomes the tuner's new baseline.
+
+| Knob | Default | Min | Max | Step | Signal |
+|---|---|---|---|---|---|
+| `l1_ttl_s` | 300 s | 60 s | 900 s | 60 s | L1 hit rate <0.5 grows, >0.9 shrinks |
+| `fanout_timeout_ms` | — | 50 ms | 500 ms | 50 ms | Fan-out incomplete rate >0.2 grows |
+| `max_concurrent_sources` (worker) | — | 1 | 8 | 1 | Ingest report, 1 adjustment per 10 runs |
+
+`PULSE_PRECOMPUTE_TTL_S` is deliberately NOT auto-tuned (no
+in-process signal exists for it).
+
 ## Roadmap 6.11: measured-first decisions
 
 Each advanced feature in the spec was judged against a measurement
