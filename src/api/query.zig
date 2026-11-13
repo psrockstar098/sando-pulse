@@ -431,6 +431,7 @@ pub fn buildEventDetailResponse(
 ) ![]u8 {
     const status = try events_intel.eventStatus(alloc, docs);
     const conflicts = try events_intel.detectConflicts(alloc, docs);
+    const flags = try events_intel.detectContradictionFlags(alloc, docs);
     const timeline = try events_intel.timelineBuckets(alloc, docs);
     const corroboration = try events_intel.corroboration(alloc, docs);
     var doc_list: std.ArrayList(struct {
@@ -477,6 +478,11 @@ pub fn buildEventDetailResponse(
             .a_title = conflicts.a_title,
             .b_title = conflicts.b_title,
         },
+        // Contradiction flags (Roadmap 7.5): every divergent pair,
+        // most dissimilar first, both sources cited. Each flag is a
+        // WARNING for a human to check — never a verdict about
+        // which report is right. Empty when the reports agree.
+        .contradictions = flags,
         .timeline = day_list.items,
         .documents = doc_list.items,
         .request_id = req_id,
@@ -766,6 +772,40 @@ pub fn buildStatisticsResponse(
         .statistics = list.items,
         .request_id = req_id,
     });
+}
+
+test "buildEventDetailResponse carries contradiction flags (Roadmap 7.5)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const event = knowledge.KnowledgeEvent{
+        .id = "ev1",
+        .title = "Fuel shortage",
+        .topic = "energy",
+        .first_seen = 0,
+        .last_seen = 86400,
+        .doc_count = 3,
+    };
+    const docs = [_]knowledge.EventDoc{
+        .{ .id = "a", .title = "Fuel shortage hits Monrovia", .source_id = "s1", .source_name = "Daily Observer", .published_at = 0, .text = "" },
+        .{ .id = "b", .title = "Fuel shortage hits Monrovia", .source_id = "s2", .source_name = "New Dawn", .published_at = 3600, .text = "" },
+        .{ .id = "c", .title = "Kakata market opens new stalls", .source_id = "s3", .source_name = "GNN Liberia", .published_at = 7200, .text = "" },
+    };
+    const out = try buildEventDetailResponse(alloc, "req-test", event, &docs, 172800);
+    // Two divergent pairs (a,c) and (b,c); the agreeing pair (a,b)
+    // is not flagged. Both sources are cited on each flag, and the
+    // warning note is present — never a verdict.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"contradictions\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Kakata market opens new stalls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Daily Observer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "check both sources") != null);
+    // The agreeing event has no flags at all.
+    const agree = [_]knowledge.EventDoc{
+        .{ .id = "a", .title = "Fuel shortage hits Monrovia", .source_id = "s1", .source_name = "Daily Observer", .published_at = 0, .text = "" },
+        .{ .id = "b", .title = "Fuel shortage hits Monrovia", .source_id = "s2", .source_name = "New Dawn", .published_at = 3600, .text = "" },
+    };
+    const out2 = try buildEventDetailResponse(alloc, "req-test", event, &agree, 172800);
+    try std.testing.expect(std.mem.indexOf(u8, out2, "\"contradictions\":[]") != null);
 }
 
 test "buildQueryResponse carries path, latency_ms and routing_reason" {
