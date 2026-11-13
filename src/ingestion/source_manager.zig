@@ -179,10 +179,12 @@ test "resolve: env overrides enabled, limit, interval, auth" {
     const rt2 = try resolve(alloc, &env, src, 300);
     try std.testing.expectEqual(AuthStatus.configured, rt2.auth);
     // A disabled registry source stays disabled unless overridden.
-    const fpa = sources.find("frontpage-africa").?;
-    const rt3 = try resolve(alloc, &env, fpa, 300);
+    // (Bush Chicken is disabled: its domain is parked. FrontPage Africa
+    // used to be the example here until it was re-enabled 2026-11-13.)
+    const bush = sources.find("bush-chicken").?;
+    const rt3 = try resolve(alloc, &env, bush, 300);
     try std.testing.expect(!rt3.enabled);
-    try env.put("PULSE_SOURCE_FRONTPAGE_AFRICA_ENABLED", "1");
-    const rt4 = try resolve(alloc, &env, fpa, 300);
+    try env.put("PULSE_SOURCE_BUSH_CHICKEN_ENABLED", "1");
+    const rt4 = try resolve(alloc, &env, bush, 300);
     try std.testing.expect(rt4.enabled);
 }

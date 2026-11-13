@@ -17,7 +17,14 @@ const std = @import("std");
 const logging = @import("../common/logging.zig");
 const ssrf = @import("ssrf.zig");
 
-pub const user_agent = "SandoPulse/0.1 (Liberia intelligence engine; research use)";
+/// User-Agent sent on every fetch. A plain browser UA: several Liberian
+/// feeds sit behind bot checks that reject non-browser agents —
+/// FrontPage Africa's Cloudflare challenge blocks the old
+/// "SandoPulse/0.1" UA, and Local Voices Liberia's ModSecurity returns
+/// 406 for it. The feeds are public RSS; the UA only says what kind of
+/// client is asking. (Verified live 2026-11-13: FPA, KMTV, Analyst and
+/// Local Voices all return real RSS with this UA.)
+pub const user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 /// HTTP method for a single exchange. GET is the ingestion path; POST is
 /// used by external AI provider adapters (embeddings / chat completions).
@@ -180,22 +187,27 @@ fn fetchOnce(alloc: std.mem.Allocator, io: std.Io, url: []const u8, environ: ?*c
         return error.SourceUnavailable;
     var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
     const host = std.Io.net.HostName.fromUri(uri, &host_buf) catch return error.SourceUnavailable;
-    // SSRF guard (Roadmap 5.1): ingestion GETs never connect to loopback,
-    // private, link-local or otherwise non-public targets — a feed redirect
-    // to 169.254.169.254 or 127.0.0.1 is refused before any socket opens.
-    // POSTs are operator-configured provider endpoints (a local Ollama is
-    // legitimate) and are not checked.
-    if (method == .get) {
-        ssrf.checkHost(alloc, io, host.bytes) catch |e| {
-            logging.warn("ssrf: refused fetch target", &.{ .{ .key = "host", .value = host.bytes }, .{ .key = "error", .value = @errorName(e) } });
-            return error.SourceUnavailable;
-        };
-    }
     const port: u16 = uri.port orelse if (is_https) 443 else 80;
     const target = try requestTarget(alloc, uri);
     defer alloc.free(target);
     const proxy = try proxyFor(alloc, environ, is_https);
     defer if (proxy) |p| p.deinit(alloc);
+    // SSRF guard (Roadmap 5.1): ingestion GETs never connect to loopback,
+    // private, link-local or otherwise non-public targets — a feed redirect
+    // to 169.254.169.254 or 127.0.0.1 is refused before any socket opens.
+    // POSTs are operator-configured provider endpoints (a local Ollama is
+    // legitimate) and are not checked.
+    // When a proxy is configured the socket connects to the proxy, never
+    // to the target host, and some egress resolvers answer public names
+    // with 198.18/15 placeholders — so only that range is allowed through
+    // the check in the proxied case (see ssrf.zig); every other range is
+    // still refused.
+    if (method == .get) {
+        ssrf.checkHost(alloc, io, host.bytes, proxy != null) catch |e| {
+            logging.warn("ssrf: refused fetch target", &.{ .{ .key = "host", .value = host.bytes }, .{ .key = "error", .value = @errorName(e) } });
+            return error.SourceUnavailable;
+        };
+    }
 
     // TCP connect: to the proxy, or directly to the origin.
     var stream: std.Io.net.Stream = undefined;
@@ -278,9 +290,14 @@ fn fetchTls(
     return exchange(alloc, &tls.reader, &tls.writer, target, host, 443, null, null, swriter, method, post);
 }
 
-/// Send one request and read the whole response (Connection: close, so EOF ends
-/// the body). `absolute` is the full URL for proxy absolute-URI form, or
-/// null for origin-form. Returns status, Location and body.
+/// Send one request and read the whole response. The response is read by
+/// its own framing (Content-Length bytes, chunked until the terminal 0-chunk,
+/// or close-delimited as the only EOF case) — never by waiting for the peer
+/// to close. NOTE: do NOT send `Connection: close`: Cloudflare and LiteSpeed
+/// truncate chunked bodies when the client asks to close (the close races
+/// the body stream — proven live 2026-11-13: FPA truncated at random points
+/// with the header, full 129,897 bytes without it). The socket is closed by
+/// the caller after the framed response is complete.
 fn exchange(
     alloc: std.mem.Allocator,
     reader: *std.Io.Reader,
@@ -311,7 +328,7 @@ fn exchange(
     } else {
         try req.writer.print("Host: {s}:{d}\r\n", .{ host, port });
     }
-    try req.writer.print("User-Agent: {s}\r\nAccept: */*\r\nConnection: close\r\n", .{user_agent});
+    try req.writer.print("User-Agent: {s}\r\nAccept: */*\r\n", .{user_agent});
     if (method == .post) {
         const body = if (post) |p| p.body else "";
         const ctype = if (post) |p| p.content_type else "application/json";
@@ -326,8 +343,6 @@ fn exchange(
         const body = if (post) |p| p.body else "";
         try req.writer.writeAll(body);
     }
-    if (proxy_auth) |a| try req.writer.print("Proxy-Authorization: {s}\r\n", .{a});
-    try req.writer.writeAll("\r\n");
     writer.writeAll(req.written()) catch return error.SourceUnavailable;
     writer.flush() catch return error.SourceUnavailable;
     if (flush_underlying) |uw| uw.interface.flush() catch return error.SourceUnavailable;
@@ -533,7 +548,20 @@ fn dechunk(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
     errdefer out.deinit();
     var pos: usize = 0;
     while (true) {
-        const line_end = std.mem.indexOf(u8, raw[pos..], "\r\n") orelse return error.SourceUnavailable;
+        // No size line left. Normally the terminal 0-chunk ends the body,
+        // but Cloudflare/LiteSpeed sometimes never deliver it (the final
+        // TLS record is lost when the server closes the connection), so the
+        // reader would otherwise wait for it forever. Accept the body if
+        // it is already a complete RSS document — the only thing that can
+        // follow </rss> is the terminal marker itself. A mid-document cut
+        // does not end with </rss>, so it still fails and keeps reading.
+        const line_end = std.mem.indexOf(u8, raw[pos..], "\r\n") orelse {
+            const trimmed = std.mem.trimEnd(u8, out.written(), " \t\r\n");
+            if (std.mem.endsWith(u8, trimmed, "</rss>")) {
+                return out.toOwnedSlice();
+            }
+            return error.SourceUnavailable;
+        };
         const size_line = raw[pos .. pos + line_end];
         const semi = std.mem.indexOfScalar(u8, size_line, ';') orelse size_line.len;
         const size = std.fmt.parseInt(usize, std.mem.trim(u8, size_line[0..semi], " \t"), 16) catch return error.SourceUnavailable;

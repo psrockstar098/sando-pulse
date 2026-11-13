@@ -20,7 +20,7 @@ DATABASE_URL=postgres://postgres:pulse_test@127.0.0.1:5432/pulse_test \
 REDIS_URL=redis://127.0.0.1:6379 \
 PULSE_API_KEY=testkey123 ./zig-out/bin/pulse serve
 
-# Ingest once (fetches the 5 enabled Liberian RSS feeds):
+# Ingest once (fetches the 9 enabled Liberian RSS feeds):
 ./zig-out/bin/pulse worker --once
 
 # Apply database migrations:
@@ -70,7 +70,7 @@ published**. The API container runs migrations on boot.
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | GET | `/v1/health` | no | `{"status":"ok","version","documents","sources_enabled","store"}` |
-| GET | `/v1/sources` | no | All 10 sources with enabled flags and disabled reasons |
+| GET | `/v1/sources` | no | All 12 sources with enabled flags and disabled reasons |
 | GET | `/v1/trends` | no | Geez + geo trends; carries `computed_at` + `stale` (Roadmap 6.4) |
 | GET | `/v1/briefing` | no | Precomputed briefing; carries `cached` + `stale` (Roadmap 6.4) |
 | GET | `/v1/popular` | no | Most-asked queries with counts (Roadmap 6.4) |
@@ -198,22 +198,24 @@ for concurrency, the threaded accept loop recorded as a gap in
 - **Social ingestion — gated** (`GET /v1/social`, `social` section in `/v1/trends`): the registry is fed only by authorized connector data. Today no social connector is configured (no Meta app/token, X and Reddit are stubs), so the endpoint reports `social_available: false` with every connector's unavailable reason. No scrapers, no faked posts.
 - **Semantic search — blocked**: the external embedding provider exists but has no API key and is never called live. Deep queries use the lexical local embedding and say so. Real semantic search needs Dominic's API-key step.
 
-## Sources (10 Liberian outlets)
+## Sources (12 Liberian outlets)
 
-Verified live 2026-11-12 (see STATUS.md for the full evidence):
+Verified live 2026-11-13 (see STATUS.md for the full evidence):
 
 | Source | Feed | Status |
 |---|---|---|
 | New Dawn | thenewdawnliberia.com/feed/ | ✅ verified |
-| Liberian Investigator | liberianinvestigator.com/feed/ | ✅ verified (intermittent Cloudflare close) |
+| Liberian Investigator | liberianinvestigator.com/feed/ | ✅ verified |
 | GNN Liberia | gnnliberia.com/feed/ | ✅ verified |
 | The News | thenewsnewspaperonline.com/feed/ | ✅ verified |
 | Daily Observer | liberianobserver.com (TownNews RSS) | ✅ verified |
-| FrontPage Africa | frontpageafricaonline.com/feed/ | ❌ Cloudflare bot challenge blocks non-browser clients |
-| Bush Chicken | — | ❌ feed returns a lander redirect stub, no content |
-| Spoon TV (Spoon FM) | — | ❌ same lander stub |
-| New Republic | — | ❌ domain parked on Hostinger DNS |
-| KMTV | — | ❌ homepage loads, no RSS feed or sitemap |
+| FrontPage Africa | frontpageafricaonline.com/feed/ | ✅ verified (was blocked — fetcher now sends a browser User-Agent) |
+| KMTV | mykmtvnews.com/feed/ | ✅ verified (new home — old domain taken over by a betting site) |
+| The Analyst | analystliberiaonline.com/feed/ | ✅ verified (new source) |
+| Local Voices Liberia | localvoicesliberia.com/feed/ | ✅ verified (new source) |
+| Bush Chicken | — | ❌ domain parked, site gone (verified 2026-11-13) |
+| Spoon TV (Spoon FM) | — | ❌ closed by court order July 2023; no website feed (verified 2026-11-13) |
+| New Republic | — | ❌ domain parked (verified 2026-11-13) |
 
 ## Layout
 
@@ -251,7 +253,7 @@ docs/INTERFACES.md      internal module interfaces
 
 ## Tests
 
-`zig build test` — 74 tests (planner, ranking, index, RSS parsing, fetcher
+`zig build test` — 274 tests (planner, ranking, index, RSS parsing, fetcher
 parsing, auth, rate limiting, metrics, JSON, Postgres wire protocol, Redis
 RESP2, S3 signing). The Postgres and Redis live tests are gated on
 `PULSE_TEST_POSTGRES_URL` / `PULSE_TEST_REDIS_URL` and skip without servers.

@@ -1,6 +1,6 @@
 # Sando Pulse — Roadmap 1 STATUS
 
-Last verified: **2026-11-12 ~19:10 GMT**. Zig 0.17.1 (`~/.local/bin/zig`).
+Last verified: **2026-11-13 ~21:17 GMT**. Zig 0.17.1 (`~/.local/bin/zig`).
 Project: `~/workspace/pulse`. Local git only — no remote, nothing pushed.
 
 ## Verdict
@@ -382,7 +382,7 @@ The restart wiped the system packages the earlier builders used: `postgresql-16`
 ### 4.6 Intelligence quality (`4ec4c30`)
 
 - `src/intelligence/quality.zig` (pure, no I/O): freshnessScore (half-life decay: 1.0 fresh, 0.5 at 24h, ~0.125 at 7d); calibrateReliability (design-doc grade penalised by consecutive failures and stale last-success, clamped 0.05..0.95; a never-run source keeps its grade but is reported missing); eventConfidence (half reliability + half corroboration, scaled by freshness, cut hard for retracted/divergent); flagEvent — misinformation indicators: single_source, conflicting_reports, retracted, stale, low_reliability, uncorroborated_old. Flags are warnings for a human to check, never verdicts; the response says so in its `note` field.
-- `GET /v1/quality`: per-source quality for all 10 registry sources (stale = no success in 24h, missing = no health record) + the newest 100 events with confidence/freshness/flags + summary counts. Live smoke test: summary stale_sources 6, missing_sources 5, flagged_events 27 (of 34 events, mostly single_source); Liberian Investigator calibrated 0.47 after its failed run (0.70 − 0.08 failure − 0.15 never-succeeded); sample event confidence 0.45, freshness 0.83, flags [single_source].
+- `GET /v1/quality`: per-source quality for all 12 registry sources (stale = no success in 24h, missing = no health record) + the newest 100 events with confidence/freshness/flags + summary counts. Live smoke test: summary stale_sources 6, missing_sources 5, flagged_events 27 (of 34 events, mostly single_source); Liberian Investigator calibrated 0.47 after its failed run (0.70 − 0.08 failure − 0.15 never-succeeded); sample event confidence 0.45, freshness 0.83, flags [single_source].
 
 ### Roadmap 4 honest gaps
 
@@ -1168,3 +1168,41 @@ Final state: `zig build` passes, **273/273 tests** (18 new), all sections 7.1–
 7. **Social is plumbing only**: no collection job feeds the registry; the Facebook/X/Reddit connectors are all unconfigured. `GET /v1/social` and the trends `social` section stay empty until Dominic authorizes a connector.
 8. **Semantic search is blocked** (7.8): no API key, no live call, lexical only.
 9. **Test residue in the live test DB**: the 7.3/7.5 smoke tests ingested synthetic docs labelled "PULSE TEST DOC" (3 crash docs + 1 diesel doc) that now live in the `pulse_test` documents table and cluster into real events. They are labelled, but a clean-DB re-run would not have them.
+
+## Source registry fix — 9 enabled sources (DONE, 2026-11-13)
+
+Ordered 2026-11-13 ~19:57 ("fix those with the x mark and update it and make it work"). Registry now 12 sources, 9 enabled (was 10 sources, 5 enabled).
+
+### What was wrong with the ❌ sources (probed live 2026-11-13)
+
+- **FrontPage Africa**: the feed was live all along (HTTP 200, 129,897 bytes, real RSS) — Pulse's fetcher sent `User-Agent: SandoPulse/0.1 (...)`, which Cloudflare blocks. The fetcher now sends a Chrome/131 browser User-Agent.
+- **Bush Chicken**: domain parked (feed + home return a 114-byte JS redirect to a parking page). The outlet is real but the site is gone; no live domain found.
+- **Spoon TV / Spoon FM**: same parked lander stub. Spoon Network was forcibly closed by court order 2023-07-14; its live presence is Facebook only. No website feed exists.
+- **New Republic**: domain parked (parking IP 198.18.151.72), connection fails entirely.
+- **KMTV**: kmtvliberia.com 301-redirects to a betting site (domain taken over). New home found + verified: mykmtvnews.com (feed 200, 72,276 bytes, real RSS).
+- **Replacements verified live**: The Analyst (analystliberiaonline.com/feed/, 200, 109,091 bytes) and Local Voices Liberia (localvoicesliberia.com/feed/, 200, 19,585 bytes — needs the full Chrome UA; a short UA gets ModSecurity 406).
+
+### Fetcher bugs found and fixed (`src/ingestion/fetchers.zig`)
+
+- **`Connection: close` truncated chunked bodies**: Cloudflare/LiteSpeed truncate chunked feeds at random points when the request carries `Connection: close` (proven by a controlled Python/OpenSSL experiment through the same proxy: with the header = truncated at random points, without = full body every time; curl never sends it, which is why curl always worked). The header is removed — never re-add it. A copy-paste bug in the same function (the header-terminating `\r\n` written twice, Proxy-Authorization duplicated after the blank line) was fixed at the same time.
+- **Terminal chunk loss**: even without the header, the final `0\r\n\r\n` chunk marker can fail to arrive (final TLS record lost when the server closes), so the fetcher received the entire decoded body and then blocked forever waiting for the marker. Fix (lenient dechunk): when no size line remains in the buffer, the decoded body is accepted if it right-trimmed ends with `</rss>`; a mid-document cut still fails and keeps reading.
+- **SSRF proxied-DNS fix** (`src/ingestion/ssrf.zig`): this VM's DNS resolves all public hosts to 198.18.151.x, which the R5 SSRF guard blocked as 198.18/15 benchmarking — refusing every source. The fetcher connects to the egress proxy, never to the checked address. When proxied, only 198.18/15 is allowed through; loopback, private, link-local, CGNAT, documentation, multicast and reserved ranges are still refused. New test added ("ssrf: proxied check allows 198.18/15 placeholders, still blocks internal ranges").
+
+### Registry + migration
+
+- `src/ingestion/sources.zig`: FrontPage Africa enabled; KMTV home/feed → mykmtvnews.com, enabled; `the-analyst` + `local-voices` added, enabled; spoon/bush-chicken/new-republic stay disabled with the true reasons above. Registry test now expects 12 sources, 9 enabled.
+- `src/ingestion/source_manager.zig`: its test used FrontPage Africa as the example disabled source — switched to `bush-chicken`.
+- `migrations/012_source_registry_fix.sql` (new): upserts the registry into the `sources` table (migration 001 seeds only the first 10; the new sources' health inserts failed with a foreign-key error before 012).
+
+### Verified 2026-11-13 ~21:08–21:17
+
+- `zig build` passes; `zig build test` **274/274 pass** (273 + 1 new SSRF test).
+- Debug test calling `fetchers.fetchFeed` directly: all 9 feeds fetched cleanly in ~67s (Daily Observer 54,776; New Dawn 48,125; Liberian Investigator 68,105; GNN 87,754; KMTV 72,276; The Analyst 109,091; Local Voices 19,585; The News 61,582; FrontPage Africa 129,759 bytes).
+- Full worker run vs `pulse_test` (migration 012 applied): docs **29 → 129** (+100 in 68.5s). Per-source: frontpage-africa 10/10/0, daily-observer 50/50/0, liberian-investigator 10/10/0, gnn-liberia 10/10/0, kmtv 10/10/0, the-analyst 10/10/0, local-voices 10/10/0, the-news 10/10/0 — all clean; new-dawn 0/0/1 (transient fetch failure; the site was verified alive immediately after by curl, 200 in 5.9s).
+- Re-run ~21:17 (after the 300s ingest interval): new-dawn **10/10/0**; docs **129 → 139**, `had_error: false`. All 9 sources clean.
+- Docs by source after: daily-observer 53, frontpage-africa 10, gnn-liberia 11, kmtv 10, liberian-investigator 10, local-voices 10, new-dawn 15, the-analyst 10, the-news 10.
+- Facebook connector: honestly unavailable in both runs (no token — Dominic's Meta app step is in progress separately).
+
+### Note for the next CI build
+
+The CI-published Docker image (`docker.io/dominic908/sando-pulse:all-in-one-0.1.0`, boot-tested 2026-11-13 ~20:03, health ok, `sources_enabled: 5`) predates this fix. The next CI build after this push carries 9 enabled sources. The `ci.yml` pre-flight audit step still fails on stock postgres:16 (missing pgvector/PostGIS/pg_trgm) — known gap, separate decision.

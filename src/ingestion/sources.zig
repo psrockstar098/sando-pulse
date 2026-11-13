@@ -1,17 +1,18 @@
-//! Source registry: the first 10 Liberian news sources from the design doc.
-//! Verified live 2026-11-12 ~17:00 GMT from this VM (curl, RSS fetch).
+//! Source registry: Liberian news sources for Pulse.
+//! Verified live 2026-11-13 ~20:00 GMT from this VM (curl, RSS fetch).
 //! A source is `enabled` ONLY if its feed returned real RSS with items.
 //! Disabled entries stay in the registry with the honest reason, so a future
 //! re-check can re-enable them — Pulse never pretends a dead source works.
 //!
-//! Verified live (5):
-//!   New Dawn, Liberian Investigator, GNN Liberia, The News, Daily Observer
-//! Skipped (5):
-//!   FrontPage Africa — Cloudflare bot challenge blocks plain HTTP clients.
-//!   Bush Chicken     — feed URL returns a 114-byte lander redirect stub.
-//!   Spoon TV (Spoon FM Radio) — same lander redirect stub, no content.
-//!   New Republic     — domain parked on Hostinger DNS (no site at all).
-//!   KMTV             — homepage loads, but no RSS feed or sitemap exists.
+//! Verified live (9):
+//!   New Dawn, Liberian Investigator, GNN Liberia, The News, Daily Observer,
+//!   FrontPage Africa (needs a browser User-Agent — see fetchers.zig),
+//!   KMTV (moved to mykmtvnews.com), The Analyst, Local Voices Liberia
+//! Disabled (3) — the sites themselves are gone, not the feeds:
+//!   Bush Chicken — domain parked (parking lander; verified 2026-11-13).
+//!   Spoon TV     — website parked; network closed by court order Jul 2023,
+//!                  live presence is Facebook only (needs the Meta app).
+//!   New Republic — domain parked (resolves to a parking IP; verified 2026-11-13).
 
 const std = @import("std");
 
@@ -33,8 +34,7 @@ pub const sources: []const Source = &.{
         .home_url = "https://frontpageafricaonline.com/",
         .feed_url = "https://frontpageafricaonline.com/feed/",
         .reliability = 0.70,
-        .enabled = false,
-        .disabled_reason = "Cloudflare bot challenge blocks non-browser HTTP clients (verified 2026-11-12)",
+        .enabled = true,
     },
     .{
         .id = "daily-observer",
@@ -71,11 +71,10 @@ pub const sources: []const Source = &.{
     .{
         .id = "kmtv",
         .name = "KMTV",
-        .home_url = "https://kmtvliberia.com/",
-        .feed_url = "https://kmtvliberia.com/feed/",
+        .home_url = "https://mykmtvnews.com/",
+        .feed_url = "https://mykmtvnews.com/feed/",
         .reliability = 0.70,
-        .enabled = false,
-        .disabled_reason = "Homepage loads but no RSS feed or sitemap exists (verified 2026-11-12)",
+        .enabled = true,
     },
     .{
         .id = "spoon-tv",
@@ -84,7 +83,7 @@ pub const sources: []const Source = &.{
         .feed_url = "https://www.spoonfmradio.com/feed/",
         .reliability = 0.70,
         .enabled = false,
-        .disabled_reason = "Feed URL returns a 114-byte lander redirect stub, no content (verified 2026-11-12)",
+        .disabled_reason = "Website parked; network closed by court order Jul 2023, live presence is Facebook only (needs the Meta app) (verified 2026-11-13)",
     },
     .{
         .id = "bush-chicken",
@@ -93,7 +92,7 @@ pub const sources: []const Source = &.{
         .feed_url = "https://bushchicken.com/feed/",
         .reliability = 0.70,
         .enabled = false,
-        .disabled_reason = "Feed URL returns a 114-byte lander redirect stub, no content (verified 2026-11-12)",
+        .disabled_reason = "Domain parked (parking lander page, no site) (verified 2026-11-13)",
     },
     .{
         .id = "new-republic",
@@ -102,7 +101,23 @@ pub const sources: []const Source = &.{
         .feed_url = "https://www.newrepublicliberia.com/feed/",
         .reliability = 0.70,
         .enabled = false,
-        .disabled_reason = "Domain parked on Hostinger DNS; site does not exist (verified 2026-11-12)",
+        .disabled_reason = "Domain parked (resolves to a parking IP; connection fails) (verified 2026-11-13)",
+    },
+    .{
+        .id = "the-analyst",
+        .name = "The Analyst",
+        .home_url = "https://analystliberiaonline.com/",
+        .feed_url = "https://analystliberiaonline.com/feed/",
+        .reliability = 0.70,
+        .enabled = true,
+    },
+    .{
+        .id = "local-voices",
+        .name = "Local Voices Liberia",
+        .home_url = "https://localvoicesliberia.com/",
+        .feed_url = "https://localvoicesliberia.com/feed/",
+        .reliability = 0.70,
+        .enabled = true,
     },
     .{
         .id = "the-news",
@@ -129,9 +144,9 @@ pub fn enabledCount() usize {
     return n;
 }
 
-test "registry has 10 sources, 5 enabled" {
-    try std.testing.expectEqual(@as(usize, 10), sources.len);
-    try std.testing.expectEqual(@as(usize, 5), enabledCount());
+test "registry has 12 sources, 9 enabled" {
+    try std.testing.expectEqual(@as(usize, 12), sources.len);
+    try std.testing.expectEqual(@as(usize, 9), enabledCount());
     for (sources) |s| {
         try std.testing.expect(s.reliability > 0 and s.reliability <= 1);
         try std.testing.expect(s.feed_url.len > 0);
