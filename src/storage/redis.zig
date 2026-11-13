@@ -45,7 +45,7 @@ fn logHostPort(msg: []const u8, host: []const u8, port: u16) void {
 }
 
 /// Unix time in milliseconds from the realtime clock.
-fn unixMillis(io: std.Io) i64 {
+pub fn unixMillis(io: std.Io) i64 {
     return std.Io.Clock.real.now(io).toMilliseconds();
 }
 
@@ -1095,8 +1095,9 @@ test "command times out against a silent peer" {
 /// This Zig's std has no getEnvVarOwned / posix.getenv, and the libc
 /// getenv needs `-lc`, which the plain test command does not pass — so the
 /// gate reads the process environment file directly (Linux-only; any
-/// failure to read it means "not set", i.e. skip).
-fn testRedisUrl(io: std.Io, alloc: Allocator) !?[]u8 {
+/// failure to read it means "not set", i.e. skip). Public so other
+/// modules' live tests (e.g. workers/realtime) can gate on the same URL.
+pub fn testRedisUrl(io: std.Io, alloc: Allocator) !?[]u8 {
     const file = std.Io.Dir.openFileAbsolute(io, "/proc/self/environ", .{}) catch return null;
     defer file.close(io);
     var buf: [4096]u8 = undefined;

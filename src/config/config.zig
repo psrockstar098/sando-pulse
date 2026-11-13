@@ -19,6 +19,9 @@ pub const Config = struct {
     minio_secret_key: ?[]const u8 = null,
     minio_bucket: []const u8 = "pulse-raw",
     ingest_interval_s: u64 = 300,
+    /// Worker identity for the Redis Streams consumer group (4.3).
+    /// Distinct per worker process when scaling (compose --scale).
+    worker_id: []const u8 = "worker-1",
     rate_limit_per_minute: u32 = 100,
     rate_limit_per_day: u32 = 10000,
     log_level: []const u8 = "info",
@@ -103,6 +106,9 @@ pub fn load(alloc: std.mem.Allocator, env_map: *std.process.Environ.Map) !Config
     }
     if (envOwned(alloc, env_map, "PULSE_INGEST_INTERVAL_S")) |v| {
         cfg.ingest_interval_s = parseU64(v) orelse 300;
+    }
+    if (envOwned(alloc, env_map, "PULSE_WORKER_ID")) |v| {
+        if (v.len > 0) cfg.worker_id = v;
     }
     if (envOwned(alloc, env_map, "PULSE_RATE_LIMIT_PER_MINUTE")) |v| {
         cfg.rate_limit_per_minute = parseU32(v) orelse 100;

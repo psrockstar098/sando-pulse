@@ -14,6 +14,9 @@ const facebook = @import("../ingestion/connectors/facebook/facebook.zig");
 const object_store = @import("../storage/object_store.zig");
 const metrics = @import("../api/metrics.zig");
 const providers = @import("../ai/providers.zig");
+const redis = @import("../storage/redis.zig");
+const cache = @import("../api/cache.zig");
+const realtime = @import("realtime.zig");
 
 pub fn runOnce(
     alloc: std.mem.Allocator,
@@ -52,8 +55,21 @@ pub fn runLoop(
     embedder: ?providers.EmbeddingProvider,
     ks: ?knowledge.KnowledgeStore,
     fb: ?*facebook.FacebookConnector,
+    redis_client: ?*redis.RedisClient,
 ) !void {
     var last_maintenance: ?i64 = null;
+    // Real-time stream consumer (Roadmap 4.3): one consumer per worker
+    // process, named by PULSE_WORKER_ID. No Redis -> no stream work.
+    var consumer: ?realtime.StreamConsumer = null;
+    var invalidator: ?cache.EpochInvalidator = null;
+    if (redis_client) |rc| {
+        invalidator = .{ .client = rc };
+        consumer = .{ .client = rc, .consumer = cfg.worker_id };
+        consumer.?.ensureGroup() catch |e| {
+            logging.warn("stream group setup failed (stream work disabled this run)", &.{.{ .key = "error", .value = @errorName(e) }});
+            consumer = null;
+        };
+    }
     while (true) {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
@@ -61,6 +77,34 @@ pub fn runLoop(
             logging.err("ingest run failed", &.{.{ .key = "error", .value = @errorName(e) }});
             m.observeIngestRun(true);
         };
+        // Real-time processing (Roadmap 4.3): drain new stream entries,
+        // then reclaim unacked ones (recovery). A Redis outage here is
+        // logged and retried next iteration — never fatal.
+        if (consumer) |*c| {
+            const proc = invalidator.?.processor();
+            if (c.drainOnce(arena.allocator(), proc)) |report| {
+                if (report.read > 0) {
+                    logging.info("stream drain done", &.{
+                        .{ .key = "read", .value = try std.fmt.allocPrint(arena.allocator(), "{d}", .{report.read}) },
+                        .{ .key = "processed", .value = try std.fmt.allocPrint(arena.allocator(), "{d}", .{report.processed}) },
+                        .{ .key = "dead_lettered", .value = try std.fmt.allocPrint(arena.allocator(), "{d}", .{report.dead_lettered}) },
+                    });
+                }
+            } else |e| {
+                logging.warn("stream drain failed", &.{.{ .key = "error", .value = @errorName(e) }});
+            }
+            if (c.reclaimPending(arena.allocator(), proc)) |report| {
+                if (report.read > 0) {
+                    logging.info("stream reclaim done", &.{
+                        .{ .key = "read", .value = try std.fmt.allocPrint(arena.allocator(), "{d}", .{report.read}) },
+                        .{ .key = "processed", .value = try std.fmt.allocPrint(arena.allocator(), "{d}", .{report.processed}) },
+                        .{ .key = "dead_lettered", .value = try std.fmt.allocPrint(arena.allocator(), "{d}", .{report.dead_lettered}) },
+                    });
+                }
+            } else |e| {
+                logging.warn("stream reclaim failed", &.{.{ .key = "error", .value = @errorName(e) }});
+            }
+        }
         // Maintenance (Roadmap 3.5): aggregation, dedup report,
         // retention. At most once per maintenance_interval_s; a
         // failed pass logs and retries next interval — never fatal.

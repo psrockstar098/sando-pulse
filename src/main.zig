@@ -248,7 +248,7 @@ pub fn main(init: std.process.Init) !void {
             });
             return;
         }
-        try worker.runLoop(alloc, io, cfg, repo, sink, if (archiver) |*a| a else null, &m, init.environ_map, embedder, ks, &fb_connector);
+        try worker.runLoop(alloc, io, cfg, repo, sink, if (archiver) |*a| a else null, &m, init.environ_map, embedder, ks, &fb_connector, redis_client);
         return;
     }
 
