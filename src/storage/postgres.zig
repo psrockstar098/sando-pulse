@@ -249,6 +249,66 @@ fn appendLikeLiteral(list: *std.ArrayList(u8), alloc: Allocator, s: []const u8) 
     try list.append(alloc, '\'');
 }
 
+/// LIKE pattern value for a parameter (Roadmap 6.8): the same
+/// escaping as `appendLikeLiteral` — %, _ and \ in the term are
+/// escaped so they match literally — but returned as a VALUE
+/// (%escaped%) instead of embedded in the SQL. The % wildcards are
+/// part of the value, which is exactly how a parameterised ILIKE
+/// is meant to work.
+fn escapeLikeValue(alloc: Allocator, s: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '%');
+    for (s) |c| {
+        if (c == '\\' or c == '%' or c == '_') try out.append(alloc, '\\');
+        try out.append(alloc, c);
+    }
+    try out.append(alloc, '%');
+    return out.toOwnedSlice(alloc);
+}
+
+/// Collects $N placeholders for a parameterised query (Roadmap 6.8).
+/// `param` appends "$N" to the SQL and pushes the value onto the
+/// params list; `likeParam` does the same with the value wrapped as
+/// a LIKE pattern. `intParam`/`floatParam` format a number as decimal
+/// text — Postgres infers the type from the SQL context
+/// (to_timestamp($1), LIMIT $1, ST_MakePoint($1, $2)).
+const ParamBuilder = struct {
+    params: std.ArrayList(?[]const u8) = .empty,
+
+    fn param(self: *ParamBuilder, sql: *std.ArrayList(u8), alloc: Allocator, value: []const u8) !void {
+        try self.params.append(alloc, value);
+        var nb: [16]u8 = undefined;
+        const s = try std.fmt.bufPrint(&nb, "${d}", .{self.params.items.len});
+        try sql.appendSlice(alloc, s);
+    }
+
+    fn nullParam(self: *ParamBuilder, sql: *std.ArrayList(u8), alloc: Allocator) !void {
+        try self.params.append(alloc, null);
+        var nb: [16]u8 = undefined;
+        const s = try std.fmt.bufPrint(&nb, "${d}", .{self.params.items.len});
+        try sql.appendSlice(alloc, s);
+    }
+
+    fn likeParam(self: *ParamBuilder, sql: *std.ArrayList(u8), alloc: Allocator, value: []const u8) !void {
+        // The pattern string is NOT freed here: the params list holds
+        // a slice of it until queryParams sends it. It lives in the
+        // caller's arena, freed as a whole when the query completes.
+        const pat = try escapeLikeValue(alloc, value);
+        try self.param(sql, alloc, pat);
+    }
+
+    fn intParam(self: *ParamBuilder, sql: *std.ArrayList(u8), alloc: Allocator, value: i64) !void {
+        const s = try std.fmt.allocPrint(alloc, "{d}", .{value});
+        try self.param(sql, alloc, s);
+    }
+
+    fn floatParam(self: *ParamBuilder, sql: *std.ArrayList(u8), alloc: Allocator, value: f64) !void {
+        const s = try std.fmt.allocPrint(alloc, "{d}", .{value});
+        try self.param(sql, alloc, s);
+    }
+};
+
 /// Escape a value for use inside a LIKE/ILIKE pattern: `\`, `%` and `_`
 /// are backslash-escaped. The result still needs `escapeLiteral` around it.
 pub fn escapeLikePattern(alloc: Allocator, s: []const u8) ![]u8 {
@@ -263,10 +323,23 @@ pub fn escapeLikePattern(alloc: Allocator, s: []const u8) ![]u8 {
 /// Format an embedding as a pgvector literal: `'[0.1,0.2,...]'::vector`.
 /// Values print with `{d}` (shortest round-trip); the literal is quoted
 /// and cast, so no SQL injection is possible through float formatting.
+/// Use this form only when the text is INTERPOLATED into SQL. Bound
+/// parameters must use `formatVectorText` instead: a param value of
+/// `'[..]'::vector` would be cast again by the SQL's own `::vector`,
+/// and the server rejects the quoted string as an invalid vector.
 pub fn formatVectorLiteral(alloc: Allocator, vec: []const f32) ![]u8 {
+    const text = try formatVectorText(alloc, vec);
+    defer alloc.free(text);
+    return std.fmt.allocPrint(alloc, "'{s}'::vector", .{text});
+}
+
+/// Format an embedding as bare pgvector text: `[0.1,0.2,...]`.
+/// This is the form a BOUND parameter takes: the SQL supplies the
+/// `::vector` cast (`$N::vector`), so the value must carry no quotes
+/// and no cast of its own.
+pub fn formatVectorText(alloc: Allocator, vec: []const f32) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
-    try out.append(alloc, '\'');
     try out.append(alloc, '[');
     for (vec, 0..) |v, i| {
         if (i > 0) try out.append(alloc, ',');
@@ -274,7 +347,7 @@ pub fn formatVectorLiteral(alloc: Allocator, vec: []const f32) ![]u8 {
         defer alloc.free(s);
         try out.appendSlice(alloc, s);
     }
-    try out.appendSlice(alloc, "]'::vector");
+    try out.append(alloc, ']');
     return out.toOwnedSlice(alloc);
 }
 
@@ -542,6 +615,96 @@ pub const PgClient = struct {
         return self.runQuery(arena.allocator(), alloc, sql, true);
     }
 
+    /// Extended Query (prepared statement), rows returned (Roadmap 6.8).
+    /// `params` are text values bound to $1..$N in `sql` (null = SQL
+    /// NULL). The unnamed statement + portal are used: each call
+    /// re-issues Parse + Bind, so no per-connection state leaks between
+    /// calls, and a failed Parse/Bind leaves the connection usable (the
+    /// server skips to Sync and returns ReadyForQuery, drained by the
+    /// shared result loop). Parse + Bind + Describe + Execute + Sync
+    /// are sent in a single flush — pipelined, no extra round trip.
+    /// This is the ONLY way user input reaches SQL in the document
+    /// store — values are never interpolated into the query text.
+    pub fn queryParams(self: *PgClient, alloc: Allocator, sql: []const u8, params: []const ?[]const u8) !QueryResult {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        return self.runExtended(arena.allocator(), alloc, sql, params, true);
+    }
+
+    /// Extended Query, rows discarded (INSERT/UPDATE/DELETE with params).
+    pub fn execParams(self: *PgClient, alloc: Allocator, sql: []const u8, params: []const ?[]const u8) !void {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var res = try self.runExtended(arena.allocator(), alloc, sql, params, false);
+        defer res.deinit(alloc);
+    }
+
+    /// Extended-protocol flow: Parse + Bind + Describe + Execute + Sync.
+    fn runExtended(self: *PgClient, arena: Allocator, row_alloc: Allocator, sql: []const u8, params: []const ?[]const u8, collect: bool) !QueryResult {
+        if (!self.open) return error.NotConnected;
+        if (params.len > 65535) return error.ProtocolError;
+        var msg: std.ArrayList(u8) = .empty;
+        defer msg.deinit(arena);
+        var lenb: [4]u8 = undefined;
+        var n16: [2]u8 = undefined;
+        var i32b: [4]u8 = undefined;
+        // Parse: 'P' | len | stmt "" | query | int16 0 (infer types).
+        try msg.append(arena, 'P');
+        std.mem.writeInt(u32, &lenb, @intCast(4 + 1 + sql.len + 1 + 2), .big);
+        try msg.appendSlice(arena, &lenb);
+        try msg.append(arena, 0);
+        try msg.appendSlice(arena, sql);
+        try msg.append(arena, 0);
+        std.mem.writeInt(i16, &n16, 0, .big);
+        try msg.appendSlice(arena, &n16);
+        // Bind: 'B' | len | portal "" | stmt "" | int16 0 (all text
+        // format) | int16 nparams | per param: int32 len + bytes |
+        // int16 0 (all text results).
+        var bind_len: usize = 4 + 1 + 1 + 2 + 2;
+        for (params) |p| bind_len += 4 + (if (p) |v| v.len else 0);
+        bind_len += 2;
+        try msg.append(arena, 'B');
+        std.mem.writeInt(u32, &lenb, @intCast(bind_len), .big);
+        try msg.appendSlice(arena, &lenb);
+        try msg.append(arena, 0);
+        try msg.append(arena, 0);
+        std.mem.writeInt(i16, &n16, 0, .big);
+        try msg.appendSlice(arena, &n16);
+        std.mem.writeInt(i16, &n16, @intCast(params.len), .big);
+        try msg.appendSlice(arena, &n16);
+        for (params) |p| {
+            if (p) |v| {
+                std.mem.writeInt(i32, &i32b, @intCast(v.len), .big);
+                try msg.appendSlice(arena, &i32b);
+                try msg.appendSlice(arena, v);
+            } else {
+                std.mem.writeInt(i32, &i32b, -1, .big);
+                try msg.appendSlice(arena, &i32b);
+            }
+        }
+        std.mem.writeInt(i16, &n16, 0, .big);
+        try msg.appendSlice(arena, &n16);
+        // Describe: 'D' | len | 'S' | stmt "".
+        try msg.append(arena, 'D');
+        std.mem.writeInt(u32, &lenb, @intCast(4 + 1 + 1), .big);
+        try msg.appendSlice(arena, &lenb);
+        try msg.append(arena, 'S');
+        try msg.append(arena, 0);
+        // Execute: 'E' | len | portal "" | int32 0 (unlimited rows).
+        try msg.append(arena, 'E');
+        std.mem.writeInt(u32, &lenb, @intCast(4 + 1 + 4), .big);
+        try msg.appendSlice(arena, &lenb);
+        try msg.append(arena, 0);
+        std.mem.writeInt(i32, &i32b, 0, .big);
+        try msg.appendSlice(arena, &i32b);
+        // Sync: 'S' | len 4.
+        try msg.append(arena, 'S');
+        std.mem.writeInt(u32, &lenb, 4, .big);
+        try msg.appendSlice(arena, &lenb);
+        try self.sendRaw(msg.items);
+        return self.readResult(arena, row_alloc, collect);
+    }
+
     // ---- low-level I/O ----
 
     fn sendRaw(self: *PgClient, data: []const u8) !void {
@@ -733,13 +896,22 @@ pub const PgClient = struct {
         try self.sendRaw(&hdr);
         try self.sendRaw(sql);
         try self.sendRaw(&[_]u8{0});
+        return self.readResult(arena, row_alloc, collect);
+    }
 
+    /// Shared backend-message loop for the simple and extended
+    /// protocols: reads until ReadyForQuery ('Z'), collecting DataRow
+    /// values into `row_alloc` when `collect` is set. An ErrorResponse
+    /// ('E') drains to ReadyForQuery first so the connection stays
+    /// usable — this is what makes a failed Parse/Bind recoverable.
+    fn readResult(self: *PgClient, arena: Allocator, row_alloc: Allocator, collect: bool) !QueryResult {
         var rows: std.ArrayList(Row) = .empty;
         var command_tag: []const u8 = "";
         while (true) {
             const msg = try self.readMessage(arena);
             switch (msg.kind) {
                 'T', 'I' => {}, // RowDescription, EmptyQueryResponse
+                '1', '2', '3', 't', 'n' => {}, // ParseComplete, BindComplete, CloseComplete, ParameterDescription, NoData (extended protocol only)
                 'D' => {
                     if (!collect) continue;
                     if (msg.body.len < 2) return error.ProtocolError;
@@ -1294,99 +1466,108 @@ pub const PostgresStore = struct {
 
     fn insertDocumentLocked(self: *PostgresStore, client: *PgClient, doc: types.Document) !void {
         const a = self.sqlAlloc();
+        // Parameterised inserts (Roadmap 6.8): every value is bound as
+        // a $N parameter — NULLs are null params, never the string
+        // "NULL", and no value is ever interpolated into the SQL.
+        var pb = ParamBuilder{};
+        defer pb.params.deinit(a);
         // The source row must exist for the FK; the feed URL is unknown here,
         // so the source home URL stands in for it.
-        const esc_src_id = try escapeLiteral(a, doc.source_id);
-        defer a.free(esc_src_id);
-        const esc_src_name = try escapeLiteral(a, doc.source_name);
-        defer a.free(esc_src_name);
-        const esc_src_url = try escapeLiteral(a, doc.source_url);
-        defer a.free(esc_src_url);
-        const src_sql = try std.fmt.allocPrint(a,
+        var src_sql: std.ArrayList(u8) = .empty;
+        defer src_sql.deinit(a);
+        try src_sql.appendSlice(a,
             \\INSERT INTO sources (id, name, home_url, feed_url, reliability)
-            \\VALUES ({s}, {s}, {s}, {s}, {d}) ON CONFLICT (id) DO NOTHING
-        , .{
-            esc_src_id,
-            esc_src_name,
-            esc_src_url,
-            esc_src_url,
-            doc.reliability,
-        });
-        defer a.free(src_sql);
-        try client.exec(a, src_sql);
+            \\VALUES (
+        );
+        try pb.param(&src_sql, a, doc.source_id);
+        try src_sql.appendSlice(a, ", ");
+        try pb.param(&src_sql, a, doc.source_name);
+        try src_sql.appendSlice(a, ", ");
+        try pb.param(&src_sql, a, doc.source_url);
+        try src_sql.appendSlice(a, ", ");
+        try pb.param(&src_sql, a, doc.source_url);
+        try src_sql.appendSlice(a, ", ");
+        try pb.floatParam(&src_sql, a, doc.reliability);
+        try src_sql.appendSlice(a, ") ON CONFLICT (id) DO NOTHING");
+        try client.execParams(a, src_sql.items, pb.params.items);
+        pb.params.clearRetainingCapacity();
 
-        const published = if (doc.published_at) |ts|
-            try std.fmt.allocPrint(a, "to_timestamp({d})", .{ts})
-        else
-            try a.dupe(u8, "NULL");
-        defer a.free(published);
-        const fetched = try std.fmt.allocPrint(a, "to_timestamp({d})", .{doc.fetched_at});
-        defer a.free(fetched);
-
-        var topics_sql: std.ArrayList(u8) = .empty;
-        defer topics_sql.deinit(a);
-        if (doc.topics.len == 0) {
-            try topics_sql.appendSlice(a, "'{}'");
-        } else {
-            try topics_sql.appendSlice(a, "ARRAY[");
-            for (doc.topics, 0..) |t, i| {
-                if (i > 0) try topics_sql.appendSlice(a, ", ");
-                try appendEscapedLiteral(&topics_sql, a, t);
-            }
-            try topics_sql.appendSlice(a, "]::text[]");
-        }
-
-        const esc_doc_id = try escapeLiteral(a, doc.id);
-        defer a.free(esc_doc_id);
-        const esc_doc_title = try escapeLiteral(a, doc.title);
-        defer a.free(esc_doc_title);
-        const esc_doc_url = try escapeLiteral(a, doc.url);
-        defer a.free(esc_doc_url);
-        const esc_doc_text = try escapeLiteral(a, doc.text);
-        defer a.free(esc_doc_text);
-        const esc_doc_hash = try escapeLiteral(a, doc.content_hash);
-        defer a.free(esc_doc_hash);
-        const lat_sql = if (doc.lat) |v| try std.fmt.allocPrint(a, "{d}", .{v}) else try a.dupe(u8, "NULL");
-        defer a.free(lat_sql);
-        const lon_sql = if (doc.lon) |v| try std.fmt.allocPrint(a, "{d}", .{v}) else try a.dupe(u8, "NULL");
-        defer a.free(lon_sql);
-        const geom_sql = if (doc.lat != null and doc.lon != null)
-            try std.fmt.allocPrint(a, "ST_SetSRID(ST_MakePoint({d}, {d}), 4326)::geography", .{ doc.lon.?, doc.lat.? })
-        else
-            try a.dupe(u8, "NULL");
-        defer a.free(geom_sql);
-        const emb_sql = if (doc.embedding) |vec| try formatVectorLiteral(a, vec) else try a.dupe(u8, "NULL");
-        defer a.free(emb_sql);
-        const esc_lang = try escapeLiteral(a, doc.lang);
-        defer a.free(esc_lang);
-        const summary_sql = if (doc.summary) |s| try escapeLiteral(a, s) else try a.dupe(u8, "NULL");
-        defer a.free(summary_sql);
-        const doc_sql = try std.fmt.allocPrint(a,
+        var doc_sql: std.ArrayList(u8) = .empty;
+        defer doc_sql.deinit(a);
+        try doc_sql.appendSlice(a,
             \\INSERT INTO documents
             \\  (id, source_id, title, url, text, published_at, fetched_at,
             \\   reliability, topics, content_hash, lat, lon, geom, embedding, lang, summary)
-            \\VALUES ({s}, {s}, {s}, {s}, {s}, {s}, {s}, {d}, {s}, {s}, {s}, {s}, {s}, {s}, {s}, {s})
-            \\ON CONFLICT (id) DO NOTHING
-        , .{
-            esc_doc_id,
-            esc_src_id,
-            esc_doc_title,
-            esc_doc_url,
-            esc_doc_text,
-            published,
-            fetched,
-            doc.reliability,
-            topics_sql.items,
-            esc_doc_hash,
-            lat_sql,
-            lon_sql,
-            geom_sql,
-            emb_sql,
-            esc_lang,
-            summary_sql,
-        });
-        defer a.free(doc_sql);
-        try client.exec(a, doc_sql);
+            \\VALUES (
+        );
+        try pb.param(&doc_sql, a, doc.id);
+        try doc_sql.appendSlice(a, ", ");
+        try pb.param(&doc_sql, a, doc.source_id);
+        try doc_sql.appendSlice(a, ", ");
+        try pb.param(&doc_sql, a, doc.title);
+        try doc_sql.appendSlice(a, ", ");
+        try pb.param(&doc_sql, a, doc.url);
+        try doc_sql.appendSlice(a, ", ");
+        try pb.param(&doc_sql, a, doc.text);
+        try doc_sql.appendSlice(a, ", to_timestamp(");
+        if (doc.published_at) |ts| {
+            try pb.intParam(&doc_sql, a, ts);
+        } else {
+            try pb.nullParam(&doc_sql, a);
+        }
+        try doc_sql.appendSlice(a, "), to_timestamp(");
+        try pb.intParam(&doc_sql, a, doc.fetched_at);
+        try doc_sql.appendSlice(a, "), ");
+        try pb.floatParam(&doc_sql, a, doc.reliability);
+        try doc_sql.appendSlice(a, ", ");
+        const topics_lit = try formatTextArrayLiteral(a, doc.topics);
+        try pb.param(&doc_sql, a, topics_lit);
+        try doc_sql.appendSlice(a, "::text[], ");
+        try pb.param(&doc_sql, a, doc.content_hash);
+        try doc_sql.appendSlice(a, ", ");
+        if (doc.lat) |v| {
+            try pb.floatParam(&doc_sql, a, v);
+        } else {
+            try pb.nullParam(&doc_sql, a);
+        }
+        try doc_sql.appendSlice(a, ", ");
+        if (doc.lon) |v| {
+            try pb.floatParam(&doc_sql, a, v);
+        } else {
+            try pb.nullParam(&doc_sql, a);
+        }
+        // ST_MakePoint(NULL, NULL) is NULL, so a missing lat/lon
+        // yields a NULL geography with the same SQL shape.
+        try doc_sql.appendSlice(a, ", ST_SetSRID(ST_MakePoint(");
+        if (doc.lon) |v| {
+            try pb.floatParam(&doc_sql, a, v);
+        } else {
+            try pb.nullParam(&doc_sql, a);
+        }
+        try doc_sql.appendSlice(a, ", ");
+        if (doc.lat) |v| {
+            try pb.floatParam(&doc_sql, a, v);
+        } else {
+            try pb.nullParam(&doc_sql, a);
+        }
+        try doc_sql.appendSlice(a, "), 4326)::geography, ");
+        if (doc.embedding) |vec| {
+            const lit = try formatVectorText(a, vec);
+            try pb.param(&doc_sql, a, lit);
+            try doc_sql.appendSlice(a, "::vector, ");
+        } else {
+            try pb.nullParam(&doc_sql, a);
+            try doc_sql.appendSlice(a, ", ");
+        }
+        try pb.param(&doc_sql, a, doc.lang);
+        try doc_sql.appendSlice(a, ", ");
+        if (doc.summary) |sm| {
+            try pb.param(&doc_sql, a, sm);
+        } else {
+            try pb.nullParam(&doc_sql, a);
+        }
+        try doc_sql.appendSlice(a, ") ON CONFLICT (id) DO NOTHING");
+        try client.execParams(a, doc_sql.items, pb.params.items);
     }
 
     /// Coarse candidate retrieval (the engine ranks afterwards). Matches any
@@ -1418,6 +1599,12 @@ pub const PostgresStore = struct {
 
         var where: std.ArrayList(u8) = .empty;
         defer where.deinit(alloc);
+        // Parameterised query (Roadmap 6.8): every value below is
+        // bound as a $N parameter, never interpolated into the SQL.
+        // The param strings live in the caller's arena until the
+        // query is sent.
+        var pb = ParamBuilder{};
+        defer pb.params.deinit(alloc);
         if (q.terms.len > 0 or q.query_embedding != null) {
             // FTS over the joined terms, OR per-term ILIKE fallback, OR
             // trigram similarity when fuzzy, OR pgvector closeness when a
@@ -1426,16 +1613,20 @@ pub const PostgresStore = struct {
             var first = true;
             if (q.terms.len > 0) {
                 const joined = try std.mem.join(alloc, " ", q.terms);
-                defer alloc.free(joined);
+                // NOT freed here: pb.params holds a slice of it until
+                // queryParams sends it below. (A `defer alloc.free`
+                // here was the 6.8 use-after-free: the allocator
+                // refills freed memory with 0xaa and the server
+                // rejected the param as invalid UTF-8.)
                 try where.appendSlice(alloc, "d.search_vector @@ websearch_to_tsquery('english', ");
-                try appendEscapedLiteral(&where, alloc, joined);
+                try pb.param(&where, alloc, joined);
                 try where.appendSlice(alloc, ")");
                 first = false;
                 for (q.terms) |term| {
                     try where.appendSlice(alloc, " OR d.title ILIKE ");
-                    try appendLikeLiteral(&where, alloc, term);
+                    try pb.likeParam(&where, alloc, term);
                     try where.appendSlice(alloc, " OR d.text ILIKE ");
-                    try appendLikeLiteral(&where, alloc, term);
+                    try pb.likeParam(&where, alloc, term);
                     if (q.fuzzy) {
                         // word_similarity measures the term against the
                         // most similar word in the title (pg_trgm). The
@@ -1447,18 +1638,19 @@ pub const PostgresStore = struct {
                         // candidates with the strict per-word 0.5 trigram
                         // check before ranking.
                         try where.appendSlice(alloc, " OR word_similarity(d.title, ");
-                        try appendEscapedLiteral(&where, alloc, term);
+                        try pb.param(&where, alloc, term);
                         try where.appendSlice(alloc, ") > 0.1");
                     }
                 }
             }
             if (q.query_embedding) |vec| {
                 if (!first) try where.appendSlice(alloc, " OR ");
-                const lit = try formatVectorLiteral(alloc, vec);
-                defer alloc.free(lit);
+                const lit = try formatVectorText(alloc, vec);
+                // NOT freed here: same reason as `joined` above —
+                // pb.params holds a slice until queryParams sends it.
                 try where.appendSlice(alloc, "d.embedding <=> ");
-                try where.appendSlice(alloc, lit);
-                try where.appendSlice(alloc, " < 0.6");
+                try pb.param(&where, alloc, lit);
+                try where.appendSlice(alloc, "::vector < 0.6");
             }
             try where.appendSlice(alloc, ")");
         }
@@ -1468,23 +1660,27 @@ pub const PostgresStore = struct {
             if (where.items.len > 0) try where.appendSlice(alloc, " AND ");
             try where.appendSlice(alloc, "(");
             if (q.from_ts) |from| {
-                const s = try std.fmt.allocPrint(alloc, "COALESCE(d.published_at, d.fetched_at) >= to_timestamp({d})", .{from});
-                defer alloc.free(s);
-                try where.appendSlice(alloc, s);
+                try where.appendSlice(alloc, "COALESCE(d.published_at, d.fetched_at) >= to_timestamp(");
+                try pb.intParam(&where, alloc, from);
+                try where.appendSlice(alloc, ")");
             }
             if (q.to_ts) |to| {
                 if (q.from_ts != null) try where.appendSlice(alloc, " AND ");
-                const s = try std.fmt.allocPrint(alloc, "COALESCE(d.published_at, d.fetched_at) < to_timestamp({d})", .{to});
-                defer alloc.free(s);
-                try where.appendSlice(alloc, s);
+                try where.appendSlice(alloc, "COALESCE(d.published_at, d.fetched_at) < to_timestamp(");
+                try pb.intParam(&where, alloc, to);
+                try where.appendSlice(alloc, ")");
             }
             try where.appendSlice(alloc, ")");
         }
         if (q.geo) |g| {
             if (where.items.len > 0) try where.appendSlice(alloc, " AND ");
-            const s = try std.fmt.allocPrint(alloc, "ST_DWithin(d.geom, ST_SetSRID(ST_MakePoint({d}, {d}), 4326)::geography, {d})", .{ g.lon, g.lat, g.radius_km * 1000.0 });
-            defer alloc.free(s);
-            try where.appendSlice(alloc, s);
+            try where.appendSlice(alloc, "ST_DWithin(d.geom, ST_SetSRID(ST_MakePoint(");
+            try pb.floatParam(&where, alloc, g.lon);
+            try where.appendSlice(alloc, ", ");
+            try pb.floatParam(&where, alloc, g.lat);
+            try where.appendSlice(alloc, "), 4326)::geography, ");
+            try pb.floatParam(&where, alloc, g.radius_km * 1000.0);
+            try where.appendSlice(alloc, ")");
         }
         if (q.organizations.len > 0) {
             if (where.items.len > 0) try where.appendSlice(alloc, " AND ");
@@ -1492,9 +1688,9 @@ pub const PostgresStore = struct {
             for (q.organizations, 0..) |org, i| {
                 if (i > 0) try where.appendSlice(alloc, " OR ");
                 try where.appendSlice(alloc, "d.source_id = ");
-                try appendEscapedLiteral(&where, alloc, org);
+                try pb.param(&where, alloc, org);
                 try where.appendSlice(alloc, " OR s.name ILIKE ");
-                try appendLikeLiteral(&where, alloc, org);
+                try pb.likeParam(&where, alloc, org);
             }
             try where.appendSlice(alloc, ")");
         }
@@ -1503,7 +1699,7 @@ pub const PostgresStore = struct {
             try where.appendSlice(alloc, "d.topics && ARRAY[");
             for (q.topics, 0..) |t, i| {
                 if (i > 0) try where.appendSlice(alloc, ", ");
-                try appendEscapedLiteral(&where, alloc, t);
+                try pb.param(&where, alloc, t);
             }
             try where.appendSlice(alloc, "]::text[]");
         }
@@ -1514,9 +1710,9 @@ pub const PostgresStore = struct {
             for (q.counties, 0..) |county, i| {
                 if (i > 0) try where.appendSlice(alloc, " OR ");
                 try where.appendSlice(alloc, "d.title ILIKE ");
-                try appendLikeLiteral(&where, alloc, county);
+                try pb.likeParam(&where, alloc, county);
                 try where.appendSlice(alloc, " OR d.text ILIKE ");
-                try appendLikeLiteral(&where, alloc, county);
+                try pb.likeParam(&where, alloc, county);
             }
             try where.appendSlice(alloc, ")");
         }
@@ -1524,11 +1720,10 @@ pub const PostgresStore = struct {
             try sql.appendSlice(alloc, " WHERE ");
             try sql.appendSlice(alloc, where.items);
         }
-        const tail = try std.fmt.allocPrint(alloc, " ORDER BY d.fetched_at DESC LIMIT {d}", .{limit});
-        defer alloc.free(tail);
-        try sql.appendSlice(alloc, tail);
+        try sql.appendSlice(alloc, " ORDER BY d.fetched_at DESC LIMIT ");
+        try pb.intParam(&sql, alloc, @intCast(limit));
 
-        var res = try client.query(alloc, sql.items);
+        var res = try client.queryParams(alloc, sql.items, pb.params.items);
         defer res.deinit(alloc);
         var docs = try alloc.alloc(types.Document, res.rows.len);
         for (res.rows, 0..) |row, i| {
@@ -1599,15 +1794,16 @@ pub const PostgresStore = struct {
             \\  d.embedding::text, d.lat, d.lon, d.lang, d.summary
             \\FROM documents d JOIN sources s ON s.id = d.source_id
         );
+        var pb = ParamBuilder{};
+        defer pb.params.deinit(alloc);
         if (before_ts) |cut| {
-            const s = try std.fmt.allocPrint(alloc, " WHERE d.fetched_at < to_timestamp({d})", .{cut});
-            defer alloc.free(s);
-            try sql.appendSlice(alloc, s);
+            try sql.appendSlice(alloc, " WHERE d.fetched_at < to_timestamp(");
+            try pb.intParam(&sql, alloc, cut);
+            try sql.appendSlice(alloc, ")");
         }
-        const tail = try std.fmt.allocPrint(alloc, " ORDER BY d.fetched_at ASC LIMIT {d}", .{@min(limit, 1000)});
-        defer alloc.free(tail);
-        try sql.appendSlice(alloc, tail);
-        var res = try client.query(alloc, sql.items);
+        try sql.appendSlice(alloc, " ORDER BY d.fetched_at ASC LIMIT ");
+        try pb.intParam(&sql, alloc, @intCast(@min(limit, 1000)));
+        var res = try client.queryParams(alloc, sql.items, pb.params.items);
         defer res.deinit(alloc);
         var docs = try alloc.alloc(types.Document, res.rows.len);
         for (res.rows, 0..) |row, i| {
@@ -1634,8 +1830,10 @@ pub const PostgresStore = struct {
             \\FROM documents d JOIN sources s ON s.id = d.source_id
             \\ WHERE d.id =
         );
-        try appendEscapedLiteral(&sql, alloc, id);
-        var res = try client.query(alloc, sql.items);
+        var pb = ParamBuilder{};
+        defer pb.params.deinit(alloc);
+        try pb.param(&sql, alloc, id);
+        var res = try client.queryParams(alloc, sql.items, pb.params.items);
         defer res.deinit(alloc);
         if (res.rows.len == 0) return null;
         return try documentFromRow(alloc, res.rows[0]);
@@ -1651,20 +1849,22 @@ pub const PostgresStore = struct {
         errdefer self.pool.drop(client);
         defer self.pool.checkin(client);
         const a = self.sqlAlloc();
+        // Parameterised IN-list (Roadmap 6.8): one $N per id, the same
+        // params list bound to both statements.
+        var pb = ParamBuilder{};
+        defer pb.params.deinit(a);
         var list: std.ArrayList(u8) = .empty;
         defer list.deinit(a);
         for (ids, 0..) |id, i| {
             if (i > 0) try list.appendSlice(a, ", ");
-            const esc = try escapeLiteral(a, id);
-            defer a.free(esc);
-            try list.appendSlice(a, esc);
+            try pb.param(&list, a, id);
         }
         const unlink = try std.fmt.allocPrint(a, "DELETE FROM event_sources WHERE document_id IN ({s})", .{list.items});
         defer a.free(unlink);
-        try client.exec(a, unlink);
+        try client.execParams(a, unlink, pb.params.items);
         const del = try std.fmt.allocPrint(a, "DELETE FROM documents WHERE id IN ({s}) RETURNING id", .{list.items});
         defer a.free(del);
-        var res = try client.query(a, del);
+        var res = try client.queryParams(a, del, pb.params.items);
         defer res.deinit(a);
         return res.rows.len;
     }
@@ -1705,6 +1905,27 @@ fn parseTextArray(alloc: Allocator, val: ?[]const u8) ![]const []const u8 {
         if (elem.len == 0) continue;
         try out.append(alloc, try alloc.dupe(u8, elem));
     }
+    return out.toOwnedSlice(alloc);
+}
+
+/// Format topics as a Postgres text[] input literal, e.g.
+/// `{"politics","fuel"}` (Roadmap 6.8). Elements are double-quoted
+/// with `"` and `\` escaped, so any topic text round-trips through a
+/// $N::text[] parameter. Empty list formats as `{}`.
+fn formatTextArrayLiteral(alloc: Allocator, topics: []const []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '{');
+    for (topics, 0..) |t, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try out.append(alloc, '"');
+        for (t) |c| {
+            if (c == '"' or c == '\\') try out.append(alloc, '\\');
+            try out.append(alloc, c);
+        }
+        try out.append(alloc, '"');
+    }
+    try out.append(alloc, '}');
     return out.toOwnedSlice(alloc);
 }
 
@@ -2102,6 +2323,82 @@ test "postgres: live" {
 
     // Migrations are idempotent: a second run must not error.
     try runMigrations(alloc, io, url, "/home/hatch/workspace/pulse/migrations");
+}
+
+test "postgres: prepared statements (live, Roadmap 6.8)" {
+    const alloc = testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const url = (try getTestEnvVar(alloc, io, "PULSE_TEST_POSTGRES_URL")) orelse {
+        std.debug.print("skip: PULSE_TEST_POSTGRES_URL not set\n", .{});
+        return;
+    };
+    defer alloc.free(url);
+
+    var client = PgClient.connect(alloc, io, url) catch |err| {
+        std.debug.print("live test: connect failed: {any}\n", .{err});
+        return err;
+    };
+    defer client.close();
+
+    // queryParams returns the same rows as the simple query for the
+    // same statement.
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var plain = try client.query(aa, "SELECT 1 AS a, 'x' AS b");
+    defer plain.deinit(aa);
+    var prepped = try client.queryParams(aa, "SELECT $1::int AS a, $2 AS b", &.{ "1", "x" });
+    defer prepped.deinit(aa);
+    try testing.expectEqual(@as(usize, 1), plain.rows.len);
+    try testing.expectEqual(@as(usize, 1), prepped.rows.len);
+    try testing.expectEqualStrings("1", prepped.rows[0].cols[0].?);
+    try testing.expectEqualStrings("x", prepped.rows[0].cols[1].?);
+
+    // A value containing a quote is bound, never interpolated: the
+    // query succeeds and returns the value verbatim. Under the old
+    // string-interpolation path this input needed escaping.
+    var quoted = try client.queryParams(aa, "SELECT $1 AS v", &.{"o'brien"});
+    defer quoted.deinit(aa);
+    try testing.expectEqualStrings("o'brien", quoted.rows[0].cols[0].?);
+
+    // NULL params bind as SQL NULL. The cast gives the server the
+    // type context: a bare `$1 IS NULL` cannot infer a type and the
+    // server rejects it with 42P18 (could not determine data type).
+    // Every real call site has type context (a column, a function
+    // argument, or an explicit cast), so only context-free test SQL
+    // needs the cast.
+    var nul = try client.queryParams(aa, "SELECT $1::text IS NULL AS is_null", &.{null});
+    defer nul.deinit(aa);
+    try testing.expectEqualStrings("t", nul.rows[0].cols[0].?);
+
+    // A failed Parse returns PgServerError AND leaves the connection
+    // usable — the next query on the same connection succeeds.
+    const bad = client.queryParams(aa, "SELECT * FROM no_such_table_xyz", &.{});
+    try testing.expectError(error.PgServerError, bad);
+    try client.ping();
+
+    // execParams: an INSERT with params, then read it back.
+    try client.execParams(aa, "CREATE TEMP TABLE pulse_prep_test (id int, name text)", &.{});
+    try client.execParams(aa, "INSERT INTO pulse_prep_test VALUES ($1, $2)", &.{ "7", "o'brien" });
+    var back = try client.queryParams(aa, "SELECT name FROM pulse_prep_test WHERE id = $1", &.{"7"});
+    defer back.deinit(aa);
+    try testing.expectEqual(@as(usize, 1), back.rows.len);
+    try testing.expectEqualStrings("o'brien", back.rows[0].cols[0].?);
+
+    // The store search path (now parameterised) handles a term with a
+    // quote without a syntax error.
+    var store = PostgresStore.init(alloc, io, url) catch |err| {
+        std.debug.print("live test: store init failed: {any}\n", .{err});
+        return err;
+    };
+    defer store.deinit();
+    var repo = store.repository();
+    const found = try repo.search(aa, .{ .terms = &.{"o'brien"}, .limit = 5 });
+    _ = found;
+    const missing = try repo.getDocument(aa, "o'brien");
+    try testing.expect(missing == null);
 }
 
 test "postgres: read replica routes reads, falls back on failure (live)" {

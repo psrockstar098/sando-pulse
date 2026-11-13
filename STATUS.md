@@ -651,3 +651,74 @@ direct order 2026-11-13), real data only, docs in the same commits.
   text, so a shared key would serve one user's casing to another.
 - Verified: `zig build` passes; 236/236 tests (5 new popular tests:
   normalise, count/top, eviction, save/load round-trip, missing file).
+
+### 6.8 Prepared statements — DONE (2026-11-13 ~16:00)
+
+- Extended protocol in `PgClient` (`src/storage/postgres.zig`):
+  `queryParams` / `execParams` use the unnamed statement + portal,
+  Parse + Bind + Describe + Execute + Sync sent in a single flush
+  (pipelined, no extra round trip). A shared `readResult` loop handles
+  both the simple and extended protocols, accepting the extended-only
+  messages `'1','2','3','t','n'` (ParseComplete, BindComplete,
+  CloseComplete, ParameterDescription, NoData) and draining to
+  ReadyForQuery on error, so a failed Parse/Bind leaves the connection
+  usable. `ParamBuilder` helper: `param`, `nullParam`, `likeParam`
+  (with `escapeLikeValue` — `%`, `_`, `\` escaped, `%` wildcards in
+  the VALUE), `intParam`, `floatParam` (numbers as decimal text;
+  Postgres infers the type from the SQL context).
+  `formatTextArrayLiteral` for `$N::text[]`; `formatVectorText`
+  (new, bare `[v,v,...]`) for `$N::vector` — see the bug note below.
+- Converted: `searchLocked` (FTS joined terms, per-term ILIKE, fuzzy
+  word_similarity, vector `$N::vector < 0.6`, time window via
+  `to_timestamp($N)`, geo via `ST_MakePoint($N,$N)`, organizations,
+  topics ARRAY, counties, LIMIT $N), `scanDocuments` (before_ts +
+  LIMIT), `getDocument` (id $N), `insertDocumentLocked` (source
+  upsert + document insert as two separate execParams calls, NULLs
+  as null params, `to_timestamp($N)`, topics as `$N::text[]`, lat/lon
+  via `ST_SetSRID(ST_MakePoint($N,$N), 4326)::geography` with null
+  params when missing, embedding as `$N::vector` or null),
+  `deleteDocuments` (parameterised IN-list, same params bound to
+  both DELETEs). This is now the ONLY way user input reaches SQL in
+  the document store — values are never interpolated into the query
+  text. A value containing a quote (`o'brien`) is bound, never
+  escaped, and returns verbatim.
+- NOT converted (gap-record, not in this section's scope):
+  knowledge-store queries, migrations, audit/usage,
+  `countBySource`/`countDocuments` (no user input in those paths).
+- Bugs found by the suite / live runs and fixed in this section:
+  1. The insert rewrite dropped the `, 4326` SRID argument from
+     `ST_SetSRID` — the server rejected the one-argument call.
+  2. A NULL param in context-free SQL (`SELECT $1 IS NULL`) is
+     rejected by the server with 42P18 (could not determine data
+     type). Every real call site has type context (a column, a
+     function argument, an explicit cast), so only the test SQL
+     needed a cast (`$1::text IS NULL`).
+  3. Use-after-free: `defer alloc.free(joined)` / `defer
+     alloc.free(lit)` in `searchLocked` freed the FTS / vector
+     param strings before `queryParams` sent them. The allocator
+     refills freed memory with `0xaa`, and the server rejected the
+     param as invalid UTF-8 (22021). Leftover from the old
+     interpolate-into-SQL code, where freeing after interpolation
+     was safe. Fixed by not freeing: param strings live in the
+     caller's arena until the query is sent.
+  4. `formatVectorLiteral` returns the quoted+cast form
+     `'[1,0,...]'::vector`, correct when interpolated into SQL —
+     but as a BOUND param the quotes/cast become part of the value
+     and `$N::vector` receives an invalid vector string. New
+     `formatVectorText` (bare `[1,0,...]`) is used for both bound
+     sites (insert + search embedding leg); the literal form is
+     kept for interpolation uses and its unit test.
+  5. Multi-statement strings are rejected by Parse (42601:
+     "cannot insert multiple commands into a prepared statement").
+     Recorded, not a store bug: the two inserts were already
+     separate execParams calls. Any future multi-statement work
+     must split the calls.
+- Verified: `zig build` passes; **237/237 tests** (1 new live test:
+  same rows via simple vs prepared `SELECT $1::int, $2`, quote
+  value `o'brien` returned verbatim, NULL param binds as SQL NULL,
+  failed Parse returns `PgServerError` AND the connection stays
+  usable (`ping()` after), `execParams` INSERT + read-back via a
+  temp table, store search + `getDocument` with an `o'brien` term).
+  Live smoke (Postgres store, port 9009): ingest of a
+  quote-titled doc OK; query `obrien fuel` -> sufficient true,
+  path fast, latency 85.0 ms, 2 results, first title as ingested.
