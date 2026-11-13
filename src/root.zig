@@ -38,6 +38,7 @@ pub const ingestion_facebook_scheduler = @import("ingestion/connectors/facebook/
 pub const ingestion_facebook_types = @import("ingestion/connectors/facebook/types.zig");
 pub const ingestion_facebook_webhooks = @import("ingestion/connectors/facebook/webhooks.zig");
 pub const ingestion_fetchers = @import("ingestion/fetchers.zig");
+pub const ingestion_ssrf = @import("ingestion/ssrf.zig");
 pub const ingestion_normalizer = @import("ingestion/normalizer.zig");
 pub const ingestion_pipeline = @import("ingestion/pipeline.zig");
 pub const ingestion_rss = @import("ingestion/rss.zig");

@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const logging = @import("../common/logging.zig");
+const ssrf = @import("ssrf.zig");
 
 pub const user_agent = "SandoPulse/0.1 (Liberia intelligence engine; research use)";
 
@@ -168,6 +169,17 @@ fn fetchOnce(alloc: std.mem.Allocator, io: std.Io, url: []const u8, environ: ?*c
         return error.SourceUnavailable;
     var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
     const host = std.Io.net.HostName.fromUri(uri, &host_buf) catch return error.SourceUnavailable;
+    // SSRF guard (Roadmap 5.1): ingestion GETs never connect to loopback,
+    // private, link-local or otherwise non-public targets — a feed redirect
+    // to 169.254.169.254 or 127.0.0.1 is refused before any socket opens.
+    // POSTs are operator-configured provider endpoints (a local Ollama is
+    // legitimate) and are not checked.
+    if (method == .get) {
+        ssrf.checkHost(alloc, io, host.bytes) catch |e| {
+            logging.warn("ssrf: refused fetch target", &.{ .{ .key = "host", .value = host.bytes }, .{ .key = "error", .value = @errorName(e) } });
+            return error.SourceUnavailable;
+        };
+    }
     const port: u16 = uri.port orelse if (is_https) 443 else 80;
     const target = try requestTarget(alloc, uri);
     defer alloc.free(target);
