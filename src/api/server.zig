@@ -188,6 +188,21 @@ pub const Server = struct {
     /// from cfg, movable by POST /v1/admin/config. Read here instead
     /// of cfg so a hot reload takes effect on the next query.
     reindex_interval_s: u64,
+    /// Reused per-request arena (optimization scope, Roadmap 6):
+    /// reset with `.retain_capacity` at the start of every request
+    /// (and every cache-warming query). The server's allocator is a
+    /// process-lifetime arena, so a FRESH ArenaAllocator per request
+    /// leaked its backing buffers forever — ArenaAllocator.free is a
+    /// no-op against an arena parent, and every request allocated new
+    /// buffers (+41 MiB over 250 distinct queries in the baseline).
+    /// One arena per server keeps the backing memory bounded by the
+    /// largest single request. Safe because the server is
+    /// single-threaded and nothing arena-allocated outlives the
+    /// request: the L1/L2 cache puts dupe with their own allocators,
+    /// the audit sink consumes its record synchronously, and the
+    /// memindex owns its storage (the request arena only holds its
+    /// build temporaries).
+    req_arena: std.heap.ArenaAllocator,
 
     pub fn serve(self: *Server) !void {
         const addr = std.Io.net.IpAddress.parse(self.cfg.host, self.cfg.port) catch |e| {
@@ -762,9 +777,8 @@ pub const Server = struct {
         var warmed: usize = 0;
         const start_ms = timex.nowMillis(self.io);
         for (top_list) |row| {
-            var arena = std.heap.ArenaAllocator.init(self.alloc);
-            defer arena.deinit();
-            const alloc = arena.allocator();
+            _ = self.req_arena.reset(.retain_capacity);
+            const alloc = self.req_arena.allocator();
             var c = self.computeQuery(alloc, row.query, enabled.items, "", timex.nowNanos(self.io)) catch {
                 logging.warn("cache warming: query failed, skipped", &.{.{ .key = "query", .value = row.query }});
                 continue;
@@ -818,9 +832,11 @@ pub const Server = struct {
 
     fn handleRequest(self: *Server, req: *std.http.Server.Request) !void {
         const start_ms = timex.nowMillis(self.io);
-        var arena = std.heap.ArenaAllocator.init(self.alloc);
-        defer arena.deinit();
-        const alloc = arena.allocator();
+        // Reused arena (optimization scope): reset, don't recreate —
+        // a fresh arena per request leaked its backing buffers into
+        // the process-lifetime parent arena (see req_arena field).
+        _ = self.req_arena.reset(.retain_capacity);
+        const alloc = self.req_arena.allocator();
         const req_id = try newRequestId(alloc, self.io);
         // Capture the head BEFORE any readBody call: std.http.Server
         // invalidates head/head_buffer pointers once the body stream is
@@ -1231,7 +1247,7 @@ pub const Server = struct {
             // counted (text + count only, no identity). The key is
             // owned by the server allocator, never the request arena.
             // Persisted every N records so the list survives restarts.
-            self.popular.record(self.alloc, qr.query) catch {};
+            self.popular.record(qr.query) catch {};
             if (self.popular.records_since_save >= self.cfg.popular_save_every) {
                 self.popular.save(self.io, self.cfg.popular_path) catch {};
                 self.popular.records_since_save = 0;

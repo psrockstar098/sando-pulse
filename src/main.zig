@@ -435,24 +435,34 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     defer if (audit_file) |f| f.close(io);
-    var audit_sink = auditlog.AuditSink.init(alloc, io, audit_pg, audit_file, audit_file_len);
+    // Allocator for components that FREE memory (optimization
+    // scope): the process arena's free is a no-op, so a component
+    // that evicts/frees into it retains every freed byte forever
+    // (the L1's evicted bodies alone grew RSS ~6 KB per fresh
+    // distinct query once full). c_allocator (malloc/free) makes
+    // those frees real, so each component's RSS is bounded by its
+    // live size. No leak report: c_allocator never reports. Only
+    // the four churning components use it; everything else keeps
+    // the process arena.
+    const churn_alloc = std.heap.c_allocator;
+    var audit_sink = auditlog.AuditSink.init(churn_alloc, io, audit_pg, audit_file, audit_file_len);
 
     // L1 in-process cache (Roadmap 6.2): process-lifetime, sits in
     // front of the Redis (L2) query cache.
-    var l1 = l1cache.L1Cache.init(alloc, cfg.l1_max_entries, cfg.l1_max_bytes, cfg.l1_ttl_s);
+    var l1 = l1cache.L1Cache.init(churn_alloc, cfg.l1_max_entries, cfg.l1_max_bytes, cfg.l1_ttl_s);
     defer l1.deinit();
 
     // In-memory index (Roadmap 6.3/6.5): built from the store at boot.
     // A build failure is a warning, not a boot failure — queries fall
     // back to the store search.
-    var mem_index = memindex.MemIndex.init(alloc, cfg.memindex_max_terms, cfg.memindex_max_docs, 64 * 1024 * 1024);
+    var mem_index = memindex.MemIndex.init(churn_alloc, cfg.memindex_max_terms, cfg.memindex_max_docs, 64 * 1024 * 1024);
     defer mem_index.deinit();
     var index_ptr: ?*memindex.MemIndex = null;
     var index_epoch: i64 = 0;
     var index_built_ms: i64 = 0;
     {
         const start_ms = timex.nowMillis(io);
-        const report = mem_index.buildFromRepo(alloc, repo, timex.nowMillis(io), start_ms) catch null;
+        const report = mem_index.buildFromRepo(churn_alloc, repo, timex.nowMillis(io), start_ms) catch null;
         if (report) |r| {
             index_ptr = &mem_index;
             if (redis_client) |rc| index_epoch = cache.currentEpoch(rc, alloc);
@@ -469,7 +479,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Popular searches (Roadmap 6.4): loaded from the persistence
     // file when present (a missing file just means no history yet).
-    var pop = popular.PopularSearches.load(alloc, io, cfg.popular_path, cfg.popular_max_tracked);
+    var pop = popular.PopularSearches.load(churn_alloc, io, cfg.popular_path, cfg.popular_max_tracked);
     defer pop.deinit();
     if (pop.tracked() > 0) {
         logging.info("popular searches loaded", &.{
@@ -503,6 +513,7 @@ pub fn main(init: std.process.Init) !void {
         .redis_breaker = breaker.CircuitBreaker.init(cfg.redis_breaker_failures, cfg.redis_breaker_cooldown_s * 1000),
         .embed_breaker = embed_breaker,
         .reindex_interval_s = cfg.reindex_interval_s,
+        .req_arena = std.heap.ArenaAllocator.init(alloc),
     };
     // Cache warming (Roadmap 6.4): run the most popular queries
     // through the pipeline and store the answers in L1/L2, so the

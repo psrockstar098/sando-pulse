@@ -936,3 +936,67 @@ direct order 2026-11-13), real data only, docs in the same commits.
   proven (no working external provider exists to succeed a
   trial call); the close logic is the same code path as the
   Redis breaker (proven live) plus unit tests.
+
+### Optimization scope (RAM/CPU/performance) — DONE (2026-11-13 ~19:00)
+
+Dominic's added R6 scope: measure first, optimize where it is
+safe and measurable, report memory + CPU next to latency. Full
+numbers in `docs/PERFORMANCE.md`; the short version:
+
+- Measurement hooks added to `pulse loadtest`
+  (`src/cli/loadtest.zig`): p99 + p99.9 on both endpoints,
+  `--server-pid <pid>` samples the server's RSS + CPU from
+  `/proc/<pid>/statm` and `/proc/<pid>/stat` before/after the
+  run (RSS before/after/delta, CPU ms per 1k queries),
+  `--distinct` makes every query unique (fast path instead of
+  cache hits), `--api-key <key>` sends the Bearer header — the
+  first baseline run measured nothing but 401s until this was
+  added (all 1000 queries failed; health passed because it needs
+  no auth). Without `--server-pid` the memory/CPU lines are
+  skipped honestly, never invented.
+- Baseline (before): idle RSS 11.2 MiB; 250 distinct queries
+  grew RSS **+41.4 MiB** (~170 KB/query retained); 250 same-query
+  (L1 hit) grew it **+6.3 MiB**. Fast p50 126.9 ms, instant p50
+  42.7 ms, CPU 9120 ms / 1480 ms per 1k queries.
+- Fix 1 — reused per-request arena: `handleRequest` created a
+  fresh `ArenaAllocator` per request from the process-lifetime
+  arena (free is a no-op), so every request's backing buffers
+  accumulated forever. Now one arena per server
+  (`Server.req_arena`), reset with `.retain_capacity` per
+  request (and per warming query). Verified safe: L1/L2 puts
+  dupe with their own allocators, the audit sink consumes its
+  record synchronously, the memindex owns its storage.
+- Fix 2 — real frees for churning components: L1, audit sink,
+  popular tracker, and memindex now allocate from
+  `std.heap.c_allocator` (malloc/free) in main.zig, so their
+  evictions/frees actually reclaim. The process arena stays for
+  everything else (deliberate: a GPA would report every
+  never-freed lifetime allocation as a leak in debug builds).
+- Fix 3 — crash found by the fix: after the c_allocator change
+  the server aborted with `munmap_chunk(): invalid pointer`
+  once tracking crossed 1000 queries (first popular eviction):
+  `PopularSearches.record` allocated the key with a
+  caller-passed allocator (process arena) while `evictLowest`
+  freed it with the map's allocator. Fixed by allocating the
+  key with the map's own allocator and dropping the parameter
+  so no caller can pass the wrong one again. L1 + memindex
+  audited for the same pattern (both dupe what they keep).
+- Post-fix (same scenarios, 5 fresh distinct batches, 1250
+  queries): 1250/1250 ok, 0 crashes; RSS 12.8 → 16.0 MiB
+  (per-batch +1.0/+1.1/+0.5/−0.3/+0.8 — L1 fill from empty,
+  then flat once full); L1 512 entries / 1,017,669 bytes,
+  **748 evictions**, no growth. Latency unchanged (fast ~127 ms,
+  instant ~43 ms) and CPU unchanged (8000–8880 vs 9120, inside
+  noise) — recorded as no win, not claimed as one.
+- The ~42 ms floor on every request (health included) is
+  environment, not Pulse code: server CPU <1 ms/request,
+  handler 0.165 ms instant, curl connect 0.2 ms / first byte
+  41.7 ms, trivial Python server on the same VM 2–3 ms.
+  Consistent with `std.Io.Threaded` socket-op dispatch latency
+  under this VM's CPU throttle; threads=4 shows 4× the floor
+  (167 ms) from accept-loop serialisation. Not fixed here;
+  re-measure on real hardware. (Full detail in
+  `docs/PERFORMANCE.md`.)
+- Verified: `zig build` passes; **252/252 tests pass** (3 new
+  loadtest tests: parseArgs --server-pid/--distinct/--api-key,
+  percentile999, readProcSample on own + bogus pid).

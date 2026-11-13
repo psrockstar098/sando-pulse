@@ -69,10 +69,16 @@ pub const PopularSearches = struct {
         return out.toOwnedSlice(alloc);
     }
 
-    /// Record one asked query. `alloc` must be a long-lived allocator
-    /// (the server's own) — the normalised key is kept in the map.
-    /// Empty and over-long (>200 chars) queries are not tracked.
-    pub fn record(self: *PopularSearches, alloc: std.mem.Allocator, query: []const u8) !void {
+    /// Record one asked query. The normalised key is kept in the
+    /// map, so it is allocated with the map's own allocator — never
+    /// a caller-passed one. (A caller-passed allocator caused a
+    /// cross-allocator free: keys allocated by the process arena
+    /// were freed by the map's allocator on eviction, aborting the
+    /// server with `munmap_chunk(): invalid pointer` once tracking
+    /// passed 1000 queries.) Empty and over-long (>200 chars)
+    /// queries are not tracked.
+    pub fn record(self: *PopularSearches, query: []const u8) !void {
+        const alloc = self.counts.allocator;
         const norm = try normalize(alloc, query);
         if (norm.len == 0 or norm.len > 200) {
             alloc.free(norm);
@@ -188,12 +194,12 @@ test "popular record counts and top orders most-asked first" {
     const alloc = arena.allocator();
     var p = PopularSearches.init(alloc, 100);
     defer p.deinit();
-    try p.record(alloc, "Fuel shortage");
-    try p.record(alloc, "fuel  shortage");
-    try p.record(alloc, "FUEL SHORTAGE");
-    try p.record(alloc, "elections");
-    try p.record(alloc, "  ");
-    try p.record(alloc, "");
+    try p.record("Fuel shortage");
+    try p.record("fuel  shortage");
+    try p.record("FUEL SHORTAGE");
+    try p.record("elections");
+    try p.record("  ");
+    try p.record("");
     const top_list = try p.top(alloc, 10);
     try std.testing.expectEqual(@as(usize, 2), top_list.len);
     try std.testing.expectEqualStrings("fuel shortage", top_list[0].query);
@@ -208,10 +214,10 @@ test "popular evicts the lowest-count entry past the cap" {
     const alloc = arena.allocator();
     var p = PopularSearches.init(alloc, 2);
     defer p.deinit();
-    try p.record(alloc, "a");
-    try p.record(alloc, "a");
-    try p.record(alloc, "b");
-    try p.record(alloc, "c");
+    try p.record("a");
+    try p.record("a");
+    try p.record("b");
+    try p.record("c");
     try std.testing.expectEqual(@as(usize, 2), p.tracked());
     const top_list = try p.top(alloc, 10);
     try std.testing.expectEqualStrings("a", top_list[0].query);
@@ -226,9 +232,9 @@ test "popular save/load round-trips counts" {
     const alloc = arena.allocator();
     var p = PopularSearches.init(alloc, 100);
     defer p.deinit();
-    try p.record(alloc, "fuel shortage");
-    try p.record(alloc, "fuel shortage");
-    try p.record(alloc, "elections");
+    try p.record("fuel shortage");
+    try p.record("fuel shortage");
+    try p.record("elections");
     const path = "/tmp/pulse-popular-test.json";
     try p.save(std.testing.io, path);
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
