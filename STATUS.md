@@ -722,3 +722,59 @@ direct order 2026-11-13), real data only, docs in the same commits.
   Live smoke (Postgres store, port 9009): ingest of a
   quote-titled doc OK; query `obrien fuel` -> sufficient true,
   path fast, latency 85.0 ms, 2 results, first title as ingested.
+
+### 6.10 Automatic performance optimization — DONE (2026-11-13 ~16:30)
+
+- `src/engine/autotune.zig` (new, pure decision logic — no I/O):
+  `Autotuner` holds the live knob values + configured defaults,
+  bounds, and cooldowns. One server-side adjustment per 100
+  queries, one worker-side adjustment per 10 runs; signals need a
+  minimum sample before anything moves.
+- Knobs and signals: L1 TTL 60–900s step 60s (hit rate < 0.5 grows,
+  > 0.9 shrinks); fan-out timeout 50–500ms step 50ms (incomplete
+  rate > 0.2 grows, zero stragglers over 50 fan-outs shrinks);
+  max concurrent sources 1–8 (worker-side; run errors shed
+  concurrency, slow but error-free fetches add it). Every
+  adjustment is logged (old -> new + reason) and counted in
+  metrics. The tuner never touches correctness, auth, or
+  retention. The precompute interval (`PULSE_PRECOMPUTE_TTL_S`)
+  is NOT auto-tuned — no in-process signal exists for briefing
+  freshness cost — so it stays manual-only (gap recorded here).
+- Wiring: the server owns an `Autotuner` (from cfg; `PULSE_AUTOTUNE`
+  defaults off) and checks it after every query; the L1 TTL is
+  applied to the live `L1Cache.ttl_s`, the fan-out deadline to a
+  runtime field read by the wait. The worker owns one too and
+  tunes the concurrency it passes to each `runOnce` from the run
+  report (errors + mean per-source duration, skipped sources
+  excluded; a failed run counts as an error signal). A failed run
+  still runs the stream/maintenance work afterwards — the tuner
+  hook does not change the loop's fall-through.
+- `GET /v1/autotune` (public): enabled, live knob values,
+  `precompute_ttl_s`, `adjustments_total`, last adjustment +
+  reason. `POST /v1/admin/autotune/reset` (API-key auth, kind
+  null — the admin pattern, no usage accounting): restores the
+  configured defaults, applies them to the live knobs, returns
+  the changed list. Restarting also restores the defaults.
+- Metrics: `pulse_autotune_adjustments_total`,
+  `pulse_autotune_l1_ttl_seconds` /
+  `pulse_autotune_fanout_timeout_ms` /
+  `pulse_autotune_max_concurrent_sources` gauges,
+  `pulse_fanout_total` / `pulse_fanout_incomplete_total`,
+  `pulse_process_rss_bytes` (Linux /proc/self/statm; 0 when
+  unreported). Note: `std.fmt` caps one format call at 32
+  arguments — `render` now emits the base block (27 args) plus a
+  second call for the new series, concatenated.
+- Verified: `zig build` passes; **244/244 tests** (7 new autotune
+  unit tests: disabled, TTL up/down + clamps, under-sampled,
+  fan-out up/down, worker up/down + cap, reset). Live smoke
+  (Postgres + Redis, `PULSE_AUTOTUNE=1`, rate limit raised for
+  the run): 105 distinct queries (all L1 misses) ->
+  `l1_ttl_s` 300 -> 360, `adjustments_total` 1, log line with
+  reason; `/metrics` showed `pulse_process_rss_bytes`
+  31,911,936 (~30.4 MiB) and the live gauges; reset returned
+  `{"reset":true,"changed":[{"knob":"l1_ttl_s","old":360,
+  "new":300}]}` and `/v1/autotune` showed 300 with
+  `last_adjustment` null. Smoke note: the default 100 req/min
+  rate limit tripped during the 105-query run — the reset probe
+  needed `PULSE_RATE_LIMIT_PER_MINUTE=1000`; the no-key reset
+  correctly returned `auth_required`.

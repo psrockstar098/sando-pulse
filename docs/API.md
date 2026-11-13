@@ -127,3 +127,32 @@ text is extractive: it is built only from the cited `results`.
   warmed answer is byte-identical to a freshly computed one. The
   warmed queries are the top `PULSE_POPULAR_WARM_N` (default 10) from
   the persisted popular list. Warming never fails the boot.
+
+## Auto-tuning (Roadmap 6.10)
+
+- Disabled by default; `PULSE_AUTOTUNE=1` enables it. The tuner
+  adjusts only safe knobs, one step at a time, within documented
+  bounds, and logs every adjustment (old -> new + reason). It never
+  touches correctness behaviour, auth, or retention.
+- Knobs and signals: L1 TTL (60–900s, step 60s) from the L1 hit rate
+  (< 0.5 grows it, > 0.9 shrinks it); fan-out timeout (50–500ms, step
+  50ms) from the enrichment incomplete rate (> 0.2 grows it, zero
+  stragglers over 50 fan-outs shrinks it); max concurrent sources
+  (1–8, worker-side) from the ingest run report (source errors shed
+  concurrency, slow but clean fetches add it). At most one
+  server-side adjustment per 100 queries, one worker-side adjustment
+  per 10 runs; a knob already at its bound stays put. Signals need a
+  minimum sample (20 L1 events, 10 fan-outs) before anything moves.
+- The precompute interval (`PULSE_PRECOMPUTE_TTL_S`) is NOT
+  auto-tuned: there is no in-process signal for briefing freshness
+  cost, so it stays manual-only.
+- `GET /v1/autotune` (public) reports enabled, the live knob values,
+  `adjustments_total`, and the last adjustment with its reason.
+  `POST /v1/admin/autotune/reset` (API-key auth) restores the
+  configured defaults and applies them to the live knobs; it returns
+  the list of values that actually changed. Restarting also restores
+  the defaults.
+- `/metrics` carries `pulse_autotune_adjustments_total`, gauges for
+  the live knob values, `pulse_fanout_total` /
+  `pulse_fanout_incomplete_total`, and `pulse_process_rss_bytes`
+  (process RSS from /proc/self/statm; 0 when unreported).

@@ -49,6 +49,7 @@ const l1cache = @import("l1cache.zig");
 const memindex = @import("../engine/memindex.zig");
 const router = @import("../engine/router.zig");
 const fanout = @import("../engine/fanout.zig");
+const autotune = @import("../engine/autotune.zig");
 const usage = @import("usage.zig");
 
 /// Fan-out task: knowledge-store locations matching the query's
@@ -159,6 +160,14 @@ pub const Server = struct {
     /// Always present; the sink degrades to log-only when neither
     /// Postgres nor a file is configured.
     audit_sink: *auditlog.AuditSink,
+    /// Bounded auto-tuning (Roadmap 6.10): holds the live knob values
+    /// the tuner moves (L1 TTL, fan-out timeout). The configured
+    /// defaults live in cfg and are restored by reset().
+    autotuner: autotune.Autotuner,
+    /// Live fan-out deadline in ms (Roadmap 6.10): initialised from
+    /// cfg, moved by the tuner. Read here instead of cfg so an
+    /// adjustment takes effect on the next query.
+    fanout_timeout_ms: u64,
 
     pub fn serve(self: *Server) !void {
         const addr = std.Io.net.IpAddress.parse(self.cfg.host, self.cfg.port) catch |e| {
@@ -347,6 +356,59 @@ pub const Server = struct {
             .{ .key = "terms", .value = std.fmt.allocPrint(alloc, "{d}", .{report.terms}) catch "?" },
             .{ .key = "duration_ms", .value = std.fmt.allocPrint(alloc, "{d}", .{report.duration_ms}) catch "?" },
         });
+    }
+
+    /// Bounded auto-tuning check (Roadmap 6.10): after each query,
+    /// ask the tuner whether a safe knob should move. The tuner
+    /// decides from the metrics snapshot; at most one adjustment per
+    /// 100 queries. An adjustment is applied to the live knob, logged
+    /// (old -> new + reason), and counted in metrics. It never fails
+    /// the query — a logging failure is swallowed.
+    fn maybeAutotune(self: *Server) void {
+        const m = self.metrics;
+        const adj = self.autotuner.maybeTuneServer(.{
+            .l1_hits = m.l1_cache_hits_total,
+            .l1_misses = m.l1_cache_misses_total,
+            .fanout_total = m.fanout_total,
+            .fanout_incomplete = m.fanout_incomplete_total,
+        }, m.queries_total) orelse return;
+        switch (adj.knob) {
+            .l1_ttl_s => self.l1.ttl_s = adj.new_value,
+            .fanout_timeout_ms => self.fanout_timeout_ms = adj.new_value,
+            .max_concurrent_sources => {}, // worker-side knob; the server never moves it.
+        }
+        m.observeAutotune();
+        m.setAutotuneValues(self.autotuner.l1_ttl_s, self.autotuner.fanout_timeout_ms, self.autotuner.max_concurrent_sources);
+        const knob_name = switch (adj.knob) {
+            .l1_ttl_s => "l1_ttl_s",
+            .fanout_timeout_ms => "fanout_timeout_ms",
+            .max_concurrent_sources => "max_concurrent_sources",
+        };
+        logging.info("autotune adjustment", &.{
+            .{ .key = "knob", .value = knob_name },
+            .{ .key = "old", .value = std.fmt.allocPrint(self.alloc, "{d}", .{adj.old_value}) catch "?" },
+            .{ .key = "new", .value = std.fmt.allocPrint(self.alloc, "{d}", .{adj.new_value}) catch "?" },
+            .{ .key = "reason", .value = adj.reason },
+        });
+    }
+
+    /// Process resident set size in bytes, Linux-only (Roadmap 6.10 /
+    /// 6.12): reads /proc/self/statm (second field = resident pages).
+    /// Returns 0 when the platform cannot report it — never an error.
+    fn processRssBytes(self: *Server) u64 {
+        const file = std.Io.Dir.cwd().openFile(self.io, "/proc/self/statm", .{}) catch return 0;
+        defer file.close(self.io);
+        var buf: [256]u8 = undefined;
+        var rbuf: [256]u8 = undefined;
+        var reader = file.reader(self.io, &rbuf);
+        const n = reader.interface.readSliceShort(&buf) catch return 0;
+        const text = buf[0..n];
+        var it = std.mem.splitScalar(u8, text, ' ');
+        _ = it.next(); // size (pages)
+        const rss_pages = it.next() orelse return 0;
+        const pages = std.fmt.parseInt(u64, std.mem.trim(u8, rss_pages, " \n"), 10) catch return 0;
+        // Linux x86_64 page size (std has no page_size constant in 0.17.1).
+        return pages * 4096;
     }
 
     fn keyFpOf(head: HeadCapture, arena: std.mem.Allocator) []const u8 {
@@ -596,8 +658,9 @@ pub const Server = struct {
         // fanout_complete false (partial results, labelled).
         var enrich = query_json.Enrichment{};
         if (fo) |*f| {
-            f.wait(self.cfg.fanout_timeout_ms);
+            f.wait(self.fanout_timeout_ms);
             enrich.fanout_complete = f.allDone();
+            self.metrics.observeFanout(enrich.fanout_complete);
             if (f.completed("locations")) enrich.locations = loc_task.?.out;
             if (f.completed("statistics")) enrich.statistics = stat_task.?.out;
         }
@@ -608,6 +671,7 @@ pub const Server = struct {
             return error.ResponseFailed;
         };
         self.metrics.observePath(decision.path.name(), latency_ms);
+        self.maybeAutotune();
         // Store a copy rendered with empty markers so a later hit
         // can splice in its own id, serving path, and latency.
         const storable = query_json.buildQueryResponse(alloc, "", query_text, p, outcome, enabled.len, timex.nowSeconds(self.io), "", 0, "", enrich) catch null;
@@ -703,6 +767,52 @@ pub const Server = struct {
 
         if (method == .GET and std.mem.eql(u8, path, "/v1/health")) {
             const body = try query_json.buildHealthResponse(alloc, req_id, self.repo.countDocuments(), sources.enabledCount(), self.store_name, self.cfg.country);
+            self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+            try respondJson(req, .ok, body, req_id);
+            return;
+        }
+
+        if (method == .GET and std.mem.eql(u8, path, "/v1/autotune")) {
+            // Auto-tuning state (Roadmap 6.10): public, like /v1/health
+            // — it names no secret, only the live knob values, the
+            // adjustment count, and the last adjustment + reason.
+            const t = &self.autotuner;
+            const last = if (t.last_adjustment) |a| try std.fmt.allocPrint(alloc, "{{\"knob\":\"{s}\",\"old\":{d},\"new\":{d},\"reason\":\"{s}\"}}", .{ @tagName(a.knob), a.old_value, a.new_value, a.reason }) else "null";
+            const body = try std.fmt.allocPrint(alloc, "{{\"request_id\":\"{s}\",\"enabled\":{},\"l1_ttl_s\":{d},\"fanout_timeout_ms\":{d},\"max_concurrent_sources\":{d},\"precompute_ttl_s\":{d},\"adjustments_total\":{d},\"last_adjustment\":{s}}}", .{
+                req_id, t.enabled, t.l1_ttl_s, t.fanout_timeout_ms, t.max_concurrent_sources, self.cfg.precompute_ttl_s, t.adjustments_total, last,
+            });
+            self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+            try respondJson(req, .ok, body, req_id);
+            return;
+        }
+
+        if (method == .POST and std.mem.eql(u8, path, "/v1/admin/autotune/reset")) {
+            // Manual override (Roadmap 6.10): API-key auth, no usage
+            // accounting (kind null, the admin pattern). Restores the
+            // configured defaults and applies them to the live knobs.
+            if (!self.checkAuthAndRate(req, head, alloc, req_id, null)) return;
+            var changed: std.ArrayList(autotune.Adjustment) = .empty;
+            defer changed.deinit(alloc);
+            self.autotuner.reset(&changed, alloc) catch {
+                self.respondError(req, alloc, req_id, .internal_server_error, "reset_failed", "Failed to reset auto-tuning");
+                return;
+            };
+            for (changed.items) |a| {
+                switch (a.knob) {
+                    .l1_ttl_s => self.l1.ttl_s = a.new_value,
+                    .fanout_timeout_ms => self.fanout_timeout_ms = a.new_value,
+                    .max_concurrent_sources => {}, // worker-side; the next worker run picks up the default.
+                }
+            }
+            self.metrics.setAutotuneValues(self.autotuner.l1_ttl_s, self.autotuner.fanout_timeout_ms, self.autotuner.max_concurrent_sources);
+            logging.info("autotune reset to configured defaults", &.{.{ .key = "changed", .value = std.fmt.allocPrint(alloc, "{d}", .{changed.items.len}) catch "?" }});
+            var items: std.ArrayList(u8) = .empty;
+            defer items.deinit(alloc);
+            for (changed.items, 0..) |a, i| {
+                if (i > 0) try items.appendSlice(alloc, ",");
+                try items.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{{\"knob\":\"{s}\",\"old\":{d},\"new\":{d}}}", .{ @tagName(a.knob), a.old_value, a.new_value }));
+            }
+            const body = try std.fmt.allocPrint(alloc, "{{\"request_id\":\"{s}\",\"reset\":true,\"changed\":[{s}]}}", .{ req_id, items.items });
             self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
             try respondJson(req, .ok, body, req_id);
             return;
@@ -934,6 +1044,10 @@ pub const Server = struct {
         }
 
         if (method == .GET and std.mem.eql(u8, path, "/metrics")) {
+            // Refresh the point-in-time gauges (Roadmap 6.10/6.12):
+            // process RSS and the tuner's live knob values.
+            self.metrics.setProcessRss(self.processRssBytes());
+            self.metrics.setAutotuneValues(self.autotuner.l1_ttl_s, self.autotuner.fanout_timeout_ms, self.autotuner.max_concurrent_sources);
             const body = try self.metrics.render(alloc);
             self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
             try req.respond(body, .{
@@ -1339,6 +1453,7 @@ pub const Server = struct {
                 std.mem.eql(u8, path, "/v1/webhooks/facebook") or
                 std.mem.eql(u8, path, "/metrics") or std.mem.eql(u8, path, "/v1/query") or
                 std.mem.eql(u8, path, "/v1/usage") or
+                std.mem.eql(u8, path, "/v1/autotune") or std.mem.eql(u8, path, "/v1/admin/autotune/reset") or
                 std.mem.eql(u8, path, "/v1/ingest")))
         {
             self.respondError(req, alloc, req_id, .method_not_allowed, "method_not_allowed", "Method not allowed on this route");

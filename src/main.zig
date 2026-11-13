@@ -46,6 +46,7 @@ const l1cache = @import("api/l1cache.zig");
 const popular = @import("api/popular.zig");
 const cache = @import("api/cache.zig");
 const memindex = @import("engine/memindex.zig");
+const autotune = @import("engine/autotune.zig");
 const worker = @import("workers/worker.zig");
 const providers = @import("ai/providers.zig");
 
@@ -478,6 +479,8 @@ pub fn main(init: std.process.Init) !void {
         .popular = &pop,
         .usage_tracker = &usage_tracker,
         .audit_sink = &audit_sink,
+        .autotuner = autotune.Autotuner.init(cfg.autotune_enabled, cfg.l1_ttl_s, cfg.fanout_timeout_ms, cfg.max_concurrent_sources),
+        .fanout_timeout_ms = cfg.fanout_timeout_ms,
     };
     // Cache warming (Roadmap 6.4): run the most popular queries
     // through the pipeline and store the answers in L1/L2, so the

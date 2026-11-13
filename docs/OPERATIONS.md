@@ -91,7 +91,13 @@ backup instead.
 - `/v1/health` — up/down + document count + sources enabled.
 - `/metrics` — Prometheus text: request counts by class, latency
   total, query counts, cache hits/misses, ingest runs/errors,
-  documents indexed.
+  documents indexed, fan-out outcomes, auto-tuning adjustments +
+  live knob values, process RSS.
+- Auto-tuning (Roadmap 6.10): off by default (`PULSE_AUTOTUNE=1`
+  enables). It moves only safe knobs within bounds (L1 TTL,
+  fan-out timeout, worker concurrency) and logs every adjustment.
+  Check `GET /v1/autotune`; restore the configured defaults with
+  `POST /v1/admin/autotune/reset` (API key) or a restart.
 - Prometheus scrapes the API, postgres-exporter, redis-exporter and
   node-exporter every 15s; rules live in
   `docker/prometheus/alerts.yml` (API down, 5xx rate, slow responses,

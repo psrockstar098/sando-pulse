@@ -59,6 +59,7 @@ published**. The API container runs migrations on boot.
 | `PULSE_POPULAR_PATH` | `popular.json` | Where the popular list is persisted (Roadmap 6.4) |
 | `PULSE_POPULAR_SAVE_EVERY` | `100` | Persist the popular list every N records (Roadmap 6.4) |
 | `PULSE_POPULAR_WARM_N` | `10` | Top popular queries warmed into L1/L2 at boot (Roadmap 6.4) |
+| `PULSE_AUTOTUNE` | `0` (off) | `1` enables bounded auto-tuning of safe knobs (Roadmap 6.10) |
 
 ## API
 
@@ -69,6 +70,8 @@ published**. The API container runs migrations on boot.
 | GET | `/v1/trends` | no | Geez + geo trends; carries `computed_at` + `stale` (Roadmap 6.4) |
 | GET | `/v1/briefing` | no | Precomputed briefing; carries `cached` + `stale` (Roadmap 6.4) |
 | GET | `/v1/popular` | no | Most-asked queries with counts (Roadmap 6.4) |
+| GET | `/v1/autotune` | no | Auto-tuning state: enabled, live knob values, adjustments, last adjustment (Roadmap 6.10) |
+| POST | `/v1/admin/autotune/reset` | Bearer <redacted> | Restore the configured tuning defaults (Roadmap 6.10) |
 | GET | `/metrics` | no | Prometheus text metrics |
 | POST | `/v1/query` | Bearer key | `{"query": "..."}` → cited answer or insufficient-evidence |
 | POST | `/v1/ingest` | Bearer key | Manual document ingest `{"title","url","source_id","text"}` |

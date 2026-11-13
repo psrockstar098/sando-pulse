@@ -18,6 +18,7 @@ const redis = @import("../storage/redis.zig");
 const cache = @import("../api/cache.zig");
 const realtime = @import("realtime.zig");
 const precomputed = @import("../intelligence/precomputed.zig");
+const autotune = @import("../engine/autotune.zig");
 
 pub fn runOnce(
     alloc: std.mem.Allocator,
@@ -74,13 +75,57 @@ pub fn runLoop(
             consumer = null;
         };
     }
+    // Bounded auto-tuning (Roadmap 6.10): the worker owns the
+    // max-concurrent-sources knob. One adjustment per 10 runs at
+    // most; every adjustment is logged. Disabled by default
+    // (PULSE_AUTOTUNE=1 enables it).
+    var tuner = autotune.Autotuner.init(cfg.autotune_enabled, cfg.l1_ttl_s, cfg.fanout_timeout_ms, cfg.max_concurrent_sources);
+    var max_concurrent = cfg.max_concurrent_sources;
     while (true) {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
-        _ = runOnce(arena.allocator(), io, repo, sink, archiver, m, environ, embedder, ks, cfg.ingest_interval_s, cfg.max_concurrent_sources, fb) catch |e| {
+        const maybe_report = runOnce(arena.allocator(), io, repo, sink, archiver, m, environ, embedder, ks, cfg.ingest_interval_s, max_concurrent, fb) catch |e| blk: {
             logging.err("ingest run failed", &.{.{ .key = "error", .value = @errorName(e) }});
             m.observeIngestRun(true);
+            // A failed run still feeds the tuner: it counts as an
+            // error signal (shed concurrency when sources struggle).
+            if (tuner.maybeTuneWorker(.{ .run_errors = 1, .run_mean_duration_ms = 0 })) |adj| {
+                max_concurrent = @intCast(adj.new_value);
+                logging.info("autotune adjustment", &.{
+                    .{ .key = "knob", .value = "max_concurrent_sources" },
+                    .{ .key = "old", .value = std.fmt.allocPrint(arena.allocator(), "{d}", .{adj.old_value}) catch "?" },
+                    .{ .key = "new", .value = std.fmt.allocPrint(arena.allocator(), "{d}", .{adj.new_value}) catch "?" },
+                    .{ .key = "reason", .value = adj.reason },
+                });
+            }
+            break :blk null;
         };
+        if (maybe_report) |report| {
+            // Tune from the run report: errors shed concurrency, slow
+            // but clean fetches add it. Signals are computed from the
+            // per-source reports (skipped sources excluded).
+            var err_count: usize = 0;
+            var dur_total: i64 = 0;
+            var dur_n: usize = 0;
+            for (report.sources) |s| {
+                if (s.skipped) continue;
+                err_count += s.errors;
+                dur_total += s.duration_ms;
+                dur_n += 1;
+            }
+            if (tuner.maybeTuneWorker(.{
+                .run_errors = err_count,
+                .run_mean_duration_ms = if (dur_n > 0) @divTrunc(dur_total, @as(i64, @intCast(dur_n))) else 0,
+            })) |adj| {
+                max_concurrent = @intCast(adj.new_value);
+                logging.info("autotune adjustment", &.{
+                    .{ .key = "knob", .value = "max_concurrent_sources" },
+                    .{ .key = "old", .value = std.fmt.allocPrint(arena.allocator(), "{d}", .{adj.old_value}) catch "?" },
+                    .{ .key = "new", .value = std.fmt.allocPrint(arena.allocator(), "{d}", .{adj.new_value}) catch "?" },
+                    .{ .key = "reason", .value = adj.reason },
+                });
+            }
+        }
         // Real-time processing (Roadmap 4.3): drain new stream entries,
         // then reclaim unacked ones (recovery). A Redis outage here is
         // logged and retried next iteration — never fatal.

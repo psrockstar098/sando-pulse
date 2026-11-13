@@ -35,6 +35,39 @@ pub const Metrics = struct {
     ingest_runs_total: u64 = 0,
     ingest_errors_total: u64 = 0,
     documents_indexed_total: u64 = 0,
+    /// Enrichment fan-out outcomes (Roadmap 6.6/6.10): how often the
+    /// knowledge tasks finished before the deadline.
+    fanout_total: u64 = 0,
+    fanout_incomplete_total: u64 = 0,
+    /// Auto-tuning (Roadmap 6.10): adjustments applied + the live
+    /// knob values the tuner currently holds.
+    autotune_adjustments_total: u64 = 0,
+    autotune_l1_ttl_s: u64 = 0,
+    autotune_fanout_timeout_ms: u64 = 0,
+    autotune_max_concurrent_sources: u64 = 0,
+    /// Process resident set size in bytes (Roadmap 6.10/6.12): set
+    /// by the server from /proc/self/statm before rendering; 0 when
+    /// the platform cannot report it.
+    process_rss_bytes: u64 = 0,
+
+    pub fn observeFanout(self: *Metrics, complete: bool) void {
+        self.fanout_total += 1;
+        if (!complete) self.fanout_incomplete_total += 1;
+    }
+
+    pub fn observeAutotune(self: *Metrics) void {
+        self.autotune_adjustments_total += 1;
+    }
+
+    pub fn setAutotuneValues(self: *Metrics, l1_ttl_s: u64, fanout_timeout_ms: u64, max_concurrent_sources: usize) void {
+        self.autotune_l1_ttl_s = l1_ttl_s;
+        self.autotune_fanout_timeout_ms = fanout_timeout_ms;
+        self.autotune_max_concurrent_sources = @intCast(max_concurrent_sources);
+    }
+
+    pub fn setProcessRss(self: *Metrics, bytes: u64) void {
+        self.process_rss_bytes = bytes;
+    }
 
     pub fn observeRequest(self: *Metrics, status: u16, duration_ms: u64) void {
         self.requests_total += 1;
@@ -114,7 +147,7 @@ pub const Metrics = struct {
     }
 
     pub fn render(self: *const Metrics, alloc: std.mem.Allocator) ![]u8 {
-        return std.fmt.allocPrint(alloc,
+        const base = try std.fmt.allocPrint(alloc,
             \\# HELP pulse_http_requests_total Total HTTP requests handled
             \\# TYPE pulse_http_requests_total counter
             \\pulse_http_requests_total {d}
@@ -222,6 +255,43 @@ pub const Metrics = struct {
             self.ingest_errors_total,
             self.documents_indexed_total,
         });
+        // Second format call (Roadmap 6.10): std.fmt caps one call at
+        // 32 arguments, and the base block already uses 27.
+        const extra = try std.fmt.allocPrint(alloc,
+            \\# HELP pulse_fanout_total Enrichment fan-outs run
+            \\# TYPE pulse_fanout_total counter
+            \\pulse_fanout_total {d}
+            \\# HELP pulse_fanout_incomplete_total Fan-outs with a task still running at the deadline
+            \\# TYPE pulse_fanout_incomplete_total counter
+            \\pulse_fanout_incomplete_total {d}
+            \\# HELP pulse_autotune_adjustments_total Auto-tuning adjustments applied
+            \\# TYPE pulse_autotune_adjustments_total counter
+            \\pulse_autotune_adjustments_total {d}
+            \\# HELP pulse_autotune_l1_ttl_seconds L1 TTL currently held by the tuner
+            \\# TYPE pulse_autotune_l1_ttl_seconds gauge
+            \\pulse_autotune_l1_ttl_seconds {d}
+            \\# HELP pulse_autotune_fanout_timeout_ms Fan-out deadline currently held by the tuner
+            \\# TYPE pulse_autotune_fanout_timeout_ms gauge
+            \\pulse_autotune_fanout_timeout_ms {d}
+            \\# HELP pulse_autotune_max_concurrent_sources Max concurrent sources currently held by the tuner
+            \\# TYPE pulse_autotune_max_concurrent_sources gauge
+            \\pulse_autotune_max_concurrent_sources {d}
+            \\# HELP pulse_process_rss_bytes Process resident set size in bytes (0 when unreported)
+            \\# TYPE pulse_process_rss_bytes gauge
+            \\pulse_process_rss_bytes {d}
+            \\
+        , .{
+            self.fanout_total,
+            self.fanout_incomplete_total,
+            self.autotune_adjustments_total,
+            self.autotune_l1_ttl_s,
+            self.autotune_fanout_timeout_ms,
+            self.autotune_max_concurrent_sources,
+            self.process_rss_bytes,
+        });
+        defer alloc.free(extra);
+        defer alloc.free(base);
+        return std.mem.concat(alloc, u8, &.{ base, extra });
     }
 };
 
