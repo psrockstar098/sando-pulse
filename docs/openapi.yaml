@@ -327,7 +327,7 @@ paths:
               $ref: "#/components/schemas/QueryRequest"
       responses:
         "200":
-          description: Answer (possibly an honest refusal: `sufficient: false`).
+          description: "Answer (possibly an honest refusal: sufficient is false)."
           content:
             application/json:
               schema:
@@ -442,7 +442,7 @@ paths:
               schema:
                 type: object
         "400":
-          description: `window` was not 24h, 7d or 30d.
+          description: "`window` was not 24h, 7d or 30d."
           content:
             application/json:
               schema:
