@@ -44,6 +44,7 @@ const metrics = @import("api/metrics.zig");
 const server = @import("api/server.zig");
 const l1cache = @import("api/l1cache.zig");
 const popular = @import("api/popular.zig");
+const social = @import("intelligence/social.zig");
 const cache = @import("api/cache.zig");
 const memindex = @import("engine/memindex.zig");
 const autotune = @import("engine/autotune.zig");
@@ -574,6 +575,12 @@ pub fn main(init: std.process.Init) !void {
         });
     }
 
+    // Social registry (Roadmap 7.7, GATED): fed only by authorized
+    // connector collection jobs. Empty until a social connector is
+    // authorized — the endpoints report that honestly.
+    var social_registry = social.SocialRegistry.init(alloc);
+    defer social_registry.deinit();
+
     var srv = server.Server{
         .alloc = alloc,
         .io = io,
@@ -585,6 +592,8 @@ pub fn main(init: std.process.Init) !void {
         .sink = sink,
         .embedder = embedder,
         .knowledge = ks,
+        .social = &social_registry,
+        .environ = init.environ_map,
         .facebook = &fb_connector,
         .redis = redis_client,
         .l1 = &l1,

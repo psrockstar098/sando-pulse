@@ -18,7 +18,7 @@
 //! Graph API URLs. Without a token it reports unavailable).
 //! Stubs (interface + unavailable reason, no client code): Google
 //! (approved Custom Search API), YouTube (Data API key), Reddit
-//! (approved API client).
+//! (approved API client), X (approved API client).
 
 const std = @import("std");
 const fetchers = @import("fetchers.zig");
@@ -35,6 +35,10 @@ pub const Kind = enum {
     google,
     youtube,
     reddit,
+    /// X (Twitter): stub only (Roadmap 7.7). Authorized-API access
+    /// only; no credentials exist. Posts are only ever fetched
+    /// through the approved API, never scraped.
+    x,
 };
 
 pub const Availability = union(enum) {
@@ -349,6 +353,11 @@ var reddit_state = StubConnector{
     .name = "Reddit",
     .reason = "not implemented: needs an approved Reddit API client (REDDIT_CLIENT_ID + REDDIT_CLIENT_SECRET); discussions are only ever fetched through the approved API",
 };
+var x_state = StubConnector{
+    .kind = .x,
+    .name = "X",
+    .reason = "not implemented: needs an approved X API client (X_API_KEY + X_API_SECRET, or a bearer token); posts are only ever fetched through the approved API, never scraped",
+};
 
 pub fn rssConnector() Connector {
     return rss_state.connector();
@@ -382,8 +391,12 @@ pub fn redditConnector() Connector {
     return reddit_state.connector();
 }
 
-/// All eight connectors in spec order, for status reporting.
-pub fn allConnectors() [8]Connector {
+pub fn xConnector() Connector {
+    return x_state.connector();
+}
+
+/// All nine connectors in spec order, for status reporting.
+pub fn allConnectors() [9]Connector {
     return .{
         rssConnector(),
         websiteConnector(),
@@ -393,6 +406,7 @@ pub fn allConnectors() [8]Connector {
         googleConnector(),
         youtubeConnector(),
         redditConnector(),
+        xConnector(),
     };
 }
 
@@ -400,7 +414,7 @@ test "rss connector is available; stubs are unavailable with reasons" {
     const alloc = std.testing.allocator;
     const c = rssConnector();
     try std.testing.expect(c.check(alloc, null) == .available);
-    for ([_]Connector{ facebookConnector(), googleConnector(), youtubeConnector(), redditConnector() }) |s| {
+    for ([_]Connector{ facebookConnector(), googleConnector(), youtubeConnector(), redditConnector(), xConnector() }) |s| {
         const av = s.check(alloc, null);
         try std.testing.expect(av == .unavailable);
         try std.testing.expect(av.unavailable.len > 20);

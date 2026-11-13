@@ -493,6 +493,61 @@ const trending = @import("../intelligence/trending.zig");
 const forecast_mod = @import("../intelligence/forecast.zig");
 const statanswer = @import("../intelligence/statanswer.zig");
 const alerts_mod = @import("../intelligence/alerts.zig");
+const social_mod = @import("../intelligence/social.zig");
+const connectors = @import("../ingestion/connectors.zig");
+
+/// GET /v1/social — social ingestion status (Roadmap 7.7, GATED).
+/// Reports the registry honestly: post counts by platform and top
+/// hashtags from real authorized posts only, plus every social
+/// connector's availability with its reason. With zero social data
+/// connected — the state today — `social_available` is false,
+/// the lists are empty, and the note says why. No counts are ever
+/// synthesized, and no post text is returned here (the registry is
+/// a trend feed, not a post mirror).
+pub fn buildSocialResponse(
+    alloc: std.mem.Allocator,
+    req_id: []const u8,
+    registry: *const social_mod.SocialRegistry,
+    all: []const connectors.Connector,
+    environ: ?*const std.process.Environ.Map,
+) ![]u8 {
+    var conn_list: std.ArrayList(struct {
+        kind: []const u8,
+        name: []const u8,
+        available: bool,
+        reason: ?[]const u8,
+    }) = .empty;
+    for (all) |c| {
+        // Only the social connectors belong here: Facebook, X,
+        // Reddit, YouTube. RSS/news/government/OSM are not social.
+        const k = c.kind;
+        if (k != .facebook and k != .x and k != .reddit and k != .youtube) continue;
+        const av = c.check(alloc, environ);
+        try conn_list.append(alloc, .{
+            .kind = @tagName(k),
+            .name = c.name,
+            .available = av == .available,
+            .reason = if (av == .unavailable) av.unavailable else null,
+        });
+    }
+    var platform_list: std.ArrayList(struct {
+        platform: []const u8,
+        count: usize,
+    }) = .empty;
+    for ([_][]const u8{ "facebook", "x", "reddit", "youtube" }) |p| {
+        try platform_list.append(alloc, .{ .platform = p, .count = registry.countByPlatform(p) });
+    }
+    const tags = try registry.topHashtags(alloc, 10);
+    return stringifyAlloc(alloc, .{
+        .social_available = registry.count() > 0,
+        .post_count = registry.count(),
+        .posts_by_platform = platform_list.items,
+        .top_hashtags = tags,
+        .connectors = conn_list.items,
+        .note = "No authorized social data is connected — the social section is empty by design. Authorize a social connector (Facebook Page, X, Reddit) to fill it; nothing here is scraped or invented.",
+        .request_id = req_id,
+    });
+}
 
 /// GET /v1/alerts — breaking alerts (Roadmap 7.3): merged
 /// incidents from the knowledge store's breaking events, kinds
@@ -617,6 +672,7 @@ pub fn buildTrendsResponse(
     geo: []const trending.GeoTrend,
     snapshots: []const trending.MonthSnapshot,
     forecasts: []const forecast_mod.Forecast,
+    social_trends: []const trending.TopicTrend,
 ) ![]u8 {
     var trend_list: std.ArrayList(struct {
         topic: []const u8,
@@ -675,11 +731,34 @@ pub fn buildTrendsResponse(
             .same_month_last_year = f.same_month_last_year,
         });
     }
+    var social_list: std.ArrayList(struct {
+        topic: []const u8,
+        category: []const u8,
+        recent_count: usize,
+        prior_count: usize,
+        velocity: f64,
+        score: f64,
+    }) = .empty;
+    for (social_trends) |t| {
+        try social_list.append(alloc, .{
+            .topic = t.topic,
+            .category = t.category,
+            .recent_count = t.recent_count,
+            .prior_count = t.prior_count,
+            .velocity = t.velocity,
+            .score = t.score,
+        });
+    }
     return stringifyAlloc(alloc, .{
         .trends = trend_list.items,
         .geo = geo_list.items,
         .snapshots = snap_list.items,
         .forecast = fc_list.items,
+        // Social lane (Roadmap 7.7): hashtag trends from authorized
+        // social posts only, category "social". Empty until a social
+        // connector is authorized and feeds the registry — never
+        // synthesized.
+        .social = social_list.items,
         // Trends are computed live from a store scan on every request,
         // so they are never stale — the fields exist so callers can
         // treat every precomputed payload the same way (Roadmap 6.4).
@@ -806,6 +885,33 @@ test "buildEventDetailResponse carries contradiction flags (Roadmap 7.5)" {
     };
     const out2 = try buildEventDetailResponse(alloc, "req-test", event, &agree, 172800);
     try std.testing.expect(std.mem.indexOf(u8, out2, "\"contradictions\":[]") != null);
+}
+
+test "buildSocialResponse is honestly empty until real data arrives (Roadmap 7.7)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var reg = social_mod.SocialRegistry.init(alloc);
+    defer reg.deinit();
+    const all = connectors.allConnectors();
+    const out = try buildSocialResponse(alloc, "req-test", &reg, &all, null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"social_available\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"post_count\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"top_hashtags\":[]") != null);
+    // Every social connector is listed as unavailable with its
+    // reason — Facebook (no token), X (no API client), Reddit and
+    // YouTube (no keys). No connector is faked as available.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"kind\":\"facebook\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"kind\":\"x\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "PULSE_FACEBOOK_ACCESS_TOKEN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "X_API_KEY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "scraped or invented") != null);
+    // One real post lights it up with real counts only.
+    try reg.ingest(.{ .id = "1", .platform = "facebook", .author = "A", .text = "Tonight #Geez", .posted_at = 1000, .url = "" });
+    const out2 = try buildSocialResponse(alloc, "req-test", &reg, &all, null);
+    try std.testing.expect(std.mem.indexOf(u8, out2, "\"social_available\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out2, "\"post_count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out2, "\"tag\":\"geez\"") != null);
 }
 
 test "buildQueryResponse carries path, latency_ms and routing_reason" {

@@ -7,6 +7,7 @@
 //!   GET  /v1/trends   public — Geez + trending engine (Roadmap 4.2)
 //!   GET  /v1/forecast public — predictive trends (Roadmap 7.1)
 //!   GET  /v1/alerts   public — breaking alerts (Roadmap 7.3)
+//!   GET  /v1/social   public — social ingestion status (Roadmap 7.7)
 //!   GET  /v1/briefing public — precomputed intelligence (Roadmap 4.4)
 //!   GET  /v1/quality  public — reliability, confidence, flags (Roadmap 4.6)
 //!   GET  /v1/locations public — reference places (Roadmap 3.6)
@@ -41,6 +42,8 @@ const trending = @import("../intelligence/trending.zig");
 const forecast_mod = @import("../intelligence/forecast.zig");
 const statanswer = @import("../intelligence/statanswer.zig");
 const alerts_mod = @import("../intelligence/alerts.zig");
+const social_mod = @import("../intelligence/social.zig");
+const connectors_mod = @import("../ingestion/connectors.zig");
 const precomputed = @import("../intelligence/precomputed.zig");
 const quality = @import("../intelligence/quality.zig");
 const redis = @import("../storage/redis.zig");
@@ -137,6 +140,14 @@ pub const Server = struct {
     /// Knowledge store for events/locations/statistics (Roadmap 3.4).
     /// Always present (memory or Postgres, matching the repo).
     knowledge: ?knowledge.KnowledgeStore = null,
+    /// Social registry (Roadmap 7.7, GATED): authorized social
+    /// posts only, fed by connector collection jobs. Always
+    /// present; empty until a social connector is authorized.
+    social: *social_mod.SocialRegistry,
+    /// Process environment map, for connector availability checks
+    /// (tokens live in env vars). Null in tests — connectors then
+    /// report unavailable with their reasons.
+    environ: ?*const std.process.Environ.Map = null,
     /// Facebook connector (Roadmap 3.2): status route + webhook
     /// receiver. Always present; it reports unavailable until a
     /// token + registry are configured.
@@ -1144,7 +1155,11 @@ pub const Server = struct {
                 const aggs = k.listMonthlyAggregates(alloc, 200) catch &.{};
                 top_forecasts = forecast_mod.forecastAll(alloc, aggs, 3) catch &.{};
             }
-            const body = try query_json.buildTrendsResponse(alloc, req_id, now, all_trends, geo_trends, snapshots.items, top_forecasts);
+            // Social lane (Roadmap 7.7): hashtag trends from
+            // authorized social posts only, category "social".
+            // Empty until a social connector feeds the registry.
+            const social_trends = self.social.socialTrends(alloc, now, window_s) catch &.{};
+            const body = try query_json.buildTrendsResponse(alloc, req_id, now, all_trends, geo_trends, snapshots.items, top_forecasts, social_trends);
             self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
             try respondJson(req, .ok, body, req_id);
             return;
@@ -1262,6 +1277,19 @@ pub const Server = struct {
                 alerts_list = alerts_mod.computeBreakingAlerts(alloc, k, now) catch &.{};
             }
             const body = try query_json.buildAlertsResponse(alloc, req_id, now, alerts_list, self.redis != null);
+            self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+            try respondJson(req, .ok, body, req_id);
+            return;
+        }
+
+        if (method == .GET and std.mem.eql(u8, path, "/v1/social")) {
+            // Social ingestion status (Roadmap 7.7, GATED): the
+            // registry plus every social connector's availability
+            // with its reason. Honestly empty today — no social
+            // connector is authorized, so no posts exist and no
+            // counts are synthesized.
+            const all = connectors_mod.allConnectors();
+            const body = try query_json.buildSocialResponse(alloc, req_id, self.social, &all, self.environ);
             self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
             try respondJson(req, .ok, body, req_id);
             return;
@@ -1885,6 +1913,7 @@ pub const Server = struct {
             (std.mem.eql(u8, path, "/v1/health") or std.mem.eql(u8, path, "/v1/sources") or
                 std.mem.eql(u8, path, "/v1/events") or std.mem.eql(u8, path, "/v1/trends") or
                 std.mem.eql(u8, path, "/v1/forecast") or std.mem.eql(u8, path, "/v1/alerts") or
+                std.mem.eql(u8, path, "/v1/social") or
                 std.mem.eql(u8, path, "/v1/briefing") or
                 std.mem.eql(u8, path, "/v1/locations") or
                 std.mem.eql(u8, path, "/v1/statistics") or

@@ -77,6 +77,7 @@ pub const intelligence_forecast = @import("intelligence/forecast.zig");
 pub const intelligence_statanswer = @import("intelligence/statanswer.zig");
 pub const intelligence_alerts = @import("intelligence/alerts.zig");
 pub const intelligence_precomputed = @import("intelligence/precomputed.zig");
+pub const intelligence_social = @import("intelligence/social.zig");
 pub const intelligence_quality = @import("intelligence/quality.zig");
 pub const cli_loadtest = @import("cli/loadtest.zig");
 pub const cli_audit = @import("cli/audit.zig");
