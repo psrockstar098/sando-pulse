@@ -1,0 +1,55 @@
+# Sando Pulse — build the all-in-one Docker image and push it to Docker Hub.
+# Triggers on pushes to main that touch the server, migrations, or image
+# files, and manually via workflow_dispatch. Every push of the image
+# publishes both the version tag and `latest`.
+# NOTE: this file must be added through the GitHub web UI. The gh CLI
+# token lacks the `workflow` scope and cannot create workflow files.
+# Needs repo secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN (a Docker Hub
+# personal access token with Read, Write, Delete).
+name: docker-publish
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'migrations/**'
+      - 'build.zig'
+      - 'build.zig.zon'
+      - 'docker/**'
+      - '.github/workflows/docker-publish.yml'
+  workflow_dispatch:
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Zig 0.17.1
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Install libzstd-dev
+        run: sudo apt-get update && sudo apt-get install -y libzstd-dev
+      - name: Build
+        run: zig build
+      - name: Test
+        run: zig build test --summary all
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Build the all-in-one image
+        env:
+          ZIG: zig
+          TAG: ${{ secrets.DOCKERHUB_USERNAME }}/sando-pulse:all-in-one-0.1.0
+          ZIG_GLOBAL_CACHE_DIR: /tmp/pulse-zig-cache
+        run: bash docker/all-in-one/build.sh
+      - name: Tag latest and push
+        run: |
+          docker tag ${{ secrets.DOCKERHUB_USERNAME }}/sando-pulse:all-in-one-0.1.0 ${{ secrets.DOCKERHUB_USERNAME }}/sando-pulse:latest
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/sando-pulse:all-in-one-0.1.0
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/sando-pulse:latest
+      - name: Verify the published image
+        run: docker buildx imagetools inspect ${{ secrets.DOCKERHUB_USERNAME }}/sando-pulse:all-in-one-0.1.0
