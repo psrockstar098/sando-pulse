@@ -34,6 +34,12 @@ pub const SearchOptions = struct {
     /// second pass still runs when fewer than 3 candidates survive,
     /// so an index miss degrades to the store search, never to nothing.
     candidates: ?[]types.Document = null,
+    /// How many ranked results the outcome keeps (Roadmap 6.12):
+    /// the API's options.limit. Default 10. Was a hardcoded 10,
+    /// which made options.limit a no-op — the limit was validated
+    /// and hashed into the cache key but never changed the result
+    /// count.
+    limit: usize = 10,
 };
 
 pub const RankedDoc = struct {
@@ -370,7 +376,7 @@ pub fn searchAndRank(
             }
         }
     }
-    const top_n = @min(items.len, 10);
+    const top_n = @min(items.len, opts.limit);
     const top = items[0..top_n];
 
     if (top.len == 0) {
@@ -413,7 +419,10 @@ pub fn searchAndRank(
 
     return .{
         .answer = answer,
-        .results = try ranked.toOwnedSlice(alloc),
+        // The outcome carries only the top `limit` ranked docs (Roadmap
+        // 6.12) — the response renders exactly these, and the answer /
+        // events / timeline above are computed from the same set.
+        .results = top,
         .confidence = conf,
         .sufficient = true,
         .insufficient_reason = null,
@@ -667,4 +676,42 @@ test "searchAndRank single-term typo recovers via fuzzy pass" {
     try std.testing.expectEqual(@as(usize, 2), out.results.len);
     try std.testing.expect(out.results[0].fuzzy_score != null);
     try std.testing.expect(out.results[0].fuzzy_score.? >= 0.5);
+}
+
+test "searchAndRank honours options.limit" {
+    // Regression test (Roadmap 6.12): the outcome always carried the
+    // top 10 ranked docs regardless of options.limit.
+    const memory = @import("../storage/memory.zig");
+    const now: i64 = 1_800_000_000;
+    var store = memory.MemoryStore.init(std.testing.allocator);
+    defer store.deinit();
+    const repo = store.asRepository();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        const id = try std.fmt.allocPrint(alloc, "d{d}", .{i});
+        const title = try std.fmt.allocPrint(alloc, "Fuel shortage hits Monrovia {d}", .{i});
+        const text = try std.fmt.allocPrint(alloc, "Fuel stations in Monrovia report long queues as the fuel shortage continues across the city. Report {d}.", .{i});
+        try repo.insertDocument(.{
+            .id = id,
+            .source_id = "new-dawn",
+            .source_name = "New Dawn",
+            .source_url = "https://thenewdawnliberia.com/",
+            .title = title,
+            .url = "https://example.com/x",
+            .text = text,
+            .published_at = now - 3600,
+            .fetched_at = now,
+            .reliability = 0.70,
+            .topics = &.{"energy"},
+            .content_hash = id,
+        });
+    }
+    const p = try planner.plan(alloc, "fuel shortage in Monrovia", &.{"new-dawn"}, now, 0);
+    const limited = try searchAndRank(alloc, repo, p, now, .{ .limit = 2 });
+    try std.testing.expectEqual(@as(usize, 2), limited.results.len);
+    const full = try searchAndRank(alloc, repo, p, now, .{});
+    try std.testing.expectEqual(@as(usize, 5), full.results.len);
 }

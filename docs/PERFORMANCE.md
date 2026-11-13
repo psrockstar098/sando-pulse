@@ -187,5 +187,181 @@ for a fast-path query).
 
 ## Benchmarks (Roadmap 6.12)
 
-To be filled in by 6.12: extended loadtest scenarios, measured
-p50/p95/p99/p99.9 per path, RSS before/after, CPU per query.
+All runs are `pulse loadtest` against a live server on this VM
+(Postgres + Redis, API key on), threads=1 unless noted, 250
+requests per scenario unless noted. The store held 3–5 documents
+unless a scenario says 10,005. Latency is client-measured (it
+includes the ~42 ms per-request floor documented in the
+optimization scope — the server's own `latency_ms` is lower).
+
+### Latency by path (3–5 documents)
+
+| Scenario | query p50 | p95 | p99 | p99.9 | CPU / 1k queries | RSS delta |
+|---|---|---|---|---|---|---|
+| fast, distinct (uncached) | 126.9 ms | 129.4 ms | 133.8 ms | 186.2 ms | 9120 ms | +41.4 MiB pre-fix, +1.0 MiB post-fix |
+| instant, same query (cached) | 42.7 ms | 43.9 ms | 44.7 ms | 128.7 ms | 1480 ms | +0.1 MiB post-fix |
+| deep, distinct (research intent) | 127.1 ms | 129.3 ms | 132.3 ms | 138.4 ms | 9920 ms | +1.1 MiB |
+| health | 42.1 ms | 43.1 ms | 44.7 ms | 46.0 ms | — | — |
+
+Deep ≈ fast at this scale: the deep path's extra work (whole
+candidate set + fuzzy second pass) is trivial over 5 documents.
+The deep query used was "research the causes of fuel shortages,
+deep dive analysis" (routing `intent_deep`); a "compare fuel
+prices in Monrovia and Buchanan" query routes **fast**, not deep,
+because the two place names outscore the compare intent in the
+classifier (local +3 vs compare +1) — classifier behaviour, not
+a router bug.
+
+### Latency by path (10,005 documents)
+
+| Scenario | query p50 | p95 | p99 | p99.9 | CPU / 1k queries | RSS delta |
+|---|---|---|---|---|---|---|
+| fast, distinct | 189.1 ms | 218.2 ms | 239.1 ms | 287.9 ms | 56,840 ms | +2.6 MiB |
+| instant, same query | 42.8 ms | 45.9 ms | 57.8 ms | 191.9 ms | 2000 ms | −0.3 MiB |
+| deep, distinct | 151.7 ms | 202.1 ms | 257.2 ms | 262.6 ms | 9520 ms | −0.1 MiB |
+| fast, limit=20, distinct | 186.3 ms | 198.5 ms | 260.9 ms | 260.9 ms | 56,700 ms | +2.5 MiB |
+
+At 10k docs the fast path costs 7× the CPU of the 5-doc store
+(56,840 vs 9120 ms/1k) — the Postgres search + ranking over
+10k rows dominates. The deep path is *cheaper* than fast here
+(9520 ms/1k): it shortlists from the in-memory index first and
+only falls back to the store search when thin, while fast always
+runs the Postgres search. Instant is unchanged by store size
+(cache hits never touch the store). Limit 10 vs 20 costs the
+same — the search already fetches 100 candidates and ranks them;
+rendering 20 vs 10 results is trivial.
+
+### Scale
+
+- Index build (`pulse reindex`, 10,005 docs): **docs_added
+  10,005 of 10,005**, 10,035 terms, wall time ~89 s (the
+  in-app `duration_ms` reports 0 — a pre-existing reporting bug:
+  both timestamps are captured before the build; the real time
+  is measured externally). Boot build over the same store: ~90 s
+  before the server listens.
+- Idle RSS: 12.9 MiB (5 docs) → **45.2 MiB (10,005 docs)** — the
+  10k-doc memindex costs ~32 MiB.
+- The 1M / 10M+ indexed-record milestones are **not tested**:
+  10k is what this VM ran; 1M would take ~2.5 hours to index at
+  the measured 89 s / 10k rate and needs a real host. Not a
+  capacity claim.
+- The build exposed a real bug (fixed in this section, below):
+  the index silently capped at the oldest 1,000 documents.
+
+### Concurrency
+
+| Threads | requests | ok | errors | query p50 | throughput |
+|---|---|---|---|---|---|
+| 1 | 250 | 250 | 0 | 42.8 ms (instant) / 126.9 ms (fast) | 11.8–23.5 calls/s |
+| 4 | 250 | 1000 | 0 | 167.9 ms | 23.8 calls/s |
+| 50 | 20 | 1000 | 0 | 2095.2 ms | 23.9 calls/s |
+
+0 errors at 50-way concurrency — the server is correct under
+load — but throughput caps at ~24 calls/s and latency scales
+linearly with concurrency (50 × the 42 ms floor): the
+single-threaded accept loop serialises everything. The 1K and
+10K concurrency milestones are **not reached here** (at 1K
+threads the queue would be ~42 s per request, past the
+loadtest's 10 s timeout) — they need a real host *and* the
+threaded accept loop recorded as the head-of-line gap.
+
+### Simultaneous ingest + search
+
+10 ingests (201, ~337 ms each) during a 250-request instant
+loadtest: 250/250 ok, 0 errors, query p50 unchanged (42.8 ms),
+but **p99 44.7 → 351.8 ms** — each ingest blocks the
+single-threaded accept loop for ~337 ms, so queries queueing
+behind one wait. Same head-of-line cause as the concurrency
+numbers.
+
+### Interruptions
+
+- **Redis killed mid-run (6.11 smoke):** queries keep serving
+  200 compute-fresh; breaker trips (state 2, trips 1, skipped
+  5); after restart + cooldown the trial reconnects, the
+  breaker closes (state 0), and a fresh-L1 server serves the
+  same query as `instant l2_hit`.
+- **Postgres killed mid-run:** queries fail fast with HTTP 500
+  `search_failed` in ~60 ms (no hang). 67 of 250 queries failed
+  during the ~11 s outage; after `service postgresql start`
+  the server recovers **without a restart** (health ok,
+  subsequent queries succeed). A repeat query would have been
+  served from L1/L2 despite the outage — the distinct-query
+  scenario is the worst case.
+
+### Freshness
+
+Ingest → searchable via `/v1/query`: **<1 s** (the doc was
+found on the first query after the 201). The store search is
+the fallback, so freshness does not wait for the memindex —
+but the memindex itself only picks the doc up at the next
+epoch-triggered rebuild (reindex interval, 3600 s default).
+Freshness objectives from the spec (breaking news 5–30 s,
+trends 15–60 s, local events 1–5 min) are targets: the
+ingest→searchable path meets the breaking-news bound; the
+memindex lag (up to 1 h) is the honest gap for index-backed
+queries, and the worker cadence that feeds ingest is
+configurable per source (not measured end-to-end here — no
+live source was connected during the benchmarks).
+
+### Cache hit ratio, DB connections
+
+- A mixed run (250 instant + 250 distinct + 100 limit=20):
+  L1 hits dominate the repeated queries (instant path);
+  distinct queries are L1+L2 misses by construction. The
+  ratio is scenario-defined, not a single number — the
+  `/metrics` counters (`pulse_l1_cache_hits_total`,
+  `pulse_queries_cache_hits_total` and their misses) are the
+  source of truth per run.
+- Postgres connections during a run: **~3 server connections**
+  (pool size 1 by default — `PULSE_PG_POOL_SIZE` — plus the
+  audit sink's client). The pool is the single query
+  connection; the server is effectively single-connection for
+  queries, matching the single-threaded loop.
+
+### Bugs found by the benchmarks (fixed here)
+
+1. **Memindex capped at the oldest 1,000 documents (6.5 bug).**
+   `scanDocuments(before_ts)` is an *upper* bound (`fetched_at
+   < cut`, ASC), but `buildFromRepo` paginated as if it were a
+   lower bound (`before_ts = newest + 1`) — it re-read the same
+   oldest 1,000 docs and stopped. The 10k scale test caught it:
+   `reindex` reported `docs_added=1000`. Fix: the scan now
+   returns newest-first with an *inclusive* bound, and the
+   build walks backward from the newest (boundary second
+   re-scanned, deduped by the seen-set). Verified: `reindex`
+   over 10,005 docs reports `docs_added=10005`, and a new
+   regression test builds 2,500 docs in a memory store and
+   asserts all are indexed. Side effects of the DESC order,
+   all audited: trends now scans the newest 5,000 (more correct
+   for a recent window); retention archives/deletes the newest
+   1,000 under the cutoff per pass (the pair stays consistent
+   and converges); duplicates/aggregates sample the newest
+   `limit` docs instead of the oldest. Known edge: if more
+   than one batch (1,000) of documents share one `fetched_at`
+   second, a full batch of already-seen docs can end the walk
+   early and the rest of that second is skipped — a
+   (timestamp, id) cursor would close it; recorded, not fixed
+   here.
+2. **`options.limit` was a no-op (pre-existing API bug).**
+   The limit was validated (1..20) and hashed into the cache
+   key, but `computeQuery` never passed it to the search — the
+   response always rendered 10 results (`top_n` and `shown`
+   were both hardcoded 10). Fix: the limit threads from
+   `qr.limit` through `computeQuery` → `SearchOptions.limit`
+   → `top_n` → `buildQueryResponse(limit)`, and
+   `outcome.results` now carries only the top-N docs. Verified
+   live: limit=20 returns 20 results, limit=5 returns 5, and
+   the two are distinct cache keys. Two new tests
+   (`searchAndRank honours options.limit`,
+   `buildQueryResponse renders exactly options.limit results`).
+   Found alongside it: the loadtest sent a top-level
+   `"limit"` field, which the parser ignores (the API reads
+   `options.limit`) — the loadtest now sends the documented
+   shape, and `--limit` validates 1..20 client-side.
+3. **`reindex`/`buildFromRepo` duration reporting:** the
+   in-app `duration_ms` is always 0 (both timestamps are
+   captured before the build). The real build time (~89 s /
+   10k docs) is measured externally. Not fixed here — a
+   reporting nit, recorded.
+

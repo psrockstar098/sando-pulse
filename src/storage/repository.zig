@@ -19,11 +19,14 @@ pub const Repository = struct {
         countDocuments: *const fn (ptr: *anyopaque) usize,
         /// Per-source document counts. Strings owned by `alloc`.
         countBySource: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]types.SourceCount,
-        /// Scan documents in fetched_at order (oldest first), optionally only
-        /// those fetched before `before_ts`. Used by maintenance (retention,
-        /// dedup, aggregation). `limit` caps the batch; call repeatedly with
-        /// a moving cutoff for large stores. All returned strings are owned
-        /// by `alloc` (the caller's arena).
+        /// Scan documents in fetched_at order (newest first),
+        /// optionally only those fetched at or before `before_ts`
+        /// (inclusive). Used by maintenance (retention, dedup,
+        /// aggregation), trends, and the memindex build. `limit`
+        /// caps the batch (and the Postgres implementation caps it
+        /// at 1000 per call); call repeatedly with a moving cutoff
+        /// for large stores. All returned strings are owned by
+        /// `alloc` (the caller's arena).
         scanDocuments: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, before_ts: ?i64, limit: usize) anyerror![]types.Document,
         /// Fetch one document by its content id (Roadmap 6.3, in-memory
         /// index resolution). Null when absent. All returned strings are

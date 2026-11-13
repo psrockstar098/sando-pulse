@@ -647,7 +647,7 @@ pub const Server = struct {
     /// shortlist, parallel fan-out, search, render. Used by the query
     /// handler on a cache miss AND by cache warming at boot — one path,
     /// so a warmed answer is byte-identical to a freshly computed one.
-    fn computeQuery(self: *Server, alloc: std.mem.Allocator, query_text: []const u8, enabled: []const []const u8, req_id: []const u8, query_start_ns: i96) !ComputeResult {
+    fn computeQuery(self: *Server, alloc: std.mem.Allocator, query_text: []const u8, enabled: []const []const u8, req_id: []const u8, query_start_ns: i96, limit: usize) !ComputeResult {
         const now = timex.nowSeconds(self.io);
         const p = planner.plan(alloc, query_text, enabled, now, self.cfg.tz_offset_minutes) catch return error.PlannerFailed;
         // Three-path router (Roadmap 6.1/6.7): instant is served by the
@@ -708,6 +708,7 @@ pub const Server = struct {
             .embedder = self.embedder,
             .tz_offset_minutes = self.cfg.tz_offset_minutes,
             .candidates = index_docs,
+            .limit = limit,
         }) catch {
             if (fo) |*f| f.joinAll();
             return error.SearchFailed;
@@ -726,7 +727,7 @@ pub const Server = struct {
         }
         self.metrics.observeQuery(outcome.sufficient);
         const latency_ms = timex.latencyMsF64(query_start_ns, timex.nowNanos(self.io));
-        const resp = query_json.buildQueryResponse(alloc, req_id, query_text, p, outcome, enabled.len, timex.nowSeconds(self.io), decision.path.name(), latency_ms, decision.reason, enrich) catch {
+        const resp = query_json.buildQueryResponse(alloc, req_id, query_text, p, outcome, enabled.len, timex.nowSeconds(self.io), decision.path.name(), latency_ms, decision.reason, enrich, limit) catch {
             if (fo) |*f| f.joinAll();
             return error.ResponseFailed;
         };
@@ -734,7 +735,7 @@ pub const Server = struct {
         self.maybeAutotune();
         // Store a copy rendered with empty markers so a later hit
         // can splice in its own id, serving path, and latency.
-        const storable = query_json.buildQueryResponse(alloc, "", query_text, p, outcome, enabled.len, timex.nowSeconds(self.io), "", 0, "", enrich) catch null;
+        const storable = query_json.buildQueryResponse(alloc, "", query_text, p, outcome, enabled.len, timex.nowSeconds(self.io), "", 0, "", enrich, limit) catch null;
         var tags: std.ArrayList([]const u8) = .empty;
         for (p.topics) |t| tags.append(alloc, t) catch {};
         for (p.counties) |t| tags.append(alloc, t) catch {};
@@ -779,7 +780,7 @@ pub const Server = struct {
         for (top_list) |row| {
             _ = self.req_arena.reset(.retain_capacity);
             const alloc = self.req_arena.allocator();
-            var c = self.computeQuery(alloc, row.query, enabled.items, "", timex.nowNanos(self.io)) catch {
+            var c = self.computeQuery(alloc, row.query, enabled.items, "", timex.nowNanos(self.io), 10) catch {
                 logging.warn("cache warming: query failed, skipped", &.{.{ .key = "query", .value = row.query }});
                 continue;
             };
@@ -1350,7 +1351,7 @@ pub const Server = struct {
             // cache misses and cache warming, so a warmed answer is
             // byte-identical to a freshly computed one. The error code
             // is preserved so callers see the same failures as before.
-            var c = self.computeQuery(alloc, qr.query, enabled.items, req_id, query_start_ns) catch |e| {
+            var c = self.computeQuery(alloc, qr.query, enabled.items, req_id, query_start_ns, qr.limit) catch |e| {
                 const code: []const u8 = switch (e) {
                     error.PlannerFailed => "planner_failed",
                     error.SearchFailed => "search_failed",

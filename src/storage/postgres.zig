@@ -1810,11 +1810,11 @@ pub const PostgresStore = struct {
         var pb = ParamBuilder{};
         defer pb.params.deinit(alloc);
         if (before_ts) |cut| {
-            try sql.appendSlice(alloc, " WHERE d.fetched_at < to_timestamp(");
+            try sql.appendSlice(alloc, " WHERE d.fetched_at <= to_timestamp(");
             try pb.intParam(&sql, alloc, cut);
             try sql.appendSlice(alloc, ")");
         }
-        try sql.appendSlice(alloc, " ORDER BY d.fetched_at ASC LIMIT ");
+        try sql.appendSlice(alloc, " ORDER BY d.fetched_at DESC LIMIT ");
         try pb.intParam(&sql, alloc, @intCast(@min(limit, 1000)));
         var res = try client.queryParams(alloc, sql.items, pb.params.items);
         defer res.deinit(alloc);

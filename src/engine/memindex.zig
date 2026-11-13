@@ -295,16 +295,29 @@ pub const MemIndex = struct {
         var report = BuildReport{};
         var seen = std.StringHashMap(void).init(alloc);
         defer seen.deinit();
+        // The scan returns newest-first with an INCLUSIVE upper
+        // bound, so walk backward: each batch is the newest docs at
+        // or before the cutoff, and the next cutoff is the oldest
+        // timestamp in the batch. The boundary second is re-scanned
+        // and deduped by the seen-set. (The old loop walked forward
+        // with `before_ts = newest + 1`, which re-read the same
+        // oldest 1000 docs forever — the index silently capped at
+        // the oldest 1000 documents. Found by the 10k-doc scale
+        // test in 6.12.) Known edge: if more than one batch (1000)
+        // of documents share one fetched_at second, a full batch of
+        // already-seen docs can end the walk early and the rest of
+        // that second is skipped; a (timestamp, id) cursor would
+        // close it — recorded, not silently dropped.
         var before_ts: ?i64 = null;
         while (true) {
             const batch = try repo.scanDocuments(alloc, before_ts, 1000);
             defer alloc.free(batch);
             if (batch.len == 0) break;
             var added_this_batch: usize = 0;
-            var newest: i64 = 0;
+            var oldest: i64 = std.math.maxInt(i64);
             for (batch) |doc| {
                 report.docs_seen += 1;
-                if (doc.fetched_at > newest) newest = doc.fetched_at;
+                if (doc.fetched_at < oldest) oldest = doc.fetched_at;
                 if (seen.contains(doc.id)) continue;
                 try seen.put(doc.id, {});
                 const before_evictions = self.evictions;
@@ -314,10 +327,7 @@ pub const MemIndex = struct {
                 report.docs_evicted += @intCast(self.evictions - before_evictions);
             }
             if (added_this_batch == 0) break;
-            // Next window: documents fetched at or after the newest
-            // timestamp in this batch (the boundary second is re-scanned
-            // and deduped by the seen-set).
-            before_ts = newest + 1;
+            before_ts = oldest;
             if (batch.len < 1000) break;
         }
         report.terms = self.terms.count();
@@ -451,6 +461,35 @@ test "memindex term cap evicts a cold term instead of failing" {
     try idx.addDocument(testDoc("d2", "gamma delta", "gamma delta"), 2000);
     try std.testing.expect(idx.terms.count() <= 2);
     try std.testing.expect(idx.evictions > 0);
+}
+
+test "memindex buildFromRepo indexes more than one scan batch" {
+    // Regression test (Roadmap 6.12 scale test): the old forward
+    // pagination re-read the same oldest 1000 docs and stopped, so
+    // the index silently capped at the oldest 1000 documents. With
+    // 2500 docs in the store the build must index all of them.
+    const memory = @import("../storage/memory.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var store = memory.MemoryStore.init(alloc);
+    defer store.deinit();
+    const repo = store.asRepository();
+    var i: usize = 0;
+    while (i < 2500) : (i += 1) {
+        var doc = testDoc("d", "fuel shortage", "fuel queues in Monrovia");
+        doc.id = try std.fmt.allocPrint(alloc, "d{d}", .{i});
+        doc.fetched_at = 1000 + @as(i64, @intCast(i));
+        try repo.insertDocument(doc);
+    }
+    var idx = MemIndex.init(alloc, 50000, 10000, 64 * 1024 * 1024);
+    defer idx.deinit();
+    const report = try idx.buildFromRepo(alloc, repo, 5000, 4000);
+    try std.testing.expectEqual(@as(usize, 2500), report.docs_added);
+    try std.testing.expectEqual(@as(usize, 2500), idx.docs_indexed);
+    // The newest doc is searchable (the old walk never reached it).
+    const cands = try idx.search(alloc, &.{"fuel"}, 6000, 10);
+    try std.testing.expect(cands.len > 0);
 }
 
 test "memindex live: build from Postgres, search, resolve by id" {

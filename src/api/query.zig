@@ -211,9 +211,13 @@ pub fn buildQueryResponse(
     /// Why the router chose this path.
     routing_reason: []const u8,
     enrich: Enrichment,
+    /// How many results to render (Roadmap 6.12): the API's
+    /// options.limit. Was a hardcoded 10, which made options.limit
+    /// a no-op — every response carried 10 results regardless.
+    limit: usize,
 ) ![]u8 {
     var results: std.ArrayList(ResultJson) = .empty;
-    const shown = @min(outcome.results.len, 10);
+    const shown = @min(outcome.results.len, limit);
     for (outcome.results[0..shown]) |r| {
         try results.append(alloc, .{
             .title = r.doc.title,
@@ -648,12 +652,12 @@ test "buildQueryResponse carries path, latency_ms and routing_reason" {
         .timeline = &.{},
     };
     // The live shape: real path + measured latency.
-    const live = try buildQueryResponse(alloc, "req-1", "fuel", p, outcome, 5, 1794477600, "fast", 12.345678, "simple_indexed", .{});
+    const live = try buildQueryResponse(alloc, "req-1", "fuel", p, outcome, 5, 1794477600, "fast", 12.345678, "simple_indexed", .{}, 10);
     try std.testing.expect(std.mem.indexOf(u8, live, "\"path\":\"fast\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, live, "\"latency_ms\":12.345678") != null);
     try std.testing.expect(std.mem.indexOf(u8, live, "\"routing_reason\":\"simple_indexed\"") != null);
     // The storable shape: empty markers stampServed expects.
-    const stored = try buildQueryResponse(alloc, "", "fuel", p, outcome, 5, 1794477600, "", 0, "", .{});
+    const stored = try buildQueryResponse(alloc, "", "fuel", p, outcome, 5, 1794477600, "", 0, "", .{}, 10);
     try std.testing.expect(std.mem.indexOf(u8, stored, "\"path\":\"\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, stored, "\"latency_ms\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, stored, "\"routing_reason\":\"\"") != null);
@@ -710,4 +714,59 @@ test "buildErrorResponse shape" {
     defer std.testing.allocator.free(s);
     try std.testing.expect(std.mem.indexOf(u8, s, "\"code\":\"not_found\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "\"request_id\":\"req-1\"") != null);
+}
+
+test "buildQueryResponse renders exactly options.limit results" {
+    // Regression test (Roadmap 6.12): the limit was validated and
+    // hashed into the cache key but the response always rendered 10.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const p: planner.Plan = .{
+        .intent = "local",
+        .terms = &.{"fuel"},
+        .counties = &.{},
+        .cities = &.{},
+        .organizations = &.{},
+        .people = &.{},
+        .topics = &.{},
+        .time_range = null,
+        .sources = &.{},
+    };
+    var ranked: [5]search.RankedDoc = undefined;
+    for (&ranked, 0..) |*r, i| {
+        r.* = .{
+            .doc = .{
+                .id = "d",
+                .source_id = "new-dawn",
+                .source_name = "New Dawn",
+                .source_url = "https://thenewdawnliberia.com/",
+                .title = "Fuel shortage hits Monrovia",
+                .url = "https://example.com/x",
+                .text = "Fuel stations report long queues.",
+                .published_at = null,
+                .fetched_at = 1000,
+                .reliability = 0.7,
+                .topics = &.{},
+                .content_hash = "h",
+                .lang = "en",
+            },
+            .score = .{ .relevance = 0.9, .reliability = 0.7, .recency = 0.5, .context = 0.5, .coverage = 0.5, .total = 0.8 },
+            .fused = 0.8 - @as(f64, @floatFromInt(i)) * 0.01,
+        };
+    }
+    const outcome: search.Outcome = .{
+        .answer = "Fuel stations report long queues. [1]",
+        .results = &ranked,
+        .confidence = 0.8,
+        .sufficient = true,
+        .insufficient_reason = null,
+        .events = &.{},
+        .timeline = &.{},
+    };
+    const two = try buildQueryResponse(alloc, "req-1", "fuel", p, outcome, 5, 1794477600, "fast", 1.0, "simple_indexed", .{}, 2);
+    // Two result objects: count the "title" fields in the results array.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, two, "\"title\":"));
+    const all = try buildQueryResponse(alloc, "req-1", "fuel", p, outcome, 5, 1794477600, "fast", 1.0, "simple_indexed", .{}, 20);
+    try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, all, "\"title\":"));
 }

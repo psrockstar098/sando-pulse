@@ -34,6 +34,9 @@ pub const Options = struct {
     /// set — without it every /v1/query returns 401 and the run
     /// measures nothing but the auth rejection.
     api_key: ?[]const u8 = null,
+    /// Result limit sent with each query (Roadmap 6.12: large
+    /// result sets). Default 5; the server caps it at its own max.
+    limit: usize = 5,
     /// Append a per-request number to the query so every query is
     /// distinct (no cache hits — measures the fast path). Default
     /// repeats one query (measures the instant path after warm-up).
@@ -79,6 +82,14 @@ pub fn parseArgs(alloc: std.mem.Allocator, args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingValue;
             opts.api_key = args[i];
+        } else if (std.mem.eql(u8, a, "--limit")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            opts.limit = try std.fmt.parseInt(usize, args[i], 10);
+            // The server accepts options.limit 1..20 (anything else
+            // is a 400); reject it here with a clear error instead
+            // of running a benchmark that only measures rejections.
+            if (opts.limit == 0 or opts.limit > 20) return error.BadLimit;
         } else if (std.mem.eql(u8, a, "--distinct")) {
             opts.distinct = true;
         } else {
@@ -326,7 +337,7 @@ const WorkerCtx = struct {
                 continue;
             };
             defer self.alloc.free(escaped);
-            const body = std.fmt.allocPrint(self.alloc, "{{\"query\":\"{s}\",\"limit\":5}}", .{escaped}) catch {
+            const body = std.fmt.allocPrint(self.alloc, "{{\"query\":\"{s}\",\"options\":{{\"limit\":{d}}}}}", .{ escaped, self.opts.limit }) catch {
                 self.errors += 1;
                 continue;
             };
@@ -506,6 +517,12 @@ test "parseArgs: --server-pid and --distinct" {
     try std.testing.expectEqual(@as(?i32, 1234), u.server_pid);
     try std.testing.expect(u.distinct);
     try std.testing.expectEqualStrings("testkey123", u.api_key.?);
+    try std.testing.expectEqual(@as(usize, 5), u.limit);
+    const l = try parseArgs(alloc, &.{ "--limit", "20" });
+    try std.testing.expectEqual(@as(usize, 20), l.limit);
+    try std.testing.expectError(error.BadLimit, parseArgs(alloc, &.{"--limit", "0"}));
+    try std.testing.expectError(error.BadLimit, parseArgs(alloc, &.{"--limit", "21"}));
+    try std.testing.expectError(error.MissingValue, parseArgs(alloc, &.{"--limit"}));
     try std.testing.expectError(error.BadPid, parseArgs(alloc, &.{"--server-pid", "0"}));
     try std.testing.expectError(error.BadPid, parseArgs(alloc, &.{"--server-pid", "-5"}));
     try std.testing.expectError(error.MissingValue, parseArgs(alloc, &.{"--server-pid"}));

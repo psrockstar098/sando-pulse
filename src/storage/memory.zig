@@ -211,13 +211,13 @@ pub const MemoryStore = struct {
         var out: std.ArrayList(types.Document) = .empty;
         for (self.docs.items) |doc| {
             if (before_ts) |cut| {
-                if (doc.fetched_at >= cut) continue;
+                if (doc.fetched_at > cut) continue;
             }
             try out.append(alloc, try dupeDocument(alloc, doc));
         }
         std.mem.sort(types.Document, out.items, {}, struct {
             fn lt(_: void, a: types.Document, b: types.Document) bool {
-                return a.fetched_at < b.fetched_at;
+                return a.fetched_at > b.fetched_at;
             }
         }.lt);
         if (out.items.len > limit) {

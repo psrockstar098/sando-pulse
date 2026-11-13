@@ -1000,3 +1000,54 @@ numbers in `docs/PERFORMANCE.md`; the short version:
 - Verified: `zig build` passes; **252/252 tests pass** (3 new
   loadtest tests: parseArgs --server-pid/--distinct/--api-key,
   percentile999, readProcSample on own + bogus pid).
+
+### 6.12 Benchmarks + freshness — DONE (2026-11-13 ~20:00)
+
+Full tables in `docs/PERFORMANCE.md`; the short version:
+
+- Loadtest extended: p99 + p99.9 on both endpoints (already in
+  the optimization scope), `--limit N` (1..20, the server's
+  range), `--distinct`, `--server-pid`, `--api-key`.
+- Latency (threads=1): fast p50 126.9 ms / instant 42.7 ms /
+  deep 127.1 ms at 3–5 docs; at 10,005 docs fast 189.1 ms,
+  deep 151.7 ms (cheaper than fast — the memindex shortlist
+  avoids the Postgres search), instant unchanged 42.8 ms.
+  CPU per 1k queries: fast 9120 ms (5 docs) → 56,840 ms
+  (10k docs); deep 9520 ms at 10k; instant ~1500–2000 ms.
+- Scale: `pulse reindex` over 10,005 docs; boot build ~90 s;
+  idle RSS 12.9 → 45.2 MiB (the 10k index costs ~32 MiB).
+  1M/10M+ milestones NOT tested (10k is what this VM ran).
+- Concurrency: 0 errors at 50 threads, but throughput caps at
+  ~24 calls/s and latency scales linearly (p50 2095 ms at 50
+  threads) — the single-threaded accept loop. 1K/10K
+  milestones NOT reached here; they need a real host + the
+  threaded accept loop.
+- Ingest + search: 10 ingests during a loadtest, 0 errors,
+  p50 unchanged, p99 44.7 → 351.8 ms (ingest blocks the loop).
+- Interruptions: Redis kill → 200s continue, breaker trips +
+  closes (6.11 smoke). Postgres kill → 500 `search_failed`
+  in ~60 ms, 67/250 failed during the ~11 s outage, server
+  recovers without a restart.
+- Freshness: ingest → searchable <1 s via the store search;
+  the memindex lags up to the 3600 s reindex interval (gap).
+- DB connections during a run: ~3 server connections (pool
+  size 1 default + audit client).
+- Bugs found + fixed here: (1) **memindex capped at the
+  oldest 1,000 docs** — `buildFromRepo` paginated the
+  upper-bound scan as a lower bound; fixed to newest-first +
+  inclusive bound + backward walk; verified at 10,005 docs
+  and by a new 2,500-doc regression test. (2)
+  **`options.limit` was a no-op** — validated + hashed into
+  the cache key but never passed to the search (always 10
+  results); threaded through `computeQuery` → `SearchOptions`
+  → `buildQueryResponse`; verified live (20 → 20 results,
+  5 → 5, distinct cache keys) + 2 new tests. The loadtest
+  itself sent a top-level `"limit"` the parser ignores (the
+  API reads `options.limit`) — fixed to the documented shape.
+  (3) `reindex` duration_ms always 0 (pre-existing reporting
+  bug) — recorded, not fixed.
+- Verified: `zig build` passes; **255/255 tests pass** on a
+  clean DB (253 before the 2 new limit tests; the geo live
+  test fails only while benchmark scale docs sit in the shared
+  test DB — they are removed after the benchmarks, and the
+  suite is re-run clean).
