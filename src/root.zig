@@ -47,6 +47,8 @@ pub const ingestion_validate = @import("ingestion/validate.zig");
 pub const storage_memory = @import("storage/memory.zig");
 pub const storage_knowledge = @import("storage/knowledge.zig");
 pub const storage_object_store = @import("storage/object_store.zig");
+pub const storage_compression = @import("storage/compression.zig");
+pub const storage_maintenance = @import("storage/maintenance.zig");
 // TODO(integration): re-enable once the Postgres client lands.
 pub const storage_postgres = @import("storage/postgres.zig");
 pub const storage_postgres_knowledge = @import("storage/postgres_knowledge.zig");
