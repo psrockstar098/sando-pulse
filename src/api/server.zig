@@ -6,6 +6,7 @@
 //!   GET  /v1/events   public — persisted event clusters (Roadmap 3.4)
 //!   GET  /v1/trends   public — Geez + trending engine (Roadmap 4.2)
 //!   GET  /v1/briefing public — precomputed intelligence (Roadmap 4.4)
+//!   GET  /v1/quality  public — reliability, confidence, flags (Roadmap 4.6)
 //!   GET  /v1/locations public — reference places (Roadmap 3.6)
 //!   GET  /v1/statistics public — seeded statistics (Roadmap 3.6)
 //!   GET  /v1/connectors/facebook public — Facebook connector status (3.2)
@@ -35,6 +36,7 @@ const facebook = @import("../ingestion/connectors/facebook/facebook.zig");
 const fb_webhooks = @import("../ingestion/connectors/facebook/webhooks.zig");
 const trending = @import("../intelligence/trending.zig");
 const precomputed = @import("../intelligence/precomputed.zig");
+const quality = @import("../intelligence/quality.zig");
 const redis = @import("../storage/redis.zig");
 const providers = @import("../ai/providers.zig");
 const auth = @import("auth.zig");
@@ -408,6 +410,25 @@ pub const Server = struct {
             const body = try std.fmt.allocPrint(alloc, "{{\"briefing\":{s},\"cached\":{},\"request_id\":\"{s}\"}}", .{ payload, cached_payload != null, req_id });
             self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
             try respondJson(req, .ok, body, req_id);
+            return;
+        }
+
+        if (method == .GET and std.mem.eql(u8, path, "/v1/quality")) {
+            const now = timex.nowSeconds(self.io);
+            if (self.knowledge) |k| {
+                const report = quality.computeQuality(alloc, k, now) catch {
+                    self.respondError(req, alloc, req_id, .internal_server_error, "quality_failed", "Failed to compute quality report");
+                    return;
+                };
+                const body = quality.renderQuality(alloc, report, req_id) catch {
+                    self.respondError(req, alloc, req_id, .internal_server_error, "quality_failed", "Failed to render quality report");
+                    return;
+                };
+                self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+                try respondJson(req, .ok, body, req_id);
+                return;
+            }
+            self.respondError(req, alloc, req_id, .internal_server_error, "quality_unavailable", "Knowledge store unavailable");
             return;
         }
 
