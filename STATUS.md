@@ -474,7 +474,7 @@ Baseline at start: `zig build` passes, 204/204 tests, origin/main `61d186a`.
 Constraints: Zig 0.17.1, REST only, raw std.http only (NO httpz — owner's
 direct order 2026-11-13), real data only, docs in the same commits.
 Final state: `zig build` passes, **255/255 tests** (51 new), all sections
-6.1–6.13 done + the added RAM/CPU optimization scope. Head `0605090`.
+6.1–6.13 done + the added RAM/CPU optimization scope. Roadmap 6 complete.
 
 ### 6.2 L1 in-process cache — DONE (2026-11-13 ~14:20)
 
