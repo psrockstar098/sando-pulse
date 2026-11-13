@@ -38,6 +38,14 @@ pub const Config = struct {
     pg_pool_size: usize = 1,
     rate_limit_per_minute: u32 = 100,
     rate_limit_per_day: u32 = 10000,
+    /// TLS termination is handled by a reverse proxy in front of Pulse
+    /// (the Zig 0.17.1 stdlib has no TLS server). Set
+    /// PULSE_BEHIND_TLS_PROXY=1 when the proxy is in place; the audit
+    /// command warns while it is unset.
+    behind_tls_proxy: bool = false,
+    /// Strict outbound mode: refuse plain-http feed URLs (Roadmap 5.1).
+    /// Default false — one registry feed (Daily Observer) is http-only.
+    require_https_fetches: bool = false,
     log_level: []const u8 = "info",
     /// Minutes east of UTC for time-aware queries (Africa/Monrovia = 0).
     tz_offset_minutes: i32 = 0,
@@ -147,6 +155,12 @@ pub fn load(alloc: std.mem.Allocator, env_map: *std.process.Environ.Map) !Config
     }
     if (envOwned(alloc, env_map, "PULSE_RATE_LIMIT_PER_DAY")) |v| {
         cfg.rate_limit_per_day = parseU32(v) orelse 10000;
+    }
+    if (envOwned(alloc, env_map, "PULSE_BEHIND_TLS_PROXY")) |v| {
+        cfg.behind_tls_proxy = std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
+    }
+    if (envOwned(alloc, env_map, "PULSE_REQUIRE_HTTPS_FETCHES")) |v| {
+        cfg.require_https_fetches = std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
     }
     if (envOwned(alloc, env_map, "PULSE_RETENTION_DAYS")) |v| {
         if (parseU32(v)) |n| {

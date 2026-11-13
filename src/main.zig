@@ -1,6 +1,7 @@
 //! Pulse CLI: `pulse serve` | `pulse worker [--once]` | `pulse migrate` |
 //! `pulse status` | `pulse keygen` | `pulse maintenance` | `pulse seed` |
-//! `pulse briefing` | `pulse loadtest [--url ...] [--threads N] [--requests N] [--query ...]`.
+//! `pulse briefing` | `pulse loadtest [--url ...] [--threads N] [--requests N] [--query ...]` |
+//! `pulse audit`.
 //!
 //! Zig 0.17.1 entry point: main takes `std.process.Init`, which carries the
 //! Io implementation, the allocator, argv, and the environment map — no
@@ -19,6 +20,7 @@ const logging = @import("common/logging.zig");
 const timex = @import("common/time.zig");
 const config = @import("config/config.zig");
 const loadtest = @import("cli/loadtest.zig");
+const audit = @import("cli/audit.zig");
 const repository = @import("storage/repository.zig");
 const knowledge = @import("storage/knowledge.zig");
 const seed = @import("seed/liberia.zig");
@@ -90,6 +92,10 @@ pub fn main(init: std.process.Init) !void {
     const cfg = try config.load(alloc, init.environ_map);
     logging.setLevel(logging.parseLevel(cfg.log_level));
 
+    if (std.mem.eql(u8, cmd, "audit")) {
+        std.process.exit(audit.run(alloc, io, cfg));
+    }
+
     if (std.mem.eql(u8, cmd, "status")) {
         printStatus(cfg);
         return;
@@ -107,8 +113,8 @@ pub fn main(init: std.process.Init) !void {
 
     const is_worker = std.mem.eql(u8, cmd, "worker");
     const once = is_worker and (cmd_arg != null and std.mem.eql(u8, cmd_arg.?, "--once"));
-    if (!std.mem.eql(u8, cmd, "serve") and !is_worker and !std.mem.eql(u8, cmd, "maintenance") and !std.mem.eql(u8, cmd, "seed") and !std.mem.eql(u8, cmd, "briefing") and !std.mem.eql(u8, cmd, "loadtest")) {
-        logging.err("unknown command (serve | worker [--once] | migrate | status | keygen | maintenance | seed | briefing | loadtest)", &.{});
+    if (!std.mem.eql(u8, cmd, "serve") and !is_worker and !std.mem.eql(u8, cmd, "maintenance") and !std.mem.eql(u8, cmd, "seed") and !std.mem.eql(u8, cmd, "briefing") and !std.mem.eql(u8, cmd, "loadtest") and !std.mem.eql(u8, cmd, "audit")) {
+        logging.err("unknown command (serve | worker [--once] | migrate | status | keygen | maintenance | seed | briefing | loadtest | audit)", &.{});
         std.process.exit(2);
     }
 

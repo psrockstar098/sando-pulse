@@ -65,6 +65,7 @@ pub const intelligence_trending = @import("intelligence/trending.zig");
 pub const intelligence_precomputed = @import("intelligence/precomputed.zig");
 pub const intelligence_quality = @import("intelligence/quality.zig");
 pub const cli_loadtest = @import("cli/loadtest.zig");
+pub const cli_audit = @import("cli/audit.zig");
 
 test {
     std.testing.refAllDecls(@This());

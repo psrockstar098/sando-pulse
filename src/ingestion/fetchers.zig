@@ -71,9 +71,20 @@ const max_head_bytes = 64 * 1024;
 /// first, then uppercase, as std does). With no proxy variables the client
 /// connects directly.
 pub fn fetchFeed(alloc: std.mem.Allocator, io: std.Io, url: []const u8, environ: ?*const std.process.Environ.Map) ![]u8 {
+    // Strict mode (Roadmap 5.1): refuse plain-http targets, including
+    // http redirects off an https feed. Default off — one registry feed
+    // (Daily Observer) is http-only, so strict mode is opt-in.
+    const strict_https = if (environ) |env| blk: {
+        const v = env.get("PULSE_REQUIRE_HTTPS_FETCHES") orelse break :blk false;
+        break :blk std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
+    } else false;
     var cur = try alloc.dupe(u8, url);
     var hops: u8 = 0;
     while (true) {
+        if (strict_https and std.mem.startsWith(u8, cur, "http://")) {
+            alloc.free(cur);
+            return error.SourceUnavailable;
+        }
         const res = try fetchOnce(alloc, io, cur, environ, .get, null);
         if (res.status == 200) {
             if (res.location) |loc| alloc.free(loc);
