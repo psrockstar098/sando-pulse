@@ -436,7 +436,7 @@ paths:
             default: 10
       responses:
         "200":
-          description: Trends, geo trends and monthly snapshots.
+          description: Trends, geo trends and monthly snapshots. Computed live from a store scan on every request, so `stale` is always false — the fields exist so every precomputed payload reports freshness the same way (Roadmap 6.4).
           content:
             application/json:
               schema:
@@ -453,7 +453,7 @@ paths:
       summary: Today's precomputed briefing (no auth)
       responses:
         "200":
-          description: Briefing for today (empty when no documents were collected today).
+          description: Briefing for today (empty when no documents were collected today). `stale` is evaluated at serve time against the precompute TTL — a cached payload served hours after it was computed is honestly marked stale (Roadmap 6.4).
           content:
             application/json:
               schema:
@@ -487,6 +487,28 @@ paths:
       responses:
         "200":
           description: Statistics with provenance.
+          content:
+            application/json:
+              schema:
+                type: object
+  /v1/popular:
+    get:
+      tags: [intelligence]
+      summary: Most-asked queries (no auth; Roadmap 6.4)
+      description: >
+        The queries users ask most, most-asked first. Only the query
+        text and a count are ever recorded or exposed — no consumer,
+        no identity. The list drives cache warming at boot.
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            maximum: 50
+            default: 10
+      responses:
+        "200":
+          description: Top queries with counts, plus how many distinct queries are tracked.
           content:
             application/json:
               schema:

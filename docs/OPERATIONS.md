@@ -115,6 +115,25 @@ backup instead.
 | Redis memory alert | Cache keys accumulating | Expected behaviour until TTL — maxmemory 256mb + allkeys-lru evicts; raise the limit if evictions hurt hit rate |
 | `pulse audit` FAIL on `api_key` | No key configured (open dev mode) | Set `PULSE_API_KEY`, restart |
 | `pulse audit` FAIL on `db_password` | `DATABASE_URL` still uses the example password `pulse` | Change `POSTGRES_PASSWORD` and `DATABASE_URL` |
+| First query after a restart is slow | Cache cold / popular list empty | Expected on a fresh store — warming only covers queries already in `popular.json`; see below |
+
+## Popular searches, persistence and warming (Roadmap 6.4)
+
+- The server tracks every asked query (text + count only, no
+  identity) in memory, bounded to `PULSE_POPULAR_MAX_TRACKED`
+  distinct queries (default 1000; the lowest-count entry is evicted
+  when full).
+- The list is persisted to `PULSE_POPULAR_PATH` (default
+  `popular.json`, relative to the API working directory) every
+  `PULSE_POPULAR_SAVE_EVERY` records (default 100). A missing or
+  corrupt file at boot just means no history yet — the server starts
+  with an empty list, never a boot failure.
+- At boot the server loads the list and warms the L1 + L2 caches with
+  the top `PULSE_POPULAR_WARM_N` queries (default 10). The log lines
+  `popular searches loaded` and `cache warmed` confirm it. Warming
+  keys are the normalised (lowercased, whitespace-collapsed) query
+  text, so a query typed with different casing computes fresh on its
+  first ask and then caches under its own raw form.
 
 ## What runs here vs on a real host
 

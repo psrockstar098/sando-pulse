@@ -108,3 +108,22 @@ audit log.
 evidence. That is a valid 200 response, not an error — treat it as "I
 don't know" and never fill the gap with invented content. The answer
 text is extractive: it is built only from the cited `results`.
+
+## Popular searches and freshness (Roadmap 6.4)
+
+- `GET /v1/popular?limit=N` returns the most-asked queries,
+  most-asked first, with a count each plus `tracked` (how many
+  distinct queries are tracked). Only the query text and a count are
+  ever recorded or exposed — no consumer, no identity.
+- Every precomputed payload reports freshness: `/v1/trends` and
+  `/v1/briefing` carry `computed_at` (Unix seconds) and `stale`.
+  Trends are computed live from a store scan on every request, so
+  `stale` is always false there. The briefing is cached by the worker;
+  `stale` is evaluated at serve time against the precompute TTL
+  (`PULSE_PRECOMPUTE_TTL_S`, default 3600s), so a cached briefing
+  served hours after it was computed is honestly marked stale.
+- At boot the server warms the L1 + L2 caches by running the most
+  popular queries through the same pipeline a cache miss uses, so a
+  warmed answer is byte-identical to a freshly computed one. The
+  warmed queries are the top `PULSE_POPULAR_WARM_N` (default 10) from
+  the persisted popular list. Warming never fails the boot.

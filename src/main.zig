@@ -43,6 +43,7 @@ const ratelimit = @import("api/ratelimit.zig");
 const metrics = @import("api/metrics.zig");
 const server = @import("api/server.zig");
 const l1cache = @import("api/l1cache.zig");
+const popular = @import("api/popular.zig");
 const cache = @import("api/cache.zig");
 const memindex = @import("engine/memindex.zig");
 const worker = @import("workers/worker.zig");
@@ -446,6 +447,17 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // Popular searches (Roadmap 6.4): loaded from the persistence
+    // file when present (a missing file just means no history yet).
+    var pop = popular.PopularSearches.load(alloc, io, cfg.popular_path, cfg.popular_max_tracked);
+    defer pop.deinit();
+    if (pop.tracked() > 0) {
+        logging.info("popular searches loaded", &.{
+            .{ .key = "tracked", .value = std.fmt.allocPrint(alloc, "{d}", .{pop.tracked()}) catch "?" },
+            .{ .key = "path", .value = cfg.popular_path },
+        });
+    }
+
     var srv = server.Server{
         .alloc = alloc,
         .io = io,
@@ -463,8 +475,13 @@ pub fn main(init: std.process.Init) !void {
         .index = index_ptr,
         .index_epoch = index_epoch,
         .index_built_ms = index_built_ms,
+        .popular = &pop,
         .usage_tracker = &usage_tracker,
         .audit_sink = &audit_sink,
     };
+    // Cache warming (Roadmap 6.4): run the most popular queries
+    // through the pipeline and store the answers in L1/L2, so the
+    // first real user of a popular query gets an instant hit.
+    srv.warmCache();
     try srv.serve();
 }

@@ -55,6 +55,10 @@ published**. The API container runs migrations on boot.
 | `PULSE_INGEST_INTERVAL_S` | `300` | Worker ingest interval |
 | `PULSE_RATE_LIMIT_PER_MINUTE` / `PULSE_RATE_LIMIT_PER_DAY` | `100` / `10000` | Per-key rate limits |
 | `PULSE_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
+| `PULSE_POPULAR_MAX_TRACKED` | `1000` | Distinct queries tracked for `GET /v1/popular` (Roadmap 6.4) |
+| `PULSE_POPULAR_PATH` | `popular.json` | Where the popular list is persisted (Roadmap 6.4) |
+| `PULSE_POPULAR_SAVE_EVERY` | `100` | Persist the popular list every N records (Roadmap 6.4) |
+| `PULSE_POPULAR_WARM_N` | `10` | Top popular queries warmed into L1/L2 at boot (Roadmap 6.4) |
 
 ## API
 
@@ -62,6 +66,9 @@ published**. The API container runs migrations on boot.
 |---|---|---|---|
 | GET | `/v1/health` | no | `{"status":"ok","version","documents","sources_enabled","store"}` |
 | GET | `/v1/sources` | no | All 10 sources with enabled flags and disabled reasons |
+| GET | `/v1/trends` | no | Geez + geo trends; carries `computed_at` + `stale` (Roadmap 6.4) |
+| GET | `/v1/briefing` | no | Precomputed briefing; carries `cached` + `stale` (Roadmap 6.4) |
+| GET | `/v1/popular` | no | Most-asked queries with counts (Roadmap 6.4) |
 | GET | `/metrics` | no | Prometheus text metrics |
 | POST | `/v1/query` | Bearer key | `{"query": "..."}` → cited answer or insufficient-evidence |
 | POST | `/v1/ingest` | Bearer key | Manual document ingest `{"title","url","source_id","text"}` |

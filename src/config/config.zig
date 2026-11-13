@@ -58,6 +58,13 @@ pub const Config = struct {
     /// L1 in-process cache (Roadmap 6.2): entry cap, byte cap, TTL.
     l1_max_entries: usize = 512,
     l1_max_bytes: usize = 8 * 1024 * 1024,
+    /// Popular searches (Roadmap 6.4): distinct-query cap, persistence
+    /// file, save interval (records), and how many top queries to
+    /// warm the cache with at boot.
+    popular_max_tracked: usize = 1000,
+    popular_path: []const u8 = "popular.json",
+    popular_save_every: usize = 100,
+    popular_warm_n: usize = 10,
     l1_ttl_s: u64 = 300,
     /// Parallel query fan-out (Roadmap 6.6): run the news + knowledge
     /// backends concurrently when the store is Postgres (pool/mutex
@@ -218,6 +225,18 @@ pub fn load(alloc: std.mem.Allocator, env_map: *std.process.Environ.Map) !Config
     }
     if (envOwned(alloc, env_map, "PULSE_L1_TTL_S")) |v| {
         cfg.l1_ttl_s = parseU64(v) orelse 300;
+    }
+    if (envOwned(alloc, env_map, "PULSE_POPULAR_MAX_TRACKED")) |v| {
+        cfg.popular_max_tracked = @intCast(@max(1, parseU64(v) orelse 1000));
+    }
+    if (envOwned(alloc, env_map, "PULSE_POPULAR_PATH")) |v| {
+        if (v.len > 0) cfg.popular_path = v;
+    }
+    if (envOwned(alloc, env_map, "PULSE_POPULAR_SAVE_EVERY")) |v| {
+        cfg.popular_save_every = @intCast(@max(1, parseU64(v) orelse 100));
+    }
+    if (envOwned(alloc, env_map, "PULSE_POPULAR_WARM_N")) |v| {
+        cfg.popular_warm_n = @intCast(parseU64(v) orelse 10);
     }
     if (envOwned(alloc, env_map, "PULSE_PARALLEL_QUERY")) |v| {
         cfg.parallel_query = std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");

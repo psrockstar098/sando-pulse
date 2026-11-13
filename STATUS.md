@@ -596,3 +596,58 @@ direct order 2026-11-13), real data only, docs in the same commits.
   full 166-location R3 seed was wiped with the DB recreations), so the
   Monrovia city match could not be verified live — the county match
   (Lofa) and the unit test cover the same code path.
+
+### 6.4 Popular searches, staleness, cache warming — DONE (2026-11-13 ~15:35)
+
+- `src/api/popular.zig` (new): `PopularSearches` — counts asked
+  queries (normalised: trimmed, lowercased, whitespace-collapsed),
+  bounded by a distinct-query cap (default 1000,
+  `PULSE_POPULAR_MAX_TRACKED`; lowest-count entry evicted when
+  full), `top(n)` most-asked first with deterministic tie-break,
+  persisted best-effort to `PULSE_POPULAR_PATH` (default
+  `popular.json`) every `PULSE_POPULAR_SAVE_EVERY` records (default
+  100). A missing or corrupt file at boot returns an empty tracker —
+  never a boot failure. Only query TEXT + count are stored, never a
+  consumer or identity.
+- `GET /v1/popular?limit=N` (public, max 50): top queries with
+  counts + `tracked` (distinct queries). Verified live: three asks of
+  "fuel shortage in Monrovia" -> `[{"query":"fuel shortage in
+  monrovia","count":3}], tracked:1`.
+- Staleness: `/v1/trends` now carries `computed_at` + `stale:false`
+  (computed live from a store scan every request, so never stale —
+  the fields exist so every precomputed payload reports freshness
+  the same way). `/v1/briefing` now carries `stale`, evaluated at
+  SERVE time against `PULSE_PRECOMPUTE_TTL_S` by parsing
+  `computed_at` out of the payload; a payload whose age cannot be
+  read is stale. Verified live: live-computed briefing -> stale
+  false; cached briefing served later -> stale false (still within
+  TTL). Bug found by the smoke test and fixed: `ignore_unknown_fields`
+  defaults to FALSE in Zig 0.17.1, so the first parse failed and
+  every briefing read stale — now passed explicitly.
+- `computeQuery` extraction: the query handler's inline pipeline
+  (plan, route, index shortlist, fan-out, search, render) is now one
+  shared method returning `{resp, storable, path, reason, latency_ms,
+  sufficient, tags, fo}` — used by the handler on a cache miss AND by
+  warming, so a warmed answer is byte-identical to a freshly computed
+  one. The fan-out task contexts and task list live in the caller's
+  arena (not on the stack) so straggler threads stay valid until the
+  caller joins after the response. Error codes preserved
+  (planner_failed/search_failed/response_failed).
+- Cache warming: at boot, after the memindex build, the server loads
+  the popular list and runs the top `PULSE_POPULAR_WARM_N` queries
+  (default 10) through `computeQuery`, storing the answers in L1
+  (consumer "default") and L2. Warming never fails the boot. Verified
+  live across a restart with Redis flushed: "popular searches
+  loaded" (tracked 1) + "cache warmed" (queries 1, 89 ms); the first
+  lowercase query (limit 10, matching the warmed entry) served
+  instant/l1_hit in 0.38 ms vs 85 ms fresh.
+- Honest note: warming keys are the NORMALISED query text, while the
+  L1/L2 cache keys use the raw query text (pre-existing R4.5/R6.2
+  behaviour, unchanged). A query typed with different casing (e.g.
+  "fuel shortage in Monrovia" with a capital M) computes fresh on
+  its first ask (85 ms, fast path) and then caches under its own raw
+  form — verified live. Normalising the cache keys was deliberately
+  NOT done: the cached body echoes the first request's raw query
+  text, so a shared key would serve one user's casing to another.
+- Verified: `zig build` passes; 236/236 tests (5 new popular tests:
+  normalise, count/top, eviction, save/load round-trip, missing file).

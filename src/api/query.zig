@@ -2,6 +2,7 @@
 //! All responses carry a request_id; all errors use one envelope shape.
 
 const std = @import("std");
+const popular = @import("popular.zig");
 const format = @import("../common/format.zig");
 const types = @import("../common/types.zig");
 const knowledge = @import("../storage/knowledge.zig");
@@ -482,6 +483,7 @@ const trending = @import("../intelligence/trending.zig");
 pub fn buildTrendsResponse(
     alloc: std.mem.Allocator,
     req_id: []const u8,
+    now: i64,
     trends: []const trending.TopicTrend,
     geo: []const trending.GeoTrend,
     snapshots: []const trending.MonthSnapshot,
@@ -527,6 +529,32 @@ pub fn buildTrendsResponse(
         .trends = trend_list.items,
         .geo = geo_list.items,
         .snapshots = snap_list.items,
+        // Trends are computed live from a store scan on every request,
+        // so they are never stale — the fields exist so callers can
+        // treat every precomputed payload the same way (Roadmap 6.4).
+        .computed_at = now,
+        .stale = false,
+        .request_id = req_id,
+    });
+}
+
+/// GET /v1/popular — the most-asked queries (Roadmap 6.4). Only the
+/// query text and a count are ever exposed; no consumer or identity
+/// is recorded, so there is nothing to leak.
+pub fn buildPopularResponse(
+    alloc: std.mem.Allocator,
+    req_id: []const u8,
+    top_list: []const popular.ScoredQuery,
+    tracked: usize,
+) ![]u8 {
+    var list: std.ArrayList(struct {
+        query: []const u8,
+        count: u64,
+    }) = .empty;
+    for (top_list) |row| try list.append(alloc, .{ .query = row.query, .count = row.count });
+    return stringifyAlloc(alloc, .{
+        .popular = list.items,
+        .tracked = tracked,
         .request_id = req_id,
     });
 }

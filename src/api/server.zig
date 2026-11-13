@@ -9,6 +9,7 @@
 //!   GET  /v1/quality  public — reliability, confidence, flags (Roadmap 4.6)
 //!   GET  /v1/locations public — reference places (Roadmap 3.6)
 //!   GET  /v1/statistics public — seeded statistics (Roadmap 3.6)
+//!   GET  /v1/popular public — most-asked queries (Roadmap 6.4)
 //!   GET  /v1/connectors/facebook public — Facebook connector status (3.2)
 //!   GET  /v1/webhooks/facebook public — Meta subscription handshake (3.2)
 //!   POST /v1/webhooks/facebook public — Meta webhook receiver, HMAC-verified (3.2)
@@ -43,6 +44,7 @@ const auth = @import("auth.zig");
 const ratelimit = @import("ratelimit.zig");
 const metrics = @import("metrics.zig");
 const cache = @import("cache.zig");
+const popular = @import("popular.zig");
 const l1cache = @import("l1cache.zig");
 const memindex = @import("../engine/memindex.zig");
 const router = @import("../engine/router.zig");
@@ -146,6 +148,10 @@ pub const Server = struct {
     index: ?*memindex.MemIndex = null,
     index_epoch: i64 = 0,
     index_built_ms: i64 = 0,
+    /// Popular searches (Roadmap 6.4). Always present; every asked
+    /// query is recorded here (text + count only, no identity) and
+    /// the top list drives cache warming at boot.
+    popular: *popular.PopularSearches,
     /// Usage tracking (Roadmap 5.3): per-consumer counters, Redis-backed
     /// when a client is configured, in-memory otherwise. Always present.
     usage_tracker: *usage.UsageTracker,
@@ -495,6 +501,193 @@ pub const Server = struct {
         return null;
     }
 
+    /// Result of running the full query pipeline (Roadmap 6.4 warming).
+    /// `resp` is rendered with the caller's request id for immediate
+    /// serving; `storable` is the same response with empty markers for
+    /// the L1/L2 caches (null when rendering it failed — the response is
+    /// still served, just never stored). `tags` are the plan's
+    /// topics/counties/cities for L1 tag invalidation. `fo` is the
+    /// fan-out handle: the caller MUST call joinAll AFTER the response
+    /// is sent — the task contexts live in `alloc` (the caller's arena),
+    /// so they stay valid until the caller frees it.
+    const ComputeResult = struct {
+        resp: []u8,
+        storable: ?[]u8,
+        path: []const u8,
+        reason: []const u8,
+        latency_ms: f64,
+        sufficient: bool,
+        tags: []const []const u8,
+        fo: ?fanout.Fanout,
+    };
+
+    /// Run the whole query pipeline for one query: plan, route, index
+    /// shortlist, parallel fan-out, search, render. Used by the query
+    /// handler on a cache miss AND by cache warming at boot — one path,
+    /// so a warmed answer is byte-identical to a freshly computed one.
+    fn computeQuery(self: *Server, alloc: std.mem.Allocator, query_text: []const u8, enabled: []const []const u8, req_id: []const u8, query_start_ns: i96) !ComputeResult {
+        const now = timex.nowSeconds(self.io);
+        const p = planner.plan(alloc, query_text, enabled, now, self.cfg.tz_offset_minutes) catch return error.PlannerFailed;
+        // Three-path router (Roadmap 6.1/6.7): instant is served by the
+        // caches above; here we choose fast vs deep.
+        const decision = router.route(p, .{});
+        // Fast path: shortlist candidates from the in-memory index
+        // (Roadmap 6.3) and resolve them via getDocument. Fewer than
+        // 3 usable candidates falls back to the store search — the
+        // deep path skips the index entirely.
+        var index_docs: ?[]types.Document = null;
+        if (decision.path == .fast) {
+            if (self.index) |idx| {
+                if (idx.search(alloc, p.terms, timex.nowMillis(self.io), 50) catch null) |cands| {
+                    self.metrics.observeMemindexLookup();
+                    if (cands.len >= 3) {
+                        var docs: std.ArrayList(types.Document) = .empty;
+                        for (cands) |c| {
+                            if (self.repo.getDocument(alloc, c.doc_id) catch null) |d| {
+                                docs.append(alloc, d) catch {};
+                            }
+                        }
+                        if (docs.items.len >= 3) {
+                            index_docs = docs.items;
+                            self.metrics.observeMemindexHit();
+                        } else docs.deinit(alloc);
+                    }
+                }
+            }
+        }
+        // Parallel fan-out (Roadmap 6.6): locations + statistics from
+        // the knowledge store run concurrently with the news search
+        // below. Parallel only when the store is Postgres (its
+        // knowledge store is mutex-guarded); the memory store runs
+        // the same tasks inline. When PULSE_PARALLEL_QUERY=0 the
+        // tasks run inline too. No entities in the plan = nothing
+        // to enrich, so no fan-out at all. The task contexts and the
+        // task list live in the caller's arena, NOT on this stack:
+        // the threads may still be running when computeQuery returns,
+        // and the caller joins them after the response is sent.
+        var fo: ?fanout.Fanout = null;
+        var loc_task: ?*LocationsTask = null;
+        var stat_task: ?*StatisticsTask = null;
+        if ((p.counties.len > 0 or p.cities.len > 0 or p.topics.len > 0) and self.knowledge != null) {
+            const lt = try alloc.create(LocationsTask);
+            lt.* = .{ .ks = self.knowledge.?, .counties = p.counties, .cities = p.cities };
+            loc_task = lt;
+            const st = try alloc.create(StatisticsTask);
+            st.* = .{ .ks = self.knowledge.?, .topics = p.topics };
+            stat_task = st;
+            const tasks = try alloc.alloc(fanout.Task, 2);
+            tasks[0] = .{ .name = "locations", .run = LocationsTask.run, .ctx = loc_task.? };
+            tasks[1] = .{ .name = "statistics", .run = StatisticsTask.run, .ctx = stat_task.? };
+            const parallel = self.cfg.parallel_query and std.mem.eql(u8, self.store_name, "postgres");
+            fo = fanout.Fanout.start(alloc, tasks, parallel) catch null;
+            if (fo == null) fanout.runSequential(alloc, tasks);
+        }
+        const outcome = search.searchAndRank(alloc, self.repo, p, now, .{
+            .embedder = self.embedder,
+            .tz_offset_minutes = self.cfg.tz_offset_minutes,
+            .candidates = index_docs,
+        }) catch {
+            if (fo) |*f| f.joinAll();
+            return error.SearchFailed;
+        };
+        // Fan-out merge (Roadmap 6.6): wait for the knowledge tasks
+        // until the deadline, then take whatever completed. A task
+        // still running leaves its section empty and
+        // fanout_complete false (partial results, labelled).
+        var enrich = query_json.Enrichment{};
+        if (fo) |*f| {
+            f.wait(self.cfg.fanout_timeout_ms);
+            enrich.fanout_complete = f.allDone();
+            if (f.completed("locations")) enrich.locations = loc_task.?.out;
+            if (f.completed("statistics")) enrich.statistics = stat_task.?.out;
+        }
+        self.metrics.observeQuery(outcome.sufficient);
+        const latency_ms = timex.latencyMsF64(query_start_ns, timex.nowNanos(self.io));
+        const resp = query_json.buildQueryResponse(alloc, req_id, query_text, p, outcome, enabled.len, timex.nowSeconds(self.io), decision.path.name(), latency_ms, decision.reason, enrich) catch {
+            if (fo) |*f| f.joinAll();
+            return error.ResponseFailed;
+        };
+        self.metrics.observePath(decision.path.name(), latency_ms);
+        // Store a copy rendered with empty markers so a later hit
+        // can splice in its own id, serving path, and latency.
+        const storable = query_json.buildQueryResponse(alloc, "", query_text, p, outcome, enabled.len, timex.nowSeconds(self.io), "", 0, "", enrich) catch null;
+        var tags: std.ArrayList([]const u8) = .empty;
+        for (p.topics) |t| tags.append(alloc, t) catch {};
+        for (p.counties) |t| tags.append(alloc, t) catch {};
+        for (p.cities) |t| tags.append(alloc, t) catch {};
+        return .{
+            .resp = resp,
+            .storable = storable,
+            .path = decision.path.name(),
+            .reason = decision.reason,
+            .latency_ms = latency_ms,
+            .sufficient = outcome.sufficient,
+            .tags = tags.items,
+            .fo = fo,
+        };
+    }
+
+    /// Cache warming (Roadmap 6.4): at boot, run the most popular
+    /// queries through the same pipeline a cache miss uses and store
+    /// the answers in L1 (and L2 when Redis is present). Each query
+    /// runs in its own arena; the L1 dupes the stored body into its
+    /// own allocator, so the arena can be freed right after. Warming
+    /// never fails the boot: every failure is logged and skipped.
+    pub fn warmCache(self: *Server) void {
+        const n = self.cfg.popular_warm_n;
+        if (n == 0) return;
+        const top_list = self.popular.top(self.alloc, n) catch {
+            logging.warn("cache warming skipped: could not list popular queries", &.{});
+            return;
+        };
+        if (top_list.len == 0) {
+            logging.info("cache warming: no popular queries yet", &.{});
+            return;
+        }
+        var enabled: std.ArrayList([]const u8) = .empty;
+        defer enabled.deinit(self.alloc);
+        for (sources.sources) |s| {
+            if (s.enabled) enabled.append(self.alloc, s.id) catch {};
+        }
+        const epoch: i64 = if (self.redis) |rc| cache.currentEpoch(rc, self.alloc) else 0;
+        var warmed: usize = 0;
+        const start_ms = timex.nowMillis(self.io);
+        for (top_list) |row| {
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            var c = self.computeQuery(alloc, row.query, enabled.items, "", timex.nowNanos(self.io)) catch {
+                logging.warn("cache warming: query failed, skipped", &.{.{ .key = "query", .value = row.query }});
+                continue;
+            };
+            if (c.storable) |s| {
+                if (s.len <= cache.max_response_bytes) {
+                    if (self.cfg.l1_ttl_s > 0) {
+                        const lk = l1cache.L1Cache.queryKey(alloc, usage.default_consumer_name, row.query, 10) catch null;
+                        if (lk) |key| {
+                            const before = self.l1.snapshot();
+                            self.l1.put(key, s, c.tags, timex.nowMillis(self.io)) catch {};
+                            const after = self.l1.snapshot();
+                            self.metrics.observeL1Evictions(after.evictions - before.evictions);
+                            self.metrics.setL1Stats(after.entries, after.bytes);
+                        }
+                    }
+                    if (self.redis) |rc| {
+                        const k = cache.cacheKey(alloc, row.query, 10) catch null;
+                        if (k) |ck| cache.put(rc, alloc, ck, epoch, s, self.cfg.query_cache_ttl_s) catch {};
+                    }
+                    warmed += 1;
+                }
+            }
+            if (c.fo) |*f| f.joinAll();
+        }
+        var qbuf: [16]u8 = undefined;
+        const qstr = std.fmt.bufPrint(&qbuf, "{d}", .{warmed}) catch "?";
+        var dbuf: [16]u8 = undefined;
+        const dstr = std.fmt.bufPrint(&dbuf, "{d}", .{@max(0, timex.nowMillis(self.io) - start_ms)}) catch "?";
+        logging.info("cache warmed", &.{ .{ .key = "queries", .value = qstr }, .{ .key = "duration_ms", .value = dstr } });
+    }
+
     fn handleRequest(self: *Server, req: *std.http.Server.Request) !void {
         const start_ms = timex.nowMillis(self.io);
         var arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -624,7 +817,7 @@ pub const Server = struct {
                     try snapshots.append(alloc, try trending.snapshotFromAggregates(alloc, aggs, m));
                 }
             }
-            const body = try query_json.buildTrendsResponse(alloc, req_id, all_trends, geo_trends, snapshots.items);
+            const body = try query_json.buildTrendsResponse(alloc, req_id, now, all_trends, geo_trends, snapshots.items);
             self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
             try respondJson(req, .ok, body, req_id);
             return;
@@ -653,7 +846,17 @@ pub const Server = struct {
                 }
                 break :blk rendered;
             };
-            const body = try std.fmt.allocPrint(alloc, "{{\"briefing\":{s},\"cached\":{},\"request_id\":\"{s}\"}}", .{ payload, cached_payload != null, req_id });
+            // Staleness (Roadmap 6.4): the payload carries computed_at;
+            // stale is evaluated at SERVE time against the precompute
+            // TTL, so a cached payload served hours later is honestly
+            // marked. A payload whose age cannot be read is stale.
+            const stale: bool = blk: {
+                const Age = struct { computed_at: i64 };
+                const parsed = std.json.parseFromSlice(Age, alloc, payload, .{ .ignore_unknown_fields = true }) catch break :blk true;
+                defer parsed.deinit();
+                break :blk now - parsed.value.computed_at > @as(i64, @intCast(self.cfg.precompute_ttl_s));
+            };
+            const body = try std.fmt.allocPrint(alloc, "{{\"briefing\":{s},\"cached\":{},\"stale\":{},\"request_id\":\"{s}\"}}", .{ payload, cached_payload != null, stale, req_id });
             self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
             try respondJson(req, .ok, body, req_id);
             return;
@@ -714,6 +917,22 @@ pub const Server = struct {
             return;
         }
 
+        if (method == .GET and std.mem.eql(u8, path, "/v1/popular")) {
+            var limit: usize = 10;
+            if (queryParam(head.query, "limit")) |ls| {
+                limit = std.fmt.parseInt(usize, ls, 10) catch 10;
+                if (limit > 50) limit = 50;
+            }
+            const top_list = self.popular.top(alloc, limit) catch {
+                self.respondError(req, alloc, req_id, .internal_server_error, "popular_failed", "Failed to list popular searches");
+                return;
+            };
+            const body = try query_json.buildPopularResponse(alloc, req_id, top_list, self.popular.tracked());
+            self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+            try respondJson(req, .ok, body, req_id);
+            return;
+        }
+
         if (method == .GET and std.mem.eql(u8, path, "/metrics")) {
             const body = try self.metrics.render(alloc);
             self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
@@ -738,6 +957,15 @@ pub const Server = struct {
                 self.respondError(req, alloc, req_id, .bad_request, "invalid_request", "Body must be JSON with a non-empty \"query\" string (max 1000 chars)");
                 return;
             };
+            // Popular searches (Roadmap 6.4): every asked query is
+            // counted (text + count only, no identity). The key is
+            // owned by the server allocator, never the request arena.
+            // Persisted every N records so the list survives restarts.
+            self.popular.record(self.alloc, qr.query) catch {};
+            if (self.popular.records_since_save >= self.cfg.popular_save_every) {
+                self.popular.save(self.io, self.cfg.popular_path) catch {};
+                self.popular.records_since_save = 0;
+            }
             var enabled: std.ArrayList([]const u8) = .empty;
             for (sources.sources) |s| {
                 if (s.enabled) try enabled.append(alloc, s.id);
@@ -804,104 +1032,37 @@ pub const Server = struct {
                     }
                 }
             }
-            const now = timex.nowSeconds(self.io);
-            const p = planner.plan(alloc, qr.query, enabled.items, now, self.cfg.tz_offset_minutes) catch {
-                self.respondError(req, alloc, req_id, .internal_server_error, "planner_failed", "Query planning failed");
-                return;
-            };
-            // Three-path router (Roadmap 6.1/6.7): instant is served
-            // above (L1/L2 hits); here we choose fast vs deep.
-            const decision = router.route(p, .{});
-            // Fast path: shortlist candidates from the in-memory index
-            // (Roadmap 6.3) and resolve them via getDocument. Fewer than
-            // 3 usable candidates falls back to the store search — the
-            // deep path skips the index entirely.
-            var index_docs: ?[]types.Document = null;
-            if (decision.path == .fast) {
-                if (self.index) |idx| {
-                    if (idx.search(alloc, p.terms, timex.nowMillis(self.io), 50) catch null) |cands| {
-                        self.metrics.observeMemindexLookup();
-                        if (cands.len >= 3) {
-                            var docs: std.ArrayList(types.Document) = .empty;
-                            for (cands) |c| {
-                                if (self.repo.getDocument(alloc, c.doc_id) catch null) |d| {
-                                    docs.append(alloc, d) catch {};
-                                }
-                            }
-                            if (docs.items.len >= 3) {
-                                index_docs = docs.items;
-                                self.metrics.observeMemindexHit();
-                            } else docs.deinit(alloc);
-                        }
-                    }
-                }
-            }
-            // Parallel fan-out (Roadmap 6.6): locations + statistics from
-            // the knowledge store run concurrently with the news search
-            // below. Parallel only when the store is Postgres (its
-            // knowledge store is mutex-guarded); the memory store runs
-            // the same tasks inline. When PULSE_PARALLEL_QUERY=0 the
-            // tasks run inline too. No entities in the plan = nothing
-            // to enrich, so no fan-out at all.
-            var loc_task: ?LocationsTask = null;
-            var stat_task: ?StatisticsTask = null;
-            var fo: ?fanout.Fanout = null;
-            if ((p.counties.len > 0 or p.cities.len > 0 or p.topics.len > 0) and self.knowledge != null) {
-                loc_task = .{ .ks = self.knowledge.?, .counties = p.counties, .cities = p.cities };
-                stat_task = .{ .ks = self.knowledge.?, .topics = p.topics };
-                var tasks = [_]fanout.Task{
-                    .{ .name = "locations", .run = LocationsTask.run, .ctx = &loc_task.? },
-                    .{ .name = "statistics", .run = StatisticsTask.run, .ctx = &stat_task.? },
+            // Full pipeline (Roadmap 6.4): plan, route, index
+            // shortlist, fan-out, search, render — one shared path for
+            // cache misses and cache warming, so a warmed answer is
+            // byte-identical to a freshly computed one. The error code
+            // is preserved so callers see the same failures as before.
+            var c = self.computeQuery(alloc, qr.query, enabled.items, req_id, query_start_ns) catch |e| {
+                const code: []const u8 = switch (e) {
+                    error.PlannerFailed => "planner_failed",
+                    error.SearchFailed => "search_failed",
+                    error.ResponseFailed => "response_failed",
+                    else => "search_failed",
                 };
-                const parallel = self.cfg.parallel_query and std.mem.eql(u8, self.store_name, "postgres");
-                fo = fanout.Fanout.start(alloc, &tasks, parallel) catch null;
-                if (fo == null) fanout.runSequential(alloc, &tasks);
-            }
-            const outcome = search.searchAndRank(alloc, self.repo, p, now, .{
-                .embedder = self.embedder,
-                .tz_offset_minutes = self.cfg.tz_offset_minutes,
-                .candidates = index_docs,
-            }) catch {
-                if (fo) |*f| f.joinAll();
-                self.respondError(req, alloc, req_id, .internal_server_error, "search_failed", "Search failed");
+                const msg: []const u8 = switch (e) {
+                    error.PlannerFailed => "Query planning failed",
+                    error.SearchFailed => "Search failed",
+                    error.ResponseFailed => "Failed to render response",
+                    else => "Search failed",
+                };
+                self.respondError(req, alloc, req_id, .internal_server_error, code, msg);
                 return;
             };
-            // Fan-out merge (Roadmap 6.6): wait for the knowledge tasks
-            // until the deadline, then take whatever completed. A task
-            // still running leaves its section empty and
-            // fanout_complete false (partial results, labelled).
-            var enrich = query_json.Enrichment{};
-            if (fo) |*f| {
-                f.wait(self.cfg.fanout_timeout_ms);
-                enrich.fanout_complete = f.allDone();
-                if (f.completed("locations")) enrich.locations = loc_task.?.out;
-                if (f.completed("statistics")) enrich.statistics = stat_task.?.out;
-            }
-            self.metrics.observeQuery(outcome.sufficient);
-            const latency_ms = timex.latencyMsF64(query_start_ns, timex.nowNanos(self.io));
-            const resp = query_json.buildQueryResponse(alloc, req_id, qr.query, p, outcome, enabled.items.len, timex.nowSeconds(self.io), decision.path.name(), latency_ms, decision.reason, enrich) catch {
-                if (fo) |*f| f.joinAll();
-                self.respondError(req, alloc, req_id, .internal_server_error, "response_failed", "Failed to render response");
-                return;
-            };
-            self.metrics.observePath(decision.path.name(), latency_ms);
-            // Store a copy rendered with empty markers so a later hit
-            // can splice in its own id, serving path, and latency.
+            // Store the storable copy in L1/L2 (Roadmap 6.2/4.5).
             // Oversized responses are served but never stored. The L1
             // entry is tagged with the plan's topics/counties/cities so
             // ingest can invalidate only the affected entries (6.2).
             if (l1_key != null or cache_key != null) {
-                if (resp.len <= cache.max_response_bytes) {
-                    const storable = query_json.buildQueryResponse(alloc, "", qr.query, p, outcome, enabled.items.len, timex.nowSeconds(self.io), "", 0, "", enrich) catch null;
-                    if (storable) |s| {
+                if (c.storable) |s| {
+                    if (s.len <= cache.max_response_bytes) {
                         if (l1_key) |lk| {
-                            var tags: std.ArrayList([]const u8) = .empty;
-                            for (p.topics) |t| tags.append(alloc, t) catch {};
-                            for (p.counties) |t| tags.append(alloc, t) catch {};
-                            for (p.cities) |t| tags.append(alloc, t) catch {};
                             const before = self.l1.snapshot();
-                            self.l1.put(lk, s, tags.items, timex.nowMillis(self.io)) catch {};
-                            tags.deinit(alloc);
+                            self.l1.put(lk, s, c.tags, timex.nowMillis(self.io)) catch {};
                             const after = self.l1.snapshot();
                             self.metrics.observeL1Evictions(after.evictions - before.evictions);
                             self.metrics.setL1Stats(after.entries, after.bytes);
@@ -915,10 +1076,10 @@ pub const Server = struct {
             self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
             self.recordUsage(head, .query);
             self.auditCall(head, alloc, req_id, 200);
-            try respondJsonCached(req, .ok, resp, req_id, false);
+            try respondJsonCached(req, .ok, c.resp, req_id, false);
             // Post-response join (Roadmap 6.6): straggler fan-out threads
             // finish here, after the response is sent — never before.
-            if (fo) |*f| f.joinAll();
+            if (c.fo) |*f| f.joinAll();
             return;
         }
 
