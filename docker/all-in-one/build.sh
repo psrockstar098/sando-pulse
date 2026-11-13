@@ -49,37 +49,43 @@ needed = pkgs
 specs = []
 skipped = []
 for pkg in needed:
-    pol = subprocess.run(["apt-cache", "policy", pkg],
+    # Prefer the highest-priority version served by an Ubuntu archive
+    # mirror. Third-party repos installed on the build host must never
+    # be pinned: e.g. the GitHub runner's PGDG postgresql-common
+    # 293.pgdg24.04+1 is not in the Ubuntu archive, so apt-get download
+    # cannot fetch it ("Can't find a source to download version").
+    mad = subprocess.run(["apt-cache", "madison", pkg],
                          capture_output=True, text=True).stdout
-    versions, cur, candidate = [], None, None
-    for line in pol.splitlines():
-        if line.strip().startswith("Candidate:"):
-            candidate = line.strip().split(None, 1)[1]
-        m = re.match(r"\s*\**\s*(\S+)\s+\d+\s*$", line)
-        if m and m.group(1) not in ("Installed:", "Candidate:"):
-            cur = m.group(1)
+    chosen = None
+    for line in mad.splitlines():
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) >= 3 and "archive.ubuntu.com" in parts[2]:
+            chosen = parts[1]
+            break
+    if chosen is None:
+        # No Ubuntu-archive version: fall back to the candidate (this is
+        # how most base packages resolve on hosts whose lists only carry
+        # the candidate), else skip installed-only packages — their
+        # version already ships in the ubuntu:24.04 base image, so the
+        # dependency is satisfied there and no .deb is needed. Record
+        # skips loudly: if dpkg -i later complains about one, the skip
+        # is the first suspect.
+        pol = subprocess.run(["apt-cache", "policy", pkg],
+                             capture_output=True, text=True).stdout
+        candidate = None
+        for line in pol.splitlines():
+            if line.strip().startswith("Candidate:"):
+                candidate = line.strip().split(None, 1)[1]
+        if candidate and candidate != "(none)":
+            print(f"  WARN {pkg}: no Ubuntu-archive version, using candidate {candidate}")
+            chosen = candidate
+        else:
+            print(f"  SKIP {pkg}: no Ubuntu-archive version, no candidate")
+            print(f"    madison output: {mad!r}")
+            print(f"    policy output: {pol!r}")
+            skipped.append(pkg)
             continue
-        if cur and "http" in line:
-            versions.append(cur)
-            cur = None
-        elif cur and "/var/lib/dpkg/status" in line:
-            cur = None
-    if versions:
-        specs.append(f"{pkg}={versions[0]}")
-    elif candidate and candidate != "(none)":
-        # No archive entry found (e.g. the host's apt lists lack this
-        # package's source) but a candidate exists in the lists: use it.
-        print(f"  WARN {pkg}: no archive version, using candidate {candidate}")
-        specs.append(f"{pkg}={candidate}")
-    else:
-        # Installed-only on this host (no archive entry, no candidate):
-        # the version already ships in the ubuntu:24.04 base image, so
-        # the dependency is satisfied there and no .deb is needed.
-        # Record it loudly — if dpkg -i later complains about this
-        # package, the skip is the first suspect.
-        print(f"  SKIP {pkg}: installed-only, no archive version, no candidate")
-        print(f"    policy output: {pol!r}")
-        skipped.append(pkg)
+    specs.append(f"{pkg}={chosen}")
 open(f"{aio}/download-specs.txt", "w").write("\n".join(specs))
 print(f"  {len(specs)} packages, {len(skipped)} skipped: {skipped}")
 EOF
