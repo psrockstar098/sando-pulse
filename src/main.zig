@@ -1,7 +1,7 @@
 //! Pulse CLI: `pulse serve` | `pulse worker [--once]` | `pulse migrate` |
 //! `pulse status` | `pulse keygen` | `pulse maintenance` | `pulse seed` |
 //! `pulse briefing` | `pulse loadtest [--url ...] [--threads N] [--requests N] [--query ...]` |
-//! `pulse audit`.
+//! `pulse audit` | `pulse backup [--out <path>] [--keep N]` | `pulse restore --in <path>`.
 //!
 //! Zig 0.17.1 entry point: main takes `std.process.Init`, which carries the
 //! Io implementation, the allocator, argv, and the environment map — no
@@ -21,6 +21,7 @@ const timex = @import("common/time.zig");
 const config = @import("config/config.zig");
 const loadtest = @import("cli/loadtest.zig");
 const audit = @import("cli/audit.zig");
+const backup_cli = @import("cli/backup.zig");
 const repository = @import("storage/repository.zig");
 const knowledge = @import("storage/knowledge.zig");
 const seed = @import("seed/liberia.zig");
@@ -96,6 +97,53 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(audit.run(alloc, io, cfg));
     }
 
+    if (std.mem.eql(u8, cmd, "backup") or std.mem.eql(u8, cmd, "restore")) {
+        const url = cfg.database_url orelse {
+            logging.err("backup/restore need DATABASE_URL", &.{});
+            std.process.exit(2);
+        };
+        // Remaining args: --out <path> --keep <n> (backup), --in <path> (restore).
+        var out_path: ?[]const u8 = null;
+        var in_path: ?[]const u8 = null;
+        var keep: usize = backup_cli.default_keep;
+        var flag_args: std.ArrayList([]const u8) = .empty;
+        if (cmd_arg) |a| try flag_args.append(alloc, a);
+        while (args_it.next()) |a| try flag_args.append(alloc, a);
+        var i: usize = 0;
+        while (i < flag_args.items.len) : (i += 1) {
+            const a = flag_args.items[i];
+            if (std.mem.eql(u8, a, "--out") and i + 1 < flag_args.items.len) {
+                out_path = flag_args.items[i + 1];
+                i += 1;
+            } else if (std.mem.eql(u8, a, "--in") and i + 1 < flag_args.items.len) {
+                in_path = flag_args.items[i + 1];
+                i += 1;
+            } else if (std.mem.eql(u8, a, "--keep") and i + 1 < flag_args.items.len) {
+                keep = std.fmt.parseInt(usize, flag_args.items[i + 1], 10) catch backup_cli.default_keep;
+                i += 1;
+            } else {
+                logging.err("unknown backup/restore flag (backup [--out <path>] [--keep N] | restore --in <path>)", &.{});
+                std.process.exit(2);
+            }
+        }
+        if (std.mem.eql(u8, cmd, "backup")) {
+            backup_cli.backup(alloc, io, url, out_path, keep) catch |e| {
+                logging.err("backup failed", &.{.{ .key = "error", .value = @errorName(e) }});
+                std.process.exit(1);
+            };
+        } else {
+            const path = in_path orelse {
+                logging.err("restore needs --in <path>", &.{});
+                std.process.exit(2);
+            };
+            backup_cli.restore(alloc, io, url, path) catch |e| {
+                logging.err("restore failed", &.{.{ .key = "error", .value = @errorName(e) }});
+                std.process.exit(1);
+            };
+        }
+        return;
+    }
+
     if (std.mem.eql(u8, cmd, "status")) {
         printStatus(cfg);
         return;
@@ -113,8 +161,8 @@ pub fn main(init: std.process.Init) !void {
 
     const is_worker = std.mem.eql(u8, cmd, "worker");
     const once = is_worker and (cmd_arg != null and std.mem.eql(u8, cmd_arg.?, "--once"));
-    if (!std.mem.eql(u8, cmd, "serve") and !is_worker and !std.mem.eql(u8, cmd, "maintenance") and !std.mem.eql(u8, cmd, "seed") and !std.mem.eql(u8, cmd, "briefing") and !std.mem.eql(u8, cmd, "loadtest") and !std.mem.eql(u8, cmd, "audit")) {
-        logging.err("unknown command (serve | worker [--once] | migrate | status | keygen | maintenance | seed | briefing | loadtest | audit)", &.{});
+    if (!std.mem.eql(u8, cmd, "serve") and !is_worker and !std.mem.eql(u8, cmd, "maintenance") and !std.mem.eql(u8, cmd, "seed") and !std.mem.eql(u8, cmd, "briefing") and !std.mem.eql(u8, cmd, "loadtest") and !std.mem.eql(u8, cmd, "audit") and !std.mem.eql(u8, cmd, "backup") and !std.mem.eql(u8, cmd, "restore")) {
+        logging.err("unknown command (serve | worker [--once] | migrate | status | keygen | maintenance | seed | briefing | loadtest | audit | backup | restore)", &.{});
         std.process.exit(2);
     }
 
