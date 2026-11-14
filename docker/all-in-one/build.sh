@@ -24,7 +24,12 @@ TAG="${TAG:-sando-pulse:all-in-one-0.1.0}"
 BUILDER="${BUILDER:-$(command -v podman || command -v docker)}"
 
 echo "== 1. pulse binary (zig 0.17.1, ReleaseSafe) =="
-"$ZIG" build -Doptimize=ReleaseSafe --prefix /tmp/pulse-build-out
+# -Dcpu=baseline: a native-target binary inherits the build host's CPU
+# features — the GitHub runner that built the 2026-11-14 image has
+# AVX-512, so the shipped binary contained EVEX instructions and died
+# with SIGILL on machines without it (this VM and the Ryzen 3 3250U
+# laptop). Baseline runs everywhere; the 5ms hot-path cost is nil.
+"$ZIG" build -Doptimize=ReleaseSafe -Dcpu=baseline --prefix /tmp/pulse-build-out
 cp /tmp/pulse-build-out/bin/pulse "$AIO/pulse"
 
 echo "== 2. vendored .debs (archive candidate versions) =="
