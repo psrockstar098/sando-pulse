@@ -328,6 +328,40 @@ Every `POST /v1/query` 200 carries, alongside the answer:
   note: same-name persons in different counties are separate
   nodes.
 
+## Trust & Intelligence Engine, Phase 8 endpoints
+
+- `GET /v1/predictions` — per-topic predictions. `?topic=` restricts
+  to one topic (any name is accepted; an unknown topic comes back
+  insufficient, never a 400); without it all 7 known topics are
+  analysed. `?county=` restricts to documents naming the county
+  (unknown county is 400). Each entry carries the monthly series,
+  the least-squares slope (docs/month), the direction (rising /
+  falling / flat), the R7.1 linear forecast for the next month
+  (predicted count, confidence, basis), the monthly anomalies, and
+  an `insufficient_reason` when the history is under 2 months. The
+  response carries the disclaimer that a prediction is a
+  statistical extrapolation from past volume, never a fact about
+  the future.
+- `GET /v1/anomalies` — daily + monthly anomalies. `?topic=`
+  restricts to one topic; without it the daily anomalies cover all
+  topics and the monthly ones cover every known topic. Daily is the
+  last 30 days bucketed by day, |z| >= 2 against the other days,
+  all 30 days counted including zero-volume days; nothing is
+  flagged on a near-empty store (under 10 documents in the
+  window). Monthly reuses the R7.1 rule (|z| >= 2, 4+ months). An
+  anomaly is a flag for a human to look at, never a verdict about
+  why.
+- `GET /v1/risk` — per-county risk assessment. `?county=` is
+  required (missing or unknown county is 400); `?topic=` restricts
+  the anomaly and trend signals to one topic. Level is low /
+  elevated / high (score >= 0.6 high, >= 0.35 elevated) from four
+  signals — anomalies 35%, rising trends 25%, contradiction
+  density (events carrying at least one flag / events) 20%,
+  breaking-alert frequency (store-wide, labelled as such) 20% —
+  with a plain-words reason for every signal that contributed. An
+  assessment of conditions, never a prediction of a specific
+  event.
+
 ## Popular searches and freshness (Roadmap 6.4)
 
 - `GET /v1/popular?limit=N` returns the most-asked queries,

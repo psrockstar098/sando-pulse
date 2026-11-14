@@ -742,6 +742,72 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
+  /v1/predictions:
+    get:
+      tags: [intelligence]
+      summary: Per-topic predictions, Phase 8 (no auth)
+      parameters:
+        - name: topic
+          in: query
+          description: One topic (energy, economy, politics, society, health, sports, business); without it all known topics are analysed. An unknown topic comes back insufficient, never a 400.
+          schema:
+            type: string
+        - name: county
+          in: query
+          description: Restrict to documents naming the county (unknown county is 400).
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Per-topic trend, forecast and monthly anomalies, with the disclaimer that a prediction is a statistical extrapolation, never a fact.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+  /v1/anomalies:
+    get:
+      tags: [intelligence]
+      summary: Daily + monthly anomalies, Phase 8 (no auth)
+      parameters:
+        - name: topic
+          in: query
+          description: One topic; without it the daily anomalies cover all topics and the monthly ones cover every known topic.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Daily anomalies (last 30 days, |z| >= 2) and monthly anomalies (R7.1 rule). An anomaly is a flag for a human to look at, never a verdict about why.
+          content:
+            application/json:
+              schema:
+                type: object
+  /v1/risk:
+    get:
+      tags: [intelligence]
+      summary: Per-county risk assessment, Phase 8 (no auth)
+      parameters:
+        - name: county
+          in: query
+          required: true
+          description: The county to assess (missing or unknown county is 400).
+          schema:
+            type: string
+        - name: topic
+          in: query
+          description: Restrict the anomaly and trend signals to one topic.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Low / elevated / high with a score and plain-words reasons. An assessment of conditions, never a prediction of a specific event.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
   /v1/events:
     get:
       tags: [intelligence]

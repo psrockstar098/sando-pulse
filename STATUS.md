@@ -1738,3 +1738,103 @@ Spec: `~/workspace/sando-pulse-trust-intelligence-engine.md` — Phase 7
 - Person extraction returns surnames only ("Boakai", not "Joseph
   Boakai") — the static entity tables' behaviour, carried into the
   graph as-is.
+
+## Trust & Intelligence Engine — Phase 8 — COMPLETE 2026-11-14 ~21:25 GMT
+
+Spec: `~/workspace/sando-pulse-trust-intelligence-engine.md` — Phase 8
+("predictive intelligence", spec section 9). No migration.
+
+### What was built
+
+- `src/intelligence/prediction/trend_analyzer.zig`: monthly volume
+  series per topic (documents bucketed by published month, county
+  filter by title+text mention), least-squares slope → direction
+  rising / falling / flat (slope beyond ±0.5 docs/month), and the
+  R7.1 `linearForecast` for the next month (predicted count,
+  confidence, basis). Fewer than 2 months of history is
+  insufficient — the analysis says so, it never extrapolates from
+  one point. Known topics: energy, economy, politics, society,
+  health, sports, business; an unknown topic asked for by name is
+  analysed the same way and comes back insufficient, never a 400.
+- `src/intelligence/prediction/anomaly_detector.zig`: monthly
+  anomalies reuse the R7.1 rule (|z| >= 2 against the other months,
+  4+ months). DAILY anomalies are new: the last 30 days bucketed by
+  day (`events.dayOf`), same leave-one-out z-score, |z| >= 2, all 30
+  days counted including zero-volume days — a quiet day is real
+  data, not a gap — and nothing is flagged on a near-empty store
+  (fewer than 10 documents in the window).
+- `src/intelligence/prediction/risk_assessor.zig`: per-county (and
+  optional per-topic) risk from four signals — anomalies 35%,
+  rising trends 25%, contradiction density 20%, breaking-alert
+  frequency 20% — into low / elevated / high (score >= 0.6 high,
+  >= 0.35 elevated) with a plain-words reason for every signal that
+  contributed. An assessment of conditions, never a prediction of a
+  specific event — the response says so.
+- API (public, REST only): `GET /v1/predictions?topic=&county=`
+  (per-topic trend + forecast + monthly anomalies + the disclaimer
+  that a prediction is a statistical extrapolation, never a fact),
+  `GET /v1/anomalies?topic=` (daily + monthly), `GET
+  /v1/risk?county=` (required, 400 when missing or unknown) with
+  optional `?topic=`.
+- Docs: README (API table + Phase 8 section + test count), STATUS.md
+  (this section), docs/API.md, docs/openapi.yaml.
+
+### Verified 2026-11-14 ~21:10–21:25
+
+- `zig build` passes; `zig build test` **327/327 pass** (322 baseline
+  + 5 new: 2 trend analyzer, 2 anomaly detector, 1 risk assessor).
+- Smoke test on Postgres (port 19094; 133 docs / 50 events):
+  `/v1/predictions?topic=energy` → rising, slope 4 docs/month,
+  series 2026-10: 1, 2026-11: 5, forecast 2026-12: 9 docs,
+  confidence 1, no monthly anomalies; all 7 topics analysed,
+  every one rising (see the gap below); `/v1/anomalies` → 1 daily
+  (2026-11-12, 53 docs, z 9.4, spike) + 1 monthly (politics
+  2026-11, 53 docs, z 117, spike); `/v1/risk?county=Montserrado`
+  → low, score 0.14, "2 of 4 event(s) carry at least one
+  contradiction flag", "1 breaking alert(s)"; Nimba → low, 0.17,
+  "2 of 3 event(s)"; missing county 400, unknown county 400.
+- One real bug caught by the smoke test and fixed in this commit:
+  the risk contradiction density first used the raw pair count
+  (118 dissimilar-title pairs among 4 events) over the event count
+  — a pair count saturates any density. The numerator is now the
+  count of EVENTS carrying at least one flag (2 of 4), which is a
+  true 0..1 density.
+
+### Phase 8 honest gaps
+
+- **Every topic reads "rising" and every forecast's confidence is
+  1.0** on the current store: the history is two months (October:
+  1 doc, November: the rest) because the worker ingested everything
+  in a 2-day burst, so a 2-point line fits perfectly. That is the
+  R7.1 `linearForecast` behaviour, not a Phase 8 bug — but on a
+  store this young the predictions describe the ingest history
+  more than real-world volume, and the disclaimer in the payload
+  says so. Real forecasts need months of steady ingestion.
+- **The anomalies are the ingest burst, not news**: the 53-doc
+  day (2026-11-12) and the politics monthly spike are the day the
+  worker ran, not a real-world event. The anomaly is a flag for a
+  human to look at, never a verdict about why — and on this store
+  the "why" is the worker.
+- The daily-anomaly z-score treats the ingest burst as one
+  outlier day; as steady ingestion continues the baseline will
+  settle and the flag will mean more.
+- Risk's breaking-alert signal is store-wide (alerts carry no
+  county), labelled as such in the reason; the contradiction
+  density counts events with at least one flag, which is a coarse
+  signal — an event with one dissimilar pair counts the same as
+  one with many.
+- Spec section 9's "prediction" wording is kept only with the
+  disclaimer: nothing here predicts a specific event, and no
+  forecast is ever presented as a fact.
+
+## Trust & Intelligence Engine — Phases 2–8 — COMPLETE 2026-11-14
+
+All eight phases are built, verified, and committed locally (one
+commit per phase, Phase 1 pushed earlier as 07b8382, Phases 2–8
+local only — DO NOT PUSH until Dominic has seen the report and
+says go). Phase 2: live account monitoring (b98d063). Phase 3:
+evidence + verification (8d589c9). Phase 4: scoring + rankings
+(e134873). Phase 5: historical + recurring intelligence (28d8a12).
+Phase 6: Live Intelligence Action Engine (d30a8a6). Phase 7:
+knowledge graph + Decision Core (76fbc83). Phase 8: predictive
+intelligence (this commit). 327/327 tests.

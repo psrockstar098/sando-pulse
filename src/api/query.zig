@@ -22,6 +22,9 @@ const action_parser = @import("../intelligence/actions/query_parser.zig");
 const job_manager = @import("../intelligence/actions/job_manager.zig");
 const history_graph = @import("../intelligence/history/entity_graph.zig");
 const decision_core = @import("../intelligence/decision/decision_core.zig");
+const prediction_trends = @import("../intelligence/prediction/trend_analyzer.zig");
+const prediction_anomalies = @import("../intelligence/prediction/anomaly_detector.zig");
+const prediction_risk = @import("../intelligence/prediction/risk_assessor.zig");
 const monitor = @import("../intelligence/monitor/account_monitor.zig");
 
 pub const QueryRequest = struct {
@@ -1666,7 +1669,100 @@ pub fn buildHistoryResponse(
     });
 }
 
-/// Trust & Intelligence Engine, Phase 7: a Decision Core decision.
+/// Trust & Intelligence Engine, Phase 8: one topic's prediction
+/// entry for /v1/predictions.
+pub const PredictionEntry = struct {
+    analysis: prediction_trends.TrendAnalysis,
+    anomalies: []const forecast_mod.Anomaly,
+};
+
+/// Trust & Intelligence Engine, Phase 8: predictions per topic.
+/// Statistical extrapolations, never facts — the disclaimer is
+/// part of the payload.
+pub fn buildPredictionsResponse(
+    alloc: std.mem.Allocator,
+    req_id: []const u8,
+    topic: ?[]const u8,
+    county: ?[]const u8,
+    entries: []const PredictionEntry,
+) ![]u8 {
+    var list: std.ArrayList(struct {
+        topic: []const u8,
+        direction: []const u8,
+        slope_docs_per_month: f64,
+        series: []const trending.MonthCount,
+        forecast: ?forecast_mod.Forecast,
+        monthly_anomalies: []const forecast_mod.Anomaly,
+        insufficient_reason: ?[]const u8,
+    }) = .empty;
+    for (entries) |e| {
+        try list.append(alloc, .{
+            .topic = e.analysis.topic,
+            .direction = e.analysis.direction.toString(),
+            .slope_docs_per_month = e.analysis.slope,
+            .series = e.analysis.series,
+            .forecast = e.analysis.forecast,
+            .monthly_anomalies = e.anomalies,
+            .insufficient_reason = e.analysis.insufficient_reason,
+        });
+    }
+    return stringifyAlloc(alloc, .{
+        .topic = topic,
+        .county = county,
+        .total = list.items.len,
+        .predictions = list.items,
+        .disclaimer = "Predictions are statistical extrapolations from past volume, not facts about the future. A forecast says how much coverage a topic may get, never what will happen.",
+        .request_id = req_id,
+    });
+}
+
+/// Trust & Intelligence Engine, Phase 8: daily + monthly anomalies.
+pub fn buildAnomaliesResponse(
+    alloc: std.mem.Allocator,
+    req_id: []const u8,
+    topic: ?[]const u8,
+    daily: []const prediction_anomalies.DailyAnomaly,
+    monthly: []const forecast_mod.Anomaly,
+) ![]u8 {
+    var daily_list: std.ArrayList(struct {
+        date: []const u8,
+        doc_count: usize,
+        mean: f64,
+        stddev: f64,
+        z_score: f64,
+        direction: []const u8,
+    }) = .empty;
+    for (daily) |a| {
+        try daily_list.append(alloc, .{
+            .date = a.date,
+            .doc_count = a.doc_count,
+            .mean = a.mean,
+            .stddev = a.stddev,
+            .z_score = a.z_score,
+            .direction = a.direction,
+        });
+    }
+    return stringifyAlloc(alloc, .{
+        .topic = topic,
+        .daily = daily_list.items,
+        .monthly = monthly,
+        .note = "An anomaly is a flag for a human to look at — volume moved sharply — never a verdict about why.",
+        .request_id = req_id,
+    });
+}
+
+/// Trust & Intelligence Engine, Phase 8: a risk assessment.
+pub fn buildRiskResponse(alloc: std.mem.Allocator, req_id: []const u8, r: prediction_risk.RiskAssessment) ![]u8 {
+    return stringifyAlloc(alloc, .{
+        .county = r.county,
+        .topic = r.topic,
+        .level = r.level.toString(),
+        .score = r.score,
+        .reasons = r.reasons,
+        .note = "An assessment of conditions (anomalies, trends, contradictions, alerts) — never a prediction of a specific event.",
+        .request_id = req_id,
+    });
+}
 /// The reasoning is the audit trail — every rule that fired, what
 /// it saw, and what it concluded.
 pub fn buildDecisionResponse(alloc: std.mem.Allocator, req_id: []const u8, d: decision_core.Decision) ![]u8 {

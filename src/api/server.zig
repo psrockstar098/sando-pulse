@@ -17,6 +17,9 @@
 //!   GET  /v1/actions/watches public — standing watches (Phase 6)
 //!   POST /v1/decisions public — Decision Core assessment (Phase 7)
 //!   GET  /v1/graph public — knowledge-graph subgraphs (Phase 7)
+//!   GET  /v1/predictions public — per-topic predictions (Phase 8)
+//!   GET  /v1/anomalies public — daily + monthly anomalies (Phase 8)
+//!   GET  /v1/risk public — per-county risk assessment (Phase 8)
 //!   GET  /v1/events   public — persisted event clusters (Roadmap 3.4)
 //!   GET  /v1/trends   public — Geez + trending engine (Roadmap 4.2)
 //!   GET  /v1/forecast public — predictive trends (Roadmap 7.1)
@@ -63,6 +66,9 @@ const action_parser = @import("../intelligence/actions/query_parser.zig");
 const job_manager = @import("../intelligence/actions/job_manager.zig");
 const history_graph = @import("../intelligence/history/entity_graph.zig");
 const decision_core = @import("../intelligence/decision/decision_core.zig");
+const prediction_trends = @import("../intelligence/prediction/trend_analyzer.zig");
+const prediction_anomalies = @import("../intelligence/prediction/anomaly_detector.zig");
+const prediction_risk = @import("../intelligence/prediction/risk_assessor.zig");
 const events_intel = @import("../intelligence/events.zig");
 const monitor_mod = @import("../intelligence/monitor/account_monitor.zig");
 const fuzzy = @import("../engine/fuzzy.zig");
@@ -1993,6 +1999,144 @@ pub const Server = struct {
             return;
         }
 
+        if (method == .GET and std.mem.eql(u8, path, "/v1/predictions")) {
+            // Trust & Intelligence Engine, Phase 8: predictions per
+            // topic — monthly trend + linear forecast (R7.1) + monthly
+            // anomalies. `?topic=` (one topic, or all known topics)
+            // and `?county=` (restrict to documents naming the
+            // county). Statistical extrapolations, never facts — the
+            // disclaimer is part of the payload. Public.
+            const now = timex.nowSeconds(self.io);
+            _ = now;
+            const q = head.query;
+            const topic = queryParam(q, "topic");
+            const county = queryParam(q, "county");
+            if (county) |c| {
+                if (!trust_registry.Registry.isKnownCounty(c)) {
+                    self.respondError(req, alloc, req_id, .bad_request, "unknown_county", "No such county");
+                    return;
+                }
+            }
+            const docs = self.repo.scanDocuments(alloc, null, 500) catch &.{};
+            var topics: []const []const u8 = &prediction_trends.known_topics;
+            if (topic) |t| topics = &.{t};
+            var entries: std.ArrayList(query_json.PredictionEntry) = .empty;
+            for (topics) |t| {
+                const analysis = prediction_trends.analyzeTopic(alloc, docs, t, county) catch {
+                    self.respondError(req, alloc, req_id, .internal_server_error, "predict_failed", "Failed to analyse the topic");
+                    return;
+                };
+                const anomalies = prediction_anomalies.monthlyAnomalies(alloc, docs, t, county) catch {
+                    self.respondError(req, alloc, req_id, .internal_server_error, "predict_failed", "Failed to detect anomalies");
+                    return;
+                };
+                try entries.append(alloc, .{ .analysis = analysis, .anomalies = anomalies });
+            }
+            const body = try query_json.buildPredictionsResponse(alloc, req_id, topic, county, entries.items);
+            self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+            try respondJson(req, .ok, body, req_id);
+            return;
+        }
+
+        if (method == .GET and std.mem.eql(u8, path, "/v1/anomalies")) {
+            // Trust & Intelligence Engine, Phase 8: daily anomalies
+            // (last 30 days, |z| >= 2) + monthly anomalies (R7.1
+            // rule). `?topic=` restricts to one topic; without it
+            // the daily anomalies cover all topics and the monthly
+            // ones cover every known topic. Public.
+            const now = timex.nowSeconds(self.io);
+            const topic = queryParam(head.query, "topic");
+            const docs = self.repo.scanDocuments(alloc, null, 500) catch &.{};
+            const daily = prediction_anomalies.dailyAnomalies(alloc, docs, topic, null, now) catch {
+                self.respondError(req, alloc, req_id, .internal_server_error, "anomaly_failed", "Failed to detect daily anomalies");
+                return;
+            };
+            var monthly: std.ArrayList(forecast_mod.Anomaly) = .empty;
+            var topics: []const []const u8 = &prediction_trends.known_topics;
+            if (topic) |t| topics = &.{t};
+            for (topics) |t| {
+                const m = prediction_anomalies.monthlyAnomalies(alloc, docs, t, null) catch {
+                    self.respondError(req, alloc, req_id, .internal_server_error, "anomaly_failed", "Failed to detect monthly anomalies");
+                    return;
+                };
+                for (m) |a| try monthly.append(alloc, a);
+            }
+            const body = try query_json.buildAnomaliesResponse(alloc, req_id, topic, daily, monthly.items);
+            self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+            try respondJson(req, .ok, body, req_id);
+            return;
+        }
+
+        if (method == .GET and std.mem.eql(u8, path, "/v1/risk")) {
+            // Trust & Intelligence Engine, Phase 8: risk assessment
+            // for one county (optionally one topic): anomalies +
+            // rising trends + contradiction density + breaking-alert
+            // frequency → low / elevated / high with plain-words
+            // reasons. An assessment of conditions, never a
+            // prediction of a specific event. `?county=` is required.
+            // Public.
+            const now = timex.nowSeconds(self.io);
+            const county = queryParam(head.query, "county") orelse {
+                self.respondError(req, alloc, req_id, .bad_request, "missing_param", "Pass ?county=<name>");
+                return;
+            };
+            if (!trust_registry.Registry.isKnownCounty(county)) {
+                self.respondError(req, alloc, req_id, .bad_request, "unknown_county", "No such county");
+                return;
+            }
+            const topic = queryParam(head.query, "topic");
+            const docs = self.repo.scanDocuments(alloc, null, 500) catch &.{};
+            const daily = prediction_anomalies.dailyAnomalies(alloc, docs, topic, county, now) catch &.{};
+            var monthly_n: usize = 0;
+            var topics: []const []const u8 = &prediction_trends.known_topics;
+            if (topic) |t| topics = &.{t};
+            var rising: usize = 0;
+            for (topics) |t| {
+                const m = prediction_anomalies.monthlyAnomalies(alloc, docs, t, county) catch &.{};
+                monthly_n += m.len;
+                const a = prediction_trends.analyzeTopic(alloc, docs, t, county) catch continue;
+                if (a.direction == .rising) rising += 1;
+            }
+            var flags_n: usize = 0;
+            var events_n: usize = 0;
+            var alerts_n: usize = 0;
+            if (self.knowledge) |k| {
+                const with_counties = self.loadEventsWithCounties(alloc, k) catch &.{};
+                for (with_counties) |e| {
+                    var in_county = false;
+                    for (e.counties) |c| {
+                        if (std.ascii.eqlIgnoreCase(c, county)) in_county = true;
+                    }
+                    if (!in_county) continue;
+                    events_n += 1;
+                    const edocs = k.eventDocs(alloc, e.event.id) catch continue;
+                    const flags = events_intel.detectContradictionFlags(alloc, edocs) catch &.{};
+                    // Density numerator is the EVENT count, not the
+                    // pair count: a flag is a dissimilar title pair,
+                    // so raw pair counts saturate any density.
+                    if (flags.len > 0) flags_n += 1;
+                }
+                const alerts_list = alerts_mod.computeBreakingAlerts(alloc, k, now) catch &.{};
+                alerts_n = alerts_list.len;
+            }
+            const assessment = prediction_risk.assessRisk(alloc, county, topic, .{
+                .daily_anomalies = daily.len,
+                .monthly_anomalies = monthly_n,
+                .rising_topics = rising,
+                .topics_total = topics.len,
+                .contradiction_flags = flags_n,
+                .events_total = events_n,
+                .breaking_alerts = alerts_n,
+            }) catch {
+                self.respondError(req, alloc, req_id, .internal_server_error, "risk_failed", "Failed to assess risk");
+                return;
+            };
+            const body = try query_json.buildRiskResponse(alloc, req_id, assessment);
+            self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+            try respondJson(req, .ok, body, req_id);
+            return;
+        }
+
         if (method == .GET and std.mem.eql(u8, path, "/v1/events")) {
             if (self.knowledge) |k| {
                 // Detail: /v1/events?id=<event_id> — the event plus
@@ -2866,6 +3010,7 @@ pub const Server = struct {
                 std.mem.eql(u8, path, "/v1/actions/jobs") or std.mem.eql(u8, path, "/v1/actions/watches") or
                 std.mem.eql(u8, path, "/v1/actions") or
                 std.mem.eql(u8, path, "/v1/decisions") or std.mem.eql(u8, path, "/v1/graph") or
+                std.mem.eql(u8, path, "/v1/predictions") or std.mem.eql(u8, path, "/v1/anomalies") or std.mem.eql(u8, path, "/v1/risk") or
                 std.mem.eql(u8, path, "/v1/events") or std.mem.eql(u8, path, "/v1/trends") or
                 std.mem.eql(u8, path, "/v1/forecast") or std.mem.eql(u8, path, "/v1/alerts") or
                 std.mem.eql(u8, path, "/v1/social") or
