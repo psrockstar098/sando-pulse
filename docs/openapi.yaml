@@ -632,6 +632,62 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
+  /v1/actions:
+    post:
+      tags: [intelligence]
+      summary: Run a plain-words action, Phase 6 (no auth)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                request:
+                  type: string
+                  example: "What is the latest from New Dawn?"
+      responses:
+        "201":
+          description: The job, already done (or failed) with its result embedded.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+  /v1/actions/jobs:
+    get:
+      tags: [intelligence]
+      summary: Poll an action job, Phase 6 (no auth)
+      parameters:
+        - name: id
+          in: query
+          required: true
+          description: Job id, e.g. job-1 (unknown id is 404).
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The job with its kind, status and embedded result.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/actions/watches:
+    get:
+      tags: [intelligence]
+      summary: Standing watches, Phase 6 (no auth)
+      responses:
+        "200":
+          description: Recorded watches. There is no push channel — the client re-checks this list.
+          content:
+            application/json:
+              schema:
+                type: object
   /v1/events:
     get:
       tags: [intelligence]

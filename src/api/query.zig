@@ -18,6 +18,8 @@ const trust_corroboration = @import("../intelligence/trust/corroboration.zig");
 const trust_score = @import("../intelligence/trust/credibility_score.zig");
 const history_store = @import("../intelligence/history/event_store.zig");
 const history_recurring = @import("../intelligence/history/recurring_events.zig");
+const action_parser = @import("../intelligence/actions/query_parser.zig");
+const job_manager = @import("../intelligence/actions/job_manager.zig");
 const monitor = @import("../intelligence/monitor/account_monitor.zig");
 
 pub const QueryRequest = struct {
@@ -794,6 +796,11 @@ pub fn buildAlertsResponse(
     now: i64,
     alerts: []const alerts_mod.MergedAlert,
     stream_available: bool,
+    /// Trust & Intelligence Engine, Phase 6: standing watches
+    /// recorded through the Action Engine. There is no push channel
+    /// — a watch is surfaced here and on /v1/actions/watches so the
+    /// client can re-check it.
+    watches: []const job_manager.Watch,
 ) ![]u8 {
     var list: std.ArrayList(struct {
         kind: []const u8,
@@ -817,12 +824,28 @@ pub fn buildAlertsResponse(
             .last_seen = a.last_seen,
         });
     }
+    var watch_list: std.ArrayList(struct {
+        id: []const u8,
+        keywords: []const u8,
+        county: ?[]const u8,
+        created_at: []const u8,
+    }) = .empty;
+    for (watches) |w| {
+        try watch_list.append(alloc, .{
+            .id = w.id,
+            .keywords = w.keywords,
+            .county = w.county,
+            .created_at = try formatIso(alloc, w.created_at),
+        });
+    }
     return stringifyAlloc(alloc, .{
         .alerts = list.items,
         .stream = alerts_mod.alert_stream,
         .stream_group = alerts_mod.alert_group,
         .stream_available = stream_available,
         .computed_at = now,
+        .watches = watch_list.items,
+        .watches_note = "Standing watches have no push channel — check /v1/actions/watches or re-run the request to see whether the story moved.",
         .request_id = req_id,
     });
 }
@@ -1641,7 +1664,206 @@ pub fn buildHistoryResponse(
     });
 }
 
-/// Trust & Intelligence Engine, Phase 5: events similar to one event.
+/// Trust & Intelligence Engine, Phase 6: one finished action job.
+/// The result is the action's own response JSON, embedded as an
+/// object (not a string).
+pub fn buildJobResponse(alloc: std.mem.Allocator, req_id: []const u8, job: job_manager.Job) ![]u8 {
+    return stringifyAlloc(alloc, .{
+        .id = job.id,
+        .request = job.request,
+        .kind = job.kind.toString(),
+        .status = job.status.toString(),
+        .result = job.result,
+        .@"error" = job.err,
+        .created_at = try formatIso(alloc, job.created_at),
+        .finished_at = if (job.finished_at) |f| try formatIso(alloc, f) else null,
+        .request_id = req_id,
+    });
+}
+
+/// Trust & Intelligence Engine, Phase 6: standing watches.
+pub fn buildWatchesResponse(alloc: std.mem.Allocator, req_id: []const u8, watches: []const job_manager.Watch) ![]u8 {
+    var list: std.ArrayList(struct {
+        id: []const u8,
+        keywords: []const u8,
+        county: ?[]const u8,
+        created_at: []const u8,
+    }) = .empty;
+    for (watches) |w| {
+        try list.append(alloc, .{
+            .id = w.id,
+            .keywords = w.keywords,
+            .county = w.county,
+            .created_at = try formatIso(alloc, w.created_at),
+        });
+    }
+    return stringifyAlloc(alloc, .{
+        .total = list.items.len,
+        .watches = list.items,
+        .note = "Watches have no push channel — re-check this list or re-run the request to see whether the story moved.",
+        .request_id = req_id,
+    });
+}
+
+/// Trust & Intelligence Engine, Phase 6: check_source_latest result.
+pub fn buildActionLatestResponse(
+    alloc: std.mem.Allocator,
+    req_id: []const u8,
+    source_id: ?[]const u8,
+    docs: []const types.Document,
+) ![]u8 {
+    var list: std.ArrayList(struct {
+        id: []const u8,
+        title: []const u8,
+        source_id: []const u8,
+        source_name: []const u8,
+        published_at: []const u8,
+        url: []const u8,
+    }) = .empty;
+    for (docs) |d| {
+        try list.append(alloc, .{
+            .id = d.id,
+            .title = d.title,
+            .source_id = d.source_id,
+            .source_name = d.source_name,
+            .published_at = try formatIso(alloc, knowledge.docTs(d)),
+            .url = d.url,
+        });
+    }
+    return stringifyAlloc(alloc, .{
+        .action = "check_source_latest",
+        .source_id = source_id,
+        .total = list.items.len,
+        .documents = list.items,
+        .request_id = req_id,
+    });
+}
+
+/// Trust & Intelligence Engine, Phase 6: whats_happening result.
+pub fn buildActionHappeningResponse(
+    alloc: std.mem.Allocator,
+    req_id: []const u8,
+    topic: ?[]const u8,
+    county: ?[]const u8,
+    events: []const history_store.EventWithCounties,
+) ![]u8 {
+    var list: std.ArrayList(struct {
+        id: []const u8,
+        title: []const u8,
+        topic: []const u8,
+        first_seen: []const u8,
+        doc_count: usize,
+        distinct_sources: usize,
+        counties: []const []const u8,
+    }) = .empty;
+    for (events) |e| {
+        try list.append(alloc, .{
+            .id = e.event.id,
+            .title = e.event.title,
+            .topic = e.event.topic,
+            .first_seen = try formatIso(alloc, e.event.first_seen),
+            .doc_count = e.event.doc_count,
+            .distinct_sources = e.event.distinct_sources,
+            .counties = e.counties,
+        });
+    }
+    return stringifyAlloc(alloc, .{
+        .action = "whats_happening",
+        .topic = topic,
+        .county = county,
+        .total = list.items.len,
+        .events = list.items,
+        .request_id = req_id,
+    });
+}
+
+/// Trust & Intelligence Engine, Phase 6: check_status result.
+pub fn buildActionStatusResponse(
+    alloc: std.mem.Allocator,
+    req_id: []const u8,
+    documents: usize,
+    sources_enabled: usize,
+    sources_total: usize,
+    store: []const u8,
+    last_success_at: ?i64,
+) ![]u8 {
+    return stringifyAlloc(alloc, .{
+        .action = "check_status",
+        .status = "ok",
+        .documents = documents,
+        .sources_enabled = sources_enabled,
+        .sources_total = sources_total,
+        .store = store,
+        .last_success_at = if (last_success_at) |t| try formatIso(alloc, t) else null,
+        .request_id = req_id,
+    });
+}
+
+/// Trust & Intelligence Engine, Phase 6: history_person result.
+/// Same-name people are NOT disambiguated — the response says so.
+pub fn buildActionPersonResponse(
+    alloc: std.mem.Allocator,
+    req_id: []const u8,
+    person: []const u8,
+    events: []const history_store.EventWithCounties,
+) ![]u8 {
+    var list: std.ArrayList(struct {
+        id: []const u8,
+        title: []const u8,
+        topic: []const u8,
+        first_seen: []const u8,
+        doc_count: usize,
+    }) = .empty;
+    for (events) |e| {
+        try list.append(alloc, .{
+            .id = e.event.id,
+            .title = e.event.title,
+            .topic = e.event.topic,
+            .first_seen = try formatIso(alloc, e.event.first_seen),
+            .doc_count = e.event.doc_count,
+        });
+    }
+    return stringifyAlloc(alloc, .{
+        .action = "history_person",
+        .person = person,
+        .total = list.items.len,
+        .events = list.items,
+        .note = "These are events whose documents mention that name. People sharing a name are not disambiguated — entity resolution is a later phase.",
+        .request_id = req_id,
+    });
+}
+
+/// Trust & Intelligence Engine, Phase 6: watch_story result.
+pub fn buildActionWatchResponse(
+    alloc: std.mem.Allocator,
+    req_id: []const u8,
+    watch: job_manager.Watch,
+) ![]u8 {
+    return stringifyAlloc(alloc, .{
+        .action = "watch_story",
+        .watch_id = watch.id,
+        .keywords = watch.keywords,
+        .county = watch.county,
+        .created_at = try formatIso(alloc, watch.created_at),
+        .note = "Watch recorded. There is no push channel — check /v1/actions/watches or /v1/alerts to see whether the story moved.",
+        .request_id = req_id,
+    });
+}
+
+/// Trust & Intelligence Engine, Phase 6: an unparsed request.
+pub fn buildActionUnknownResponse(alloc: std.mem.Allocator, req_id: []const u8, message: []const u8) ![]u8 {
+    return stringifyAlloc(alloc, .{
+        .action = "unknown",
+        .message = message,
+        .suggestions = [_][]const u8{
+            "what is the latest from New Dawn?",
+            "is it true that fuel prices rose?",
+            "what is happening in Bong?",
+            "watch for fuel shortages in Bong",
+        },
+        .request_id = req_id,
+    });
+}
 pub fn buildSimilarResponse(
     alloc: std.mem.Allocator,
     req_id: []const u8,

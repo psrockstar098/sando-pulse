@@ -290,6 +290,24 @@ Every `POST /v1/query` 200 carries, alongside the answer:
   county, most similar first, each with its `reason`. Missing
   `event` is 400, unknown id is 404.
 
+## Trust & Intelligence Engine, Phase 6 endpoints
+
+- `POST /v1/actions` — run a plain-words request. Body
+  `{"request": "..."}`. The request is parsed into a typed action
+  (latest from a source, verify a claim, monitor an account, what
+  is happening, system status, a person's history, watch a story)
+  and run synchronously — the returned job (201) is already `done`
+  (or `failed`) with its `result` embedded. An unrecognized request
+  is never guessed: the job completes with a plain-words message and
+  example requests. Missing/empty `request` or invalid JSON is 400.
+- `GET /v1/actions/jobs?id=job-<n>` — poll a job: its kind, status,
+  result (embedded as an object when done) or error, created and
+  finished times. Unknown id is 404; missing `id` is 400. Jobs are
+  in-memory and forgotten on restart.
+- `GET /v1/actions/watches` — standing watches (id, keywords,
+  county, created_at) with the note that there is no push channel.
+  Watches are also listed on `GET /v1/alerts`.
+
 ## Popular searches and freshness (Roadmap 6.4)
 
 - `GET /v1/popular?limit=N` returns the most-asked queries,

@@ -12,6 +12,9 @@
 //!   GET  /v1/rankings public — per-county source ranking (Phase 4)
 //!   GET  /v1/history public — historical search + recurring stories (Phase 5)
 //!   GET  /v1/history/similar public — events similar to one event (Phase 5)
+//!   POST /v1/actions public — run a plain-words action, returns a job (Phase 6)
+//!   GET  /v1/actions/jobs public — poll a job by ?id= (Phase 6)
+//!   GET  /v1/actions/watches public — standing watches (Phase 6)
 //!   GET  /v1/events   public — persisted event clusters (Roadmap 3.4)
 //!   GET  /v1/trends   public — Geez + trending engine (Roadmap 4.2)
 //!   GET  /v1/forecast public — predictive trends (Roadmap 7.1)
@@ -54,6 +57,8 @@ const trust_corroboration = @import("../intelligence/trust/corroboration.zig");
 const trust_score = @import("../intelligence/trust/credibility_score.zig");
 const history_store = @import("../intelligence/history/event_store.zig");
 const history_recurring = @import("../intelligence/history/recurring_events.zig");
+const action_parser = @import("../intelligence/actions/query_parser.zig");
+const job_manager = @import("../intelligence/actions/job_manager.zig");
 const events_intel = @import("../intelligence/events.zig");
 const monitor_mod = @import("../intelligence/monitor/account_monitor.zig");
 const fuzzy = @import("../engine/fuzzy.zig");
@@ -166,6 +171,10 @@ pub const Server = struct {
     /// county categorization. Static (the 12 real sources) with a
     /// history log seeded at boot. Always present.
     trust_registry: *trust_registry.Registry,
+    /// Trust & Intelligence Engine, Phase 6: in-memory job + watch
+    /// store for the Action Engine. Bounded (100 jobs, 50 watches),
+    /// forgotten on restart. Always present.
+    actions: *job_manager.JobStore,
     /// Process environment map, for connector availability checks
     /// (tokens live in env vars). Null in tests — connectors then
     /// report unavailable with their reasons.
@@ -724,6 +733,174 @@ pub const Server = struct {
             }
         }
         return trust_score.scoreAll(alloc, docs.items, evts.items, now);
+    }
+
+    /// Trust & Intelligence Engine, Phase 6: run a parsed action
+    /// synchronously and return its result JSON. The caller stores
+    /// the result on the job. An error here fails the job with a
+    /// plain-words reason (the caller converts it).
+    fn executeAction(self: *Server, alloc: std.mem.Allocator, action: action_parser.ParsedAction, now: i64) ![]u8 {
+        // A request id is not available here; use a fixed one — the
+        // job response carries the real request id.
+        const req_id = "action";
+        switch (action.kind) {
+            .check_source_latest => {
+                const scanned = self.repo.scanDocuments(alloc, null, 500) catch &.{};
+                var latest: std.ArrayList(types.Document) = .empty;
+                for (scanned) |d| {
+                    if (latest.items.len >= 5) break;
+                    if (action.source_id) |sid| {
+                        if (!std.mem.eql(u8, d.source_id, sid)) continue;
+                    }
+                    try latest.append(alloc, d);
+                }
+                return query_json.buildActionLatestResponse(alloc, req_id, action.source_id, latest.items);
+            },
+            .verify_claim => {
+                const claim = action.claim orelse return error.MissingClaim;
+                var enabled: std.ArrayList([]const u8) = .empty;
+                for (sources.sources) |s| {
+                    if (s.enabled) try enabled.append(alloc, s.id);
+                }
+                const p = planner.plan(alloc, claim, enabled.items, now, self.cfg.tz_offset_minutes) catch {
+                    return error.PlannerFailed;
+                };
+                var inputs: std.ArrayList(trust_corroboration.EvidenceInput) = .empty;
+                var newest: i64 = now;
+                if (p.terms.len > 0) {
+                    const docs = self.repo.search(alloc, .{ .terms = p.terms, .limit = 20 }) catch {
+                        return error.SearchFailed;
+                    };
+                    for (docs) |d| {
+                        try inputs.append(alloc, .{
+                            .source_id = d.source_id,
+                            .source_name = d.source_name,
+                            .title = d.title,
+                            .url = d.url,
+                            .published_at = knowledge.docTs(d),
+                            .reliability = d.reliability,
+                        });
+                    }
+                    if (inputs.items.len > 0) {
+                        var m: i64 = inputs.items[0].published_at;
+                        for (inputs.items) |inp| {
+                            if (inp.published_at > m) m = inp.published_at;
+                        }
+                        newest = m;
+                    }
+                }
+                const rec = trust_corroboration.assess(alloc, claim, inputs.items, "reported", false, newest, now, null) catch {
+                    return error.AssessFailed;
+                };
+                return query_json.buildEvidenceResponse(alloc, req_id, rec);
+            },
+            .monitor_account => {
+                const sid = action.source_id orelse return error.NoAccountNamed;
+                // The Facebook connector is not a registry source:
+                // report its status directly (available or not, with
+                // the reason) and no RSS statuses.
+                if (std.mem.eql(u8, sid, "facebook")) {
+                    const interval_s: i64 = @intCast(@max(60, self.cfg.ingest_interval_s));
+                    var fb_json: ?query_json.FacebookMonitorJson = null;
+                    if (self.facebook) |fb| {
+                        fb_json = .{
+                            .available = fb.validate() == null,
+                            .reason = fb.validate(),
+                            .registered_pages = fb.registeredPages(),
+                            .pending_pages = fb.pendingPages(),
+                            .pages_polled_total = fb.pages_polled_total,
+                            .pages_failed_total = fb.pages_failed_total,
+                            .notifications_pending = fb.pendingNotificationCount(alloc),
+                        };
+                    } else {
+                        fb_json = .{
+                            .available = false,
+                            .reason = "no Facebook connector configured",
+                            .registered_pages = 0,
+                            .pending_pages = 0,
+                            .pages_polled_total = 0,
+                            .pages_failed_total = 0,
+                            .notifications_pending = 0,
+                        };
+                    }
+                    return query_json.buildMonitorResponse(alloc, req_id, &.{}, fb_json, interval_s);
+                }
+                var src: ?sources.Source = null;
+                for (sources.sources) |s| {
+                    if (std.mem.eql(u8, s.id, sid)) src = s;
+                }
+                const source = src orelse return error.NoAccountNamed;
+                const interval_s: i64 = @intCast(@max(60, self.cfg.ingest_interval_s));
+                const health = if (self.knowledge) |k| k.getSourceHealth(alloc, sid) catch null else null;
+                var latest: ?monitor_mod.LatestDoc = null;
+                const scanned = self.repo.scanDocuments(alloc, null, 500) catch &.{};
+                for (scanned) |d| {
+                    if (latest != null) break;
+                    if (std.mem.eql(u8, d.source_id, sid)) {
+                        latest = .{ .title = d.title, .url = d.url, .fetched_at = d.fetched_at };
+                    }
+                }
+                const status = monitor_mod.statusFromHealth(source, health, latest, now, interval_s);
+                return query_json.buildMonitorResponse(alloc, req_id, &.{status}, null, interval_s);
+            },
+            .whats_happening => {
+                if (self.knowledge) |k| {
+                    const with_counties = try self.loadEventsWithCounties(alloc, k);
+                    const filtered = history_store.searchHistory(alloc, with_counties, null, null, action.county) catch {
+                        return error.HistoryFailed;
+                    };
+                    var kept: std.ArrayList(history_store.EventWithCounties) = .empty;
+                    for (filtered) |e| {
+                        if (kept.items.len >= 10) break;
+                        if (action.topic) |t| {
+                            if (!std.mem.eql(u8, e.event.topic, t)) continue;
+                        }
+                        try kept.append(alloc, e);
+                    }
+                    return query_json.buildActionHappeningResponse(alloc, req_id, action.topic, action.county, kept.items);
+                }
+                return error.StoreUnavailable;
+            },
+            .check_status => {
+                var last_success: ?i64 = null;
+                if (self.knowledge) |k| {
+                    for (sources.sources) |s| {
+                        const h = k.getSourceHealth(alloc, s.id) catch null;
+                        if (h) |hh| {
+                            if (hh.last_success_at) |t| {
+                                if (last_success == null or t > last_success.?) last_success = t;
+                            }
+                        }
+                    }
+                }
+                return query_json.buildActionStatusResponse(alloc, req_id, self.repo.countDocuments(), sources.enabledCount(), sources.sources.len, self.store_name, last_success);
+            },
+            .history_person => {
+                const name = action.person orelse return error.NoPersonNamed;
+                const lower_name = try std.ascii.allocLowerString(alloc, name);
+                if (self.knowledge) |k| {
+                    const all = k.listEvents(alloc, 100) catch &.{};
+                    var matches: std.ArrayList(history_store.EventWithCounties) = .empty;
+                    for (all) |e| {
+                        if (matches.items.len >= 10) break;
+                        const lower_title = try std.ascii.allocLowerString(alloc, e.title);
+                        defer alloc.free(lower_title);
+                        if (std.mem.indexOf(u8, lower_title, lower_name) == null) continue;
+                        try matches.append(alloc, .{ .event = e, .counties = &.{} });
+                    }
+                    return query_json.buildActionPersonResponse(alloc, req_id, name, matches.items);
+                }
+                return error.StoreUnavailable;
+            },
+            .watch_story => {
+                const keywords = action.watch_keywords orelse return error.NoKeywords;
+                const watch = try self.actions.addWatch(keywords, action.county, now);
+                return query_json.buildActionWatchResponse(alloc, req_id, watch.*);
+            },
+            .unknown => {
+                return query_json.buildActionUnknownResponse(alloc, req_id, action.message);
+            },
+        }
     }
 
     /// Record each computed score in the registry history when it
@@ -1616,6 +1793,92 @@ pub const Server = struct {
             return;
         }
 
+        if (method == .POST and std.mem.eql(u8, path, "/v1/actions")) {
+            // Trust & Intelligence Engine, Phase 6: Live Intelligence
+            // Action Engine. Body {"request": "..."} — a plain-words
+            // request parsed into a typed action and run
+            // SYNCHRONOUSLY; the job is already done (or failed)
+            // when this returns. Polling GET /v1/actions/jobs?id=
+            // re-fetches the finished result. Public (read-only over
+            // public data; jobs and watches are bounded in-memory).
+            const now = timex.nowSeconds(self.io);
+            const raw = readBody(req, alloc) catch {
+                self.respondError(req, alloc, req_id, .bad_request, "bad_body", "Request body required");
+                return;
+            };
+            const parsed_json = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch {
+                self.respondError(req, alloc, req_id, .bad_request, "bad_json", "Request body is not valid JSON");
+                return;
+            };
+            defer parsed_json.deinit();
+            if (parsed_json.value != .object) {
+                self.respondError(req, alloc, req_id, .bad_request, "bad_json", "Request body must be a JSON object");
+                return;
+            }
+            const request_val = parsed_json.value.object.get("request") orelse {
+                self.respondError(req, alloc, req_id, .bad_request, "missing_request", "Body must contain {\"request\": \"...\"}");
+                return;
+            };
+            if (request_val != .string or request_val.string.len == 0) {
+                self.respondError(req, alloc, req_id, .bad_request, "missing_request", "Body must contain {\"request\": \"...\"}");
+                return;
+            }
+            const action = action_parser.parse(alloc, request_val.string) catch {
+                self.respondError(req, alloc, req_id, .internal_server_error, "parse_failed", "Failed to parse the request");
+                return;
+            };
+            const job = self.actions.createJob(request_val.string, action.kind, now) catch {
+                self.respondError(req, alloc, req_id, .internal_server_error, "job_failed", "Failed to create the job");
+                return;
+            };
+            const result = self.executeAction(alloc, action, now) catch |err| {
+                const reason: []const u8 = switch (err) {
+                    error.NoAccountNamed => "No account was named — say which account, for example \"monitor the FrontPage Africa account\" or \"monitor facebook\".",
+                    error.NoPersonNamed => "No person was named — add the name, for example \"who is Joseph Boakai?\".",
+                    error.NoKeywords => "Nothing to watch — say what to watch for, for example \"watch for fuel shortages in Bong\".",
+                    else => "The action could not run — the store may be unavailable. Try again.",
+                };
+                self.actions.failJob(job, reason, now);
+                const body = try query_json.buildJobResponse(alloc, req_id, job.*);
+                self.metrics.observeRequest(201, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+                try respondJson(req, .created, body, req_id);
+                return;
+            };
+            self.actions.completeJob(job, result, now);
+            const body = try query_json.buildJobResponse(alloc, req_id, job.*);
+            self.metrics.observeRequest(201, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+            try respondJson(req, .created, body, req_id);
+            return;
+        }
+
+        if (method == .GET and std.mem.eql(u8, path, "/v1/actions/jobs")) {
+            // Trust & Intelligence Engine, Phase 6: poll a job by id
+            // (?id=job-<n>). The result is embedded when done.
+            // Public.
+            if (queryParam(head.query, "id")) |jid| {
+                const job = self.actions.getJob(jid) orelse {
+                    self.respondError(req, alloc, req_id, .not_found, "job_not_found", "No such job (jobs are forgotten on restart)");
+                    return;
+                };
+                const body = try query_json.buildJobResponse(alloc, req_id, job.*);
+                self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+                try respondJson(req, .ok, body, req_id);
+                return;
+            }
+            self.respondError(req, alloc, req_id, .bad_request, "missing_param", "Pass ?id=job-<n>");
+            return;
+        }
+
+        if (method == .GET and std.mem.eql(u8, path, "/v1/actions/watches")) {
+            // Trust & Intelligence Engine, Phase 6: standing watches.
+            // No push channel exists — this list (and /v1/alerts) is
+            // how a watch is checked. Public.
+            const body = try query_json.buildWatchesResponse(alloc, req_id, self.actions.listWatches());
+            self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+            try respondJson(req, .ok, body, req_id);
+            return;
+        }
+
         if (method == .GET and std.mem.eql(u8, path, "/v1/events")) {
             if (self.knowledge) |k| {
                 // Detail: /v1/events?id=<event_id> — the event plus
@@ -1846,7 +2109,7 @@ pub const Server = struct {
             if (self.knowledge) |k| {
                 alerts_list = alerts_mod.computeBreakingAlerts(alloc, k, now) catch &.{};
             }
-            const body = try query_json.buildAlertsResponse(alloc, req_id, now, alerts_list, self.redis != null);
+            const body = try query_json.buildAlertsResponse(alloc, req_id, now, alerts_list, self.redis != null, self.actions.listWatches());
             self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
             try respondJson(req, .ok, body, req_id);
             return;
@@ -2486,6 +2749,8 @@ pub const Server = struct {
                 std.mem.eql(u8, path, "/v1/evidence") or std.mem.eql(u8, path, "/v1/claims") or
                 std.mem.eql(u8, path, "/v1/sources/scores") or std.mem.eql(u8, path, "/v1/rankings") or
                 std.mem.eql(u8, path, "/v1/history") or std.mem.eql(u8, path, "/v1/history/similar") or
+                std.mem.eql(u8, path, "/v1/actions/jobs") or std.mem.eql(u8, path, "/v1/actions/watches") or
+                std.mem.eql(u8, path, "/v1/actions") or
                 std.mem.eql(u8, path, "/v1/events") or std.mem.eql(u8, path, "/v1/trends") or
                 std.mem.eql(u8, path, "/v1/forecast") or std.mem.eql(u8, path, "/v1/alerts") or
                 std.mem.eql(u8, path, "/v1/social") or

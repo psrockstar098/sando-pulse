@@ -80,6 +80,9 @@ published**. The API container runs migrations on boot.
 | GET | `/v1/rankings` | no | Per-county source ranking, top 20 of up to 50 registered candidates (Trust & Intelligence Engine, Phase 4): `?county=` required |
 | GET | `/v1/history` | no | Historical event search (Trust & Intelligence Engine, Phase 5): `?query=`, `?year=`, `?county=`; monthly timeline + recurring (topic, county) groups |
 | GET | `/v1/history/similar` | no | Events similar to one event (Trust & Intelligence Engine, Phase 5): `?event=<id>` |
+| POST | `/v1/actions` | no | Run a plain-words action, returns a finished job (Trust & Intelligence Engine, Phase 6): body `{"request": "..."}` |
+| GET | `/v1/actions/jobs` | no | Poll an action job (Trust & Intelligence Engine, Phase 6): `?id=job-<n>` |
+| GET | `/v1/actions/watches` | no | Standing watches (Trust & Intelligence Engine, Phase 6) |
 | GET | `/v1/trends` | no | Geez + geo trends; carries `computed_at` + `stale` (Roadmap 6.4) |
 | GET | `/v1/briefing` | no | Precomputed briefing; carries `cached` + `stale` (Roadmap 6.4) |
 | GET | `/v1/popular` | no | Most-asked queries with counts (Roadmap 6.4) |
@@ -224,6 +227,7 @@ Live account monitoring (spec: `~/workspace/sando-pulse-trust-intelligence-engin
 - **Evidence** (`GET /v1/evidence?event=<id>` or `?claim=<text>`, `GET /v1/claims?event=<id>` — Phase 3): claim extraction (title + lead sentence, copied from the document, never generated) and an evidence assessment per claim — `verified` (4+ independent sources agree, no flags), `corroborated` (2–3 sources), `partially_confirmed` (publisher corrected part of the story), `unconfirmed` (one source or none), `disputed` (contradiction flags among the supporting documents, or the publisher retracted the report), `outdated` (a newer report on the same topic exists and this one is over 30 days old). Each record cites its supporting documents and flags with a plain-words explanation and a documented confidence formula — and there is deliberately NO `false` status: calling a claim false is a verdict, and Pulse never issues verdicts (see STATUS.md).
 - **Scores + rankings** (`GET /v1/sources/scores`, `GET /v1/rankings?county=` — Phase 4): credibility scores computed on demand from the last 30 days of documents + events. Weights: accuracy 30%, corroboration 20%, evidence 15%, original reporting 10%, timeliness 10%, corrections 10%, local knowledge 5%. Rating 1–5 from the weighted total; a source with fewer than 5 documents in the window is provisional (rating null, reason stated). Score changes are written to the registry history log (`score_changed`), so a source can see why its score moved. Rankings cover registered sources only, top 20 per county — a county with no registered sources ranks nothing, honestly.
 - **History** (`GET /v1/history?query=&year=&county=`, `GET /v1/history/similar?event=<id>` — Phase 5): historical search over the persisted events (the R7.5 event grouping, read back). An event counts for a county when at least one of its documents mentions it. The response also carries a monthly timeline of the matches and the recurring (topic, county) groups — a story that shows up in two or more distinct months. Similar events match by title similarity (>= 0.5) or the same topic in a shared county. Never grouped by person name alone (entity resolution is Phase 7).
+- **Action Engine** (`POST /v1/actions`, `GET /v1/actions/jobs?id=`, `GET /v1/actions/watches` — Phase 6): plain-words requests become typed actions — latest from a source, verify a claim, monitor an account, what is happening, system status, a person's history, watch a story. Actions run synchronously and the job is already done when the POST returns; polling re-fetches the finished result (REST only — no WebSocket, no SSE). An unrecognized request is never guessed: the job completes with a plain-words message and examples of what works. Watches are recorded, not pushed — there is no push channel, so they are listed on `/v1/actions/watches` and on `/v1/alerts` for the client to re-check.
 - **Storage**: migration 014 (`source_health.last_new_at`); the pipeline's `recordHealth` stamps it on inserting runs and preserves it otherwise.
 - **Honest gaps**: county-source discovery was described in Phase 1 docs as "Phase 2" — it is not: Phase 2 monitors the 12 registered sources; no new county sources are registered here, and none are invented. Registration of county bloggers/pages is still an open step (Phase 4 ranks whatever is registered). `last_new_at` is null for every source until a worker run inserts a document after migration 014.
 
@@ -282,7 +286,7 @@ docs/INTERFACES.md      internal module interfaces
 
 ## Tests
 
-`zig build test` — 312 tests (planner, ranking, index, RSS parsing, fetcher
+`zig build test` — 318 tests (planner, ranking, index, RSS parsing, fetcher
 parsing, auth, rate limiting, metrics, JSON, Postgres wire protocol, Redis
-RESP2, S3 signing, Trust & Intelligence Engine Phases 1–5). The Postgres and Redis live tests are gated on
+RESP2, S3 signing, Trust & Intelligence Engine Phases 1–6). The Postgres and Redis live tests are gated on
 `PULSE_TEST_POSTGRES_URL` / `PULSE_TEST_REDIS_URL` and skip without servers.

@@ -1,6 +1,6 @@
 # Sando Pulse — Roadmap 1 STATUS
 
-Last verified: **2026-11-14 ~21:00 GMT**. Zig 0.17.1 (`~/.local/bin/zig`).
+Last verified: **2026-11-14 ~21:10 GMT**. Zig 0.17.1 (`~/.local/bin/zig`).
 
 ⚠ Environment note (2026-11-14 ~20:10–20:35): the VM was REPLACED —
 PostgreSQL and Redis packages were gone entirely and the `pulse_test`
@@ -1590,3 +1590,73 @@ persisted events.
 - Recurring detection needs events in two distinct months; on a
   young store (one day's ingest) only 1 group fired. It grows as
   the store ages.
+
+## Trust & Intelligence Engine — Phase 6 — COMPLETE 2026-11-14 ~21:10 GMT
+
+Spec: `~/workspace/sando-pulse-trust-intelligence-engine.md` — Phase 6
+("Live Intelligence Action Engine", spec section 5). The spec's
+WebSocket/SSE proposal is NOT built — Pulse is REST only, so long
+work returns a job id and the client polls over REST; here the
+work is synchronous, so the job is already done when the POST
+returns. No migration.
+
+### What was built
+
+- `src/intelligence/actions/query_parser.zig`: plain-words requests
+  → typed actions (`check_source_latest`, `verify_claim`,
+  `monitor_account`, `whats_happening`, `check_status`,
+  `history_person`, `watch_story`, `unknown`) with source ids/names
+  from the registry, counties from the canonical list, topic
+  keywords from a small static table, and "facebook" kept as a
+  sentinel for the separate Facebook connector. An unrecognized
+  request is `unknown` with a plain-words message and examples —
+  never a guessed action.
+- `src/intelligence/actions/job_manager.zig`: in-memory bounded
+  JobStore (100 jobs, 50 watches, oldest evicted, forgotten on
+  restart). Jobs carry kind, status (queued/running/done/failed),
+  the result as an embedded JSON value, and a plain-words error.
+- API (public, REST only): `POST /v1/actions` (body
+  `{"request": "..."}`, 201 with the finished job),
+  `GET /v1/actions/jobs?id=job-<n>` (404 unknown, 400 missing id),
+  `GET /v1/actions/watches`. Watches are also listed on
+  `GET /v1/alerts` (with the no-push-channel note).
+- `monitor_account` for Facebook pages without a token is honestly
+  unavailable (the connector's own reason, never a faked status).
+- Docs: README (API table + Phase 6 section + test count), STATUS.md
+  (this section), docs/API.md, docs/openapi.yaml.
+
+### Verified 2026-11-14 ~21:05–21:10
+
+- `zig build` passes; `zig build test` **318/318 pass** (312 baseline
+  + 6 new: 4 parser, 2 job store).
+- Smoke test on Postgres (port 19092; 133 docs / 50 events): all
+  nine requests run live — latest from New Dawn → 5 documents;
+  verify "fuel prices rose" → unconfirmed, confidence 0.3, honest
+  explanation; monitor FrontPage Africa → monitor status; monitor
+  facebook → available false with the token reason; what is
+  happening in Bong → 1 event; status → documents 133,
+  sources_enabled 9/12, store postgres; who is Joseph Boakai → 0
+  events (no event title mentions him) with the disambiguation
+  note; watch for fuel shortages in Bong → watch-1 recorded;
+  "hello there" → unknown, done with the message + examples. Empty
+  body 400, invalid JSON 400, poll job-1 → done with the embedded
+  result, poll job-99 → 404, watches → 1, alerts → 1 alert + 1
+  watch.
+
+### Phase 6 honest gaps
+
+- Jobs are synchronous and in-memory: a request that takes long
+  blocks the single-threaded server until it finishes, and every
+  job is forgotten on restart. The 100-job / 50-watch bounds evict
+  the oldest silently.
+- The parser is keyword matching, not language understanding: a
+  request phrased outside its patterns ("give me the scoop on
+  Nimba") falls to `unknown` even when the intent is clear to a
+  human. The unknown response lists what works.
+- `history_person` matches event TITLES only (not full article
+  text), so a person mentioned mid-article but not in a title is
+  missed. Same-name people are not disambiguated — the response
+  says so; entity resolution is Phase 7.
+- `check_source_latest` without a named source returns the newest
+  documents across all sources; `monitor_account` without a named
+  account fails the job with a plain-words reason.

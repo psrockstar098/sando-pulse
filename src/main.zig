@@ -46,6 +46,7 @@ const l1cache = @import("api/l1cache.zig");
 const popular = @import("api/popular.zig");
 const social = @import("intelligence/social.zig");
 const trust_registry = @import("intelligence/trust/source_registry.zig");
+const job_manager = @import("intelligence/actions/job_manager.zig");
 const cache = @import("api/cache.zig");
 const memindex = @import("engine/memindex.zig");
 const autotune = @import("engine/autotune.zig");
@@ -588,6 +589,10 @@ pub fn main(init: std.process.Init) !void {
     var trust_reg = try trust_registry.Registry.init(alloc, timex.nowSeconds(io));
     defer trust_reg.deinit();
 
+    // Trust & Intelligence Engine, Phase 6: in-memory job + watch
+    // store for the Action Engine (bounded, forgotten on restart).
+    var actions_store = job_manager.JobStore.init(alloc);
+
     var srv = server.Server{
         .alloc = alloc,
         .io = io,
@@ -601,6 +606,7 @@ pub fn main(init: std.process.Init) !void {
         .knowledge = ks,
         .social = &social_registry,
         .trust_registry = &trust_reg,
+        .actions = &actions_store,
         .environ = init.environ_map,
         .facebook = &fb_connector,
         .redis = redis_client,
