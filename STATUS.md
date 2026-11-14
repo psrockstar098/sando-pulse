@@ -1,6 +1,15 @@
 # Sando Pulse — Roadmap 1 STATUS
 
-Last verified: **2026-11-14 ~20:00 GMT**. Zig 0.17.1 (`~/.local/bin/zig`).
+Last verified: **2026-11-14 ~20:15 GMT**. Zig 0.17.1 (`~/.local/bin/zig`).
+
+⚠ Environment note (2026-11-14 ~20:10): the VM was REPLACED — uptime
+3 min, PostgreSQL and Redis packages are gone entirely (not just
+stopped), and the `pulse_test` DB is gone with them. Phase 3 was
+verified on the memory store (see below); the Postgres restore is
+an apt reinstall (`postgresql-16`, `redis-server`, postgis, pgvector)
+in progress. The 10 live Postgres/Redis tests fail with
+ConnectionRefused until the packages are back — that is
+environmental, not a code failure.
 Project: `~/workspace/pulse`. Local git only — no remote, nothing pushed.
 
 ## Verdict
@@ -1345,3 +1354,87 @@ monitoring state on top of them.
 - The monitor reads health from the store — it does not run checks
   itself. If the worker stops, statuses go `stale` on schedule, which
   is the intended signal, not a monitor failure.
+
+## Trust & Intelligence Engine — Phase 3 — COMPLETE 2026-11-14 ~20:20 GMT
+
+Spec: `~/workspace/sando-pulse-trust-intelligence-engine.md` — Phase 3
+("evidence + verification", spec section 5), mapped onto the existing
+R7.5 event grouping + contradiction detection instead of a parallel
+system. No migration: everything is computed live from the store.
+
+### What was built
+
+- `src/intelligence/trust/evidence_tracker.zig`: claim extraction —
+  the title (always) plus the lead sentence when it adds something,
+  capped at 280 chars, copied from the document, never generated.
+  `firstSentence` stops at the first `.`/`!`/`?` followed by a space
+  or the end (a decimal point does not end a sentence).
+- `src/intelligence/trust/corroboration.zig`: the assessment. Statuses
+  (assessments, never verdicts): `verified` (4+ independent sources
+  agree, no flags), `corroborated` (2–3 sources), `partially_confirmed`
+  (publisher corrected part of the story), `unconfirmed` (one source
+  or none — a single source is never enough), `disputed` (R7.5
+  contradiction flags among the supporting documents, or the publisher
+  retracted the report), `outdated` (a newer same-topic event exists
+  and this one is over 30 days old). Confidence is a documented
+  formula: 0.6 * min(distinct sources, 5)/5 + 0.3 * agreement + 0.1 *
+  recency, capped at 0.95. Every record carries its supporting
+  documents, its flags, a plain-words explanation and the rule (`basis`)
+  that produced the status.
+- API (public, REST only): `GET /v1/evidence?event=<id>` (the event's
+  own claim against its documents) and `?claim=<text>` (searches the
+  store for the claim, up to 20 documents, and assesses it);
+  `GET /v1/claims?event=<id>` (extracted claims, deduped). Errors:
+  no parameter 400, unknown event 404. The evidence response carries
+  a `status_note`: the status is an assessment, not a verdict.
+- `urlDecode` in `src/api/server.zig`: `%XX` + `+` decoding for the
+  `?claim=` value. Found by the smoke test: `queryParam` returns the
+  raw value, so a percent-encoded claim planned to one nonsense term
+  and matched nothing. (Other GET parameters are ids/enums and are
+  left raw.)
+- Docs: README (API table + Phase 3 section + test count), STATUS.md
+  (this section), docs/API.md, docs/openapi.yaml.
+
+### Verified 2026-11-14 ~20:15–20:20
+
+- `zig build` passes; `zig build test` **292/302 pass, 10 fail** — the
+  10 failures are all live Postgres/Redis tests failing with
+  ConnectionRefused because the VM replacement wiped the packages
+  (see the environment note above); all 7 new Phase 3 tests pass
+  (2 extraction, 4 assessment, 1 response builder).
+- Smoke test on the memory store (port 19098): 4 documents ingested
+  (one per source, same title "Fuel shortage hits Monrovia") formed
+  one event (4 docs, 4 distinct sources, topic "energy");
+  `/v1/evidence?event=<id>` → **verified**, confidence 0.88, 4
+  supporting documents cited; `/v1/claims?event=<id>` → 2 claims
+  (title + lead, deduped); `/v1/evidence?claim=Fuel%20shortage%20hits%20Monrovia`
+  → **verified** 0.88 after the urlDecode fix (before the fix it
+  honestly read unconfirmed — the bug, not the data);
+  `?claim=Fuel+shortage+in+Monrovia` → verified 0.88;
+  `?claim=Zebra migration patterns` → unconfirmed, 0 sources, honest
+  explanation; no parameter 400, unknown event 404, `/v1/claims`
+  without `event` 400.
+- The Postgres re-verification of Phase 3 (same endpoints against the
+  Postgres store) is pending the package reinstall — the Phase 3 code
+  touches no SQL of its own (no migration); the store calls it uses
+  (getEvent/eventDocs/listEvents/search) were all verified against
+  Postgres in Phase 1/Roadmap runs.
+
+### Phase 3 honest gaps
+
+- **There is deliberately NO `false` status.** The spec lists "False"
+  as a claim trust status; calling a claim false is a verdict, and
+  Pulse never issues verdicts (Roadmap 7.5 rule, "no answer is better
+  than a wrong answer"). A claim contradicted by the evidence reads
+  `disputed` with the flags cited. Whether `false` is ever implemented
+  is Dominic's call — flagged here, not implemented.
+- The `verified` bar (4+ independent sources) is reachable — the
+  smoke test hit it — but on real data most events have 1–2 sources,
+  so most claims will honestly read `unconfirmed` or `corroborated`
+  until coverage grows.
+- `outdated` needs a newer same-topic event; on a young store with
+  one event per topic it never fires, and age alone does not make a
+  claim outdated.
+- Claim extraction is extractive only: a claim buried mid-article
+  (not in the title or first sentence) is not extracted. Full
+  claim-mining over article text is a later phase's work.

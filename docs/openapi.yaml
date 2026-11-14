@@ -502,6 +502,54 @@ paths:
                 type: object
         "404":
           $ref: "#/components/responses/NotFound"
+  /v1/evidence:
+    get:
+      tags: [intelligence]
+      summary: Claim evidence assessment, Phase 3 (no auth)
+      parameters:
+        - name: event
+          in: query
+          description: Event id whose own claim (its title) is assessed against its documents (unknown id is 404).
+          schema:
+            type: string
+        - name: claim
+          in: query
+          description: Free-text claim; the store is searched for it and the claim assessed against what matched.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The assessment (verified / corroborated / partially_confirmed / unconfirmed / disputed / outdated) with confidence, explanation, basis, supporting documents and contradiction flags. No "false" status — Pulse never issues verdicts.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/claims:
+    get:
+      tags: [intelligence]
+      summary: Claims extracted from one event, Phase 3 (no auth)
+      parameters:
+        - name: event
+          in: query
+          required: true
+          description: Event id (unknown id is 404).
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The event's extracted claims (title + lead sentence, deduped), each with source, published time and URL.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
   /v1/events:
     get:
       tags: [intelligence]

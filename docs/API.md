@@ -227,6 +227,33 @@ Every `POST /v1/query` 200 carries, alongside the answer:
   (else 400). Timestamps are ISO strings, null when the event has
   never happened.
 
+## Trust & Intelligence Engine, Phase 3 endpoints
+
+- `GET /v1/evidence` — evidence assessment for one claim. Two forms:
+  `?event=<id>` assesses the event's own claim (its title) against
+  its documents; `?claim=<text>` searches the store for the claim
+  (planner terms, up to 20 documents) and assesses it against what
+  matched. Returns `claim`, `event_id` (null for a free-text claim),
+  `status` (`verified` / `corroborated` / `partially_confirmed` /
+  `unconfirmed` / `disputed` / `outdated`), `confidence` (0..1,
+  documented formula: 0.6 * min(distinct sources, 5)/5 + 0.3 *
+  agreement + 0.1 * recency, capped at 0.95), `explanation`
+  (plain words), `basis` (which rule produced the status),
+  `distinct_sources`, `supporting` (source, title, URL, published
+  time, title similarity to the claim), `contradicting` (the R7.5
+  contradiction flags among the supporting documents), and
+  `assessed_at`. A claim with no supporting document is `unconfirmed`;
+  a single source is never enough to corroborate. The response
+  carries a `status_note`: the status is an assessment, not a verdict
+  — there is no `false` status. Unknown event id is 404; neither
+  parameter is 400.
+- `GET /v1/claims?event=<id>` — the claims extracted from one
+  event's documents: the title (always) plus the lead sentence when
+  it adds something, deduped by text, each with `kind`, `source_id`,
+  `source_name`, `published_at`, `url`. Claim text is copied from
+  the documents, never generated. Unknown event id is 404; missing
+  `event` is 400.
+
 ## Popular searches and freshness (Roadmap 6.4)
 
 - `GET /v1/popular?limit=N` returns the most-asked queries,

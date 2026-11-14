@@ -6,6 +6,8 @@
 //!   GET  /v1/sources/profiles public — source profiles (Trust & Intelligence Engine, Phase 1)
 //!   GET  /v1/counties public — all 15 counties + source counts (Phase 1)
 //!   GET  /v1/monitor public — live account monitoring (Trust & Intelligence Engine, Phase 2)
+//!   GET  /v1/evidence public — claim evidence assessment (Phase 3)
+//!   GET  /v1/claims public — claims extracted from one event (Phase 3)
 //!   GET  /v1/events   public — persisted event clusters (Roadmap 3.4)
 //!   GET  /v1/trends   public — Geez + trending engine (Roadmap 4.2)
 //!   GET  /v1/forecast public — predictive trends (Roadmap 7.1)
@@ -43,7 +45,10 @@ const facebook = @import("../ingestion/connectors/facebook/facebook.zig");
 const fb_webhooks = @import("../ingestion/connectors/facebook/webhooks.zig");
 const trending = @import("../intelligence/trending.zig");
 const trust_registry = @import("../intelligence/trust/source_registry.zig");
+const trust_evidence = @import("../intelligence/trust/evidence_tracker.zig");
+const trust_corroboration = @import("../intelligence/trust/corroboration.zig");
 const monitor_mod = @import("../intelligence/monitor/account_monitor.zig");
+const fuzzy = @import("../engine/fuzzy.zig");
 const forecast_mod = @import("../intelligence/forecast.zig");
 const statanswer = @import("../intelligence/statanswer.zig");
 const alerts_mod = @import("../intelligence/alerts.zig");
@@ -657,6 +662,30 @@ pub const Server = struct {
         return null;
     }
 
+    /// Percent-decode a query value: `%XX` hex escapes and `+` as
+    /// space. Invalid escapes pass through unchanged. Needed by
+    /// endpoints that take free text in the query string (Phase 3
+    /// `?claim=`) — queryParam itself returns the raw value, and the
+    /// other GET parameters are ids/enums that never need decoding.
+    fn urlDecode(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        var i: usize = 0;
+        while (i < s.len) : (i += 1) {
+            const c = s[i];
+            if (c == '+') {
+                try out.append(alloc, ' ');
+            } else if (c == '%' and i + 2 < s.len and std.ascii.isHex(s[i + 1]) and std.ascii.isHex(s[i + 2])) {
+                const hi = std.fmt.charToDigit(s[i + 1], 16) catch 0;
+                const lo = std.fmt.charToDigit(s[i + 2], 16) catch 0;
+                try out.append(alloc, @as(u8, @intCast(hi * 16 + lo)));
+                i += 2;
+            } else {
+                try out.append(alloc, c);
+            }
+        }
+        return out.toOwnedSlice(alloc);
+    }
+
     /// Result of running the full query pipeline (Roadmap 6.4 warming).
     /// `resp` is rendered with the caller's request id for immediate
     /// serving; `storable` is the same response with empty markers for
@@ -1186,6 +1215,168 @@ pub const Server = struct {
             const body = try query_json.buildMonitorResponse(alloc, req_id, statuses, fb_json, interval_s);
             self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
             try respondJson(req, .ok, body, req_id);
+            return;
+        }
+
+        if (method == .GET and std.mem.eql(u8, path, "/v1/evidence")) {
+            // Trust & Intelligence Engine, Phase 3: evidence +
+            // verification. `?event=<id>` assesses the event's own
+            // claim (its title) against its documents;
+            // `?claim=<text>` searches the store for the claim and
+            // assesses it against what matched. The status is an
+            // assessment, never a verdict — see corroboration.zig.
+            // One of the two parameters is required. Public.
+            const now = timex.nowSeconds(self.io);
+            const q = head.query;
+            if (queryParam(q, "event")) |ev_id| {
+                if (self.knowledge) |k| {
+                    const ev = (k.getEvent(alloc, ev_id) catch {
+                        self.respondError(req, alloc, req_id, .internal_server_error, "event_failed", "Failed to load event");
+                        return;
+                    }) orelse {
+                        self.respondError(req, alloc, req_id, .not_found, "event_not_found", "No such event");
+                        return;
+                    };
+                    const docs = k.eventDocs(alloc, ev_id) catch {
+                        self.respondError(req, alloc, req_id, .internal_server_error, "event_docs_failed", "Failed to list event documents");
+                        return;
+                    };
+                    var inputs: std.ArrayList(trust_corroboration.EvidenceInput) = .empty;
+                    for (docs) |d| {
+                        var rel: f32 = 0;
+                        for (sources.sources) |s| {
+                            if (std.mem.eql(u8, s.id, d.source_id)) rel = s.reliability;
+                        }
+                        try inputs.append(alloc, .{
+                            .source_id = d.source_id,
+                            .source_name = d.source_name,
+                            .title = d.title,
+                            .url = "",
+                            .published_at = d.published_at,
+                            .reliability = rel,
+                        });
+                    }
+                    // A newer event on the same topic makes an old
+                    // claim "outdated" — same-topic + later + similar
+                    // title (the caller checks the event list).
+                    var newer = false;
+                    const all = k.listEvents(alloc, 100) catch &.{};
+                    for (all) |e| {
+                        if (std.mem.eql(u8, e.id, ev.id)) continue;
+                        if (!std.mem.eql(u8, e.topic, ev.topic)) continue;
+                        if (e.first_seen <= ev.last_seen) continue;
+                        if ((fuzzy.similarity(alloc, e.title, ev.title) catch 0) >= 0.5) {
+                            newer = true;
+                            break;
+                        }
+                    }
+                    const rec = trust_corroboration.assess(alloc, ev.title, inputs.items, ev.status, newer, ev.last_seen, now, ev.id) catch {
+                        self.respondError(req, alloc, req_id, .internal_server_error, "assess_failed", "Failed to assess the claim");
+                        return;
+                    };
+                    const body = try query_json.buildEvidenceResponse(alloc, req_id, rec);
+                    self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+                    try respondJson(req, .ok, body, req_id);
+                    return;
+                }
+                self.respondError(req, alloc, req_id, .internal_server_error, "events_unavailable", "Knowledge store unavailable");
+                return;
+            }
+            if (queryParam(q, "claim")) |raw_claim| {
+                // The claim arrives percent-encoded in the query
+                // string; decode it before planning the search.
+                const claim_text = urlDecode(alloc, raw_claim) catch raw_claim;
+                if (claim_text.len == 0) {
+                    self.respondError(req, alloc, req_id, .bad_request, "empty_claim", "claim must not be empty");
+                    return;
+                }
+                var enabled: std.ArrayList([]const u8) = .empty;
+                for (sources.sources) |s| {
+                    if (s.enabled) try enabled.append(alloc, s.id);
+                }
+                const p = planner.plan(alloc, claim_text, enabled.items, now, self.cfg.tz_offset_minutes) catch {
+                    self.respondError(req, alloc, req_id, .internal_server_error, "planner_failed", "Failed to plan the claim search");
+                    return;
+                };
+                // A claim of only stopwords has no search terms: assess
+                // it against nothing (unconfirmed) rather than
+                // returning the whole store.
+                var inputs: std.ArrayList(trust_corroboration.EvidenceInput) = .empty;
+                var newest: i64 = now;
+                if (p.terms.len > 0) {
+                    const docs = self.repo.search(alloc, .{ .terms = p.terms, .limit = 20 }) catch {
+                        self.respondError(req, alloc, req_id, .internal_server_error, "search_failed", "Failed to search for the claim");
+                        return;
+                    };
+                    for (docs) |d| {
+                        try inputs.append(alloc, .{
+                            .source_id = d.source_id,
+                            .source_name = d.source_name,
+                            .title = d.title,
+                            .url = d.url,
+                            .published_at = knowledge.docTs(d),
+                            .reliability = d.reliability,
+                        });
+                    }
+                    if (inputs.items.len > 0) {
+                        var m: i64 = inputs.items[0].published_at;
+                        for (inputs.items) |inp| {
+                            if (inp.published_at > m) m = inp.published_at;
+                        }
+                        newest = m;
+                    }
+                }
+                const rec = trust_corroboration.assess(alloc, claim_text, inputs.items, "reported", false, newest, now, null) catch {
+                    self.respondError(req, alloc, req_id, .internal_server_error, "assess_failed", "Failed to assess the claim");
+                    return;
+                };
+                const body = try query_json.buildEvidenceResponse(alloc, req_id, rec);
+                self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+                try respondJson(req, .ok, body, req_id);
+                return;
+            }
+            self.respondError(req, alloc, req_id, .bad_request, "missing_param", "Pass ?event=<id> or ?claim=<text>");
+            return;
+        }
+
+        if (method == .GET and std.mem.eql(u8, path, "/v1/claims")) {
+            // Trust & Intelligence Engine, Phase 3: the claims
+            // extracted from one event's documents (title + lead
+            // sentence, deduped). `?event=<id>` is required. Public.
+            if (queryParam(head.query, "event")) |ev_id| {
+                if (self.knowledge) |k| {
+                    const ev = (k.getEvent(alloc, ev_id) catch {
+                        self.respondError(req, alloc, req_id, .internal_server_error, "event_failed", "Failed to load event");
+                        return;
+                    }) orelse {
+                        self.respondError(req, alloc, req_id, .not_found, "event_not_found", "No such event");
+                        return;
+                    };
+                    _ = ev;
+                    const docs = k.eventDocs(alloc, ev_id) catch {
+                        self.respondError(req, alloc, req_id, .internal_server_error, "event_docs_failed", "Failed to list event documents");
+                        return;
+                    };
+                    var claims: std.ArrayList(trust_evidence.Claim) = .empty;
+                    for (docs) |d| {
+                        const cs = trust_evidence.extractClaimsFromEventDoc(alloc, d) catch continue;
+                        for (cs) |c| {
+                            var dup = false;
+                            for (claims.items) |e| {
+                                if (std.mem.eql(u8, e.text, c.text)) dup = true;
+                            }
+                            if (!dup) try claims.append(alloc, c);
+                        }
+                    }
+                    const body = try query_json.buildClaimsResponse(alloc, req_id, ev_id, claims.items);
+                    self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+                    try respondJson(req, .ok, body, req_id);
+                    return;
+                }
+                self.respondError(req, alloc, req_id, .internal_server_error, "events_unavailable", "Knowledge store unavailable");
+                return;
+            }
+            self.respondError(req, alloc, req_id, .bad_request, "missing_param", "Pass ?event=<id>");
             return;
         }
 
@@ -2056,6 +2247,7 @@ pub const Server = struct {
             (std.mem.eql(u8, path, "/v1/health") or std.mem.eql(u8, path, "/v1/sources") or
                 std.mem.eql(u8, path, "/v1/sources/profiles") or std.mem.eql(u8, path, "/v1/counties") or
                 std.mem.eql(u8, path, "/v1/monitor") or
+                std.mem.eql(u8, path, "/v1/evidence") or std.mem.eql(u8, path, "/v1/claims") or
                 std.mem.eql(u8, path, "/v1/events") or std.mem.eql(u8, path, "/v1/trends") or
                 std.mem.eql(u8, path, "/v1/forecast") or std.mem.eql(u8, path, "/v1/alerts") or
                 std.mem.eql(u8, path, "/v1/social") or

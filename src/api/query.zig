@@ -13,6 +13,8 @@ const temporal = @import("../engine/temporal.zig");
 const sources = @import("../ingestion/sources.zig");
 const trust_registry = @import("../intelligence/trust/source_registry.zig");
 const trust_history = @import("../intelligence/trust/source_history.zig");
+const trust_evidence = @import("../intelligence/trust/evidence_tracker.zig");
+const trust_corroboration = @import("../intelligence/trust/corroboration.zig");
 const monitor = @import("../intelligence/monitor/account_monitor.zig");
 
 pub const QueryRequest = struct {
@@ -1343,4 +1345,125 @@ test "buildQueryResponse renders exactly options.limit results" {
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, two, "\"title\":"));
     const all = try buildQueryResponse(alloc, "req-1", "fuel", p, outcome, 5, 1794477600, "fast", 1.0, "simple_indexed", .{}, 20);
     try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, all, "\"title\":"));
+}
+
+/// Trust & Intelligence Engine, Phase 3: one claim's evidence
+/// assessment. The status is an assessment, never a verdict — see
+/// corroboration.zig. `record` carries the supporting documents and
+/// the contradiction flags so the reader can check the work.
+pub fn buildEvidenceResponse(
+    alloc: std.mem.Allocator,
+    req_id: []const u8,
+    record: trust_corroboration.EvidenceRecord,
+) ![]u8 {
+    var supporting: std.ArrayList(struct {
+        source_id: []const u8,
+        source_name: []const u8,
+        title: []const u8,
+        url: []const u8,
+        published_at: []const u8,
+        similarity: f64,
+    }) = .empty;
+    for (record.supporting) |s| {
+        try supporting.append(alloc, .{
+            .source_id = s.source_id,
+            .source_name = s.source_name,
+            .title = s.title,
+            .url = s.url,
+            .published_at = try formatIso(alloc, s.published_at),
+            .similarity = s.similarity,
+        });
+    }
+    var contradicting: std.ArrayList(struct {
+        doc_a: []const u8,
+        doc_b: []const u8,
+        similarity: f64,
+    }) = .empty;
+    for (record.contradicting) |f| {
+        try contradicting.append(alloc, .{
+            .doc_a = f.a_title,
+            .doc_b = f.b_title,
+            .similarity = f.similarity,
+        });
+    }
+    return stringifyAlloc(alloc, .{
+        .claim = record.claim,
+        .event_id = record.event_id,
+        .status = record.status.name(),
+        .confidence = record.confidence,
+        .explanation = record.explanation,
+        .basis = record.basis,
+        .distinct_sources = record.distinct_sources,
+        .supporting = supporting.items,
+        .contradicting = contradicting.items,
+        .assessed_at = try formatIso(alloc, record.assessed_at),
+        .status_note = "Assessment, not a verdict: Pulse never calls a claim false. See STATUS.md.",
+        .request_id = req_id,
+    });
+}
+
+/// Trust & Intelligence Engine, Phase 3: the claims extracted from
+/// one event's documents. Claim text is copied from the documents,
+/// never generated.
+pub fn buildClaimsResponse(
+    alloc: std.mem.Allocator,
+    req_id: []const u8,
+    event_id: []const u8,
+    claims: []const trust_evidence.Claim,
+) ![]u8 {
+    var list: std.ArrayList(struct {
+        text: []const u8,
+        kind: []const u8,
+        source_id: []const u8,
+        source_name: []const u8,
+        published_at: []const u8,
+        url: []const u8,
+    }) = .empty;
+    for (claims) |c| {
+        try list.append(alloc, .{
+            .text = c.text,
+            .kind = c.kind,
+            .source_id = c.source_id,
+            .source_name = c.source_name,
+            .published_at = try formatIso(alloc, c.published_at),
+            .url = c.url,
+        });
+    }
+    return stringifyAlloc(alloc, .{
+        .event_id = event_id,
+        .total = list.items.len,
+        .claims = list.items,
+        .request_id = req_id,
+    });
+}
+
+test "buildEvidenceResponse renders status, confidence, supporting and flags" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var supporting = [_]trust_corroboration.EvidenceDoc{.{
+        .source_id = "new-dawn",
+        .source_name = "New Dawn",
+        .title = "Fuel shortage hits Monrovia",
+        .url = "https://example.com/1",
+        .published_at = 1795000000,
+        .similarity = 1,
+    }};
+    var no_flags = [_]events_intel.ContradictionFlag{};
+    const rec = trust_corroboration.EvidenceRecord{
+        .claim = "Fuel shortage hits Monrovia",
+        .status = .corroborated,
+        .confidence = 0.64,
+        .explanation = "Two or more independent sources agree.",
+        .basis = "2-3 independent sources agree",
+        .supporting = &supporting,
+        .contradicting = &no_flags,
+        .distinct_sources = 2,
+        .event_id = "ev1",
+        .assessed_at = 1795000100,
+    };
+    const body = try buildEvidenceResponse(alloc, "req-9", rec);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"status\":\"corroborated\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "not a verdict") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "New Dawn") != null);
 }
