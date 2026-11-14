@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-24.04
     services:
       postgres:
-        image: postgres:16
+        image: ruxwez/postgres:16
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: pulse_test
@@ -46,14 +46,14 @@ jobs:
       - name: Build
         run: zig build
       - name: Test (unit suite; live legs need extensions — see below)
-        # The live Postgres/Redis legs are SKIPPED here: migration 003
-        # needs the pgvector, PostGIS and pg_trgm extensions, which stock
-        # postgres:16 does not ship. To enable them, swap the postgres
-        # service image for one that bundles all three (or build a custom
-        # image), create the extensions, and set:
+        # The postgres service image is ruxwez/postgres:16, which bundles
+        # pgvector, PostGIS and pg_trgm, so migration 003's CREATE EXTENSION
+        # calls succeed and `pulse migrate` below can run against it.
+        # (Previously stock postgres:16, which ships none of the three,
+        # so the migrate step failed with: extension "vector" is not
+        # available. Fixed 2026-11-14; see run 43514880800)
         #   PULSE_TEST_POSTGRES_URL: postgres://postgres:pulse_test@localhost:5432/pulse_test
         #   PULSE_TEST_REDIS_URL: redis://localhost:6379
-        # The full suite (unit + live) is run on the dev host instead.
         run: zig build test --summary all
       - name: Pre-flight audit (needs a key to pass; uses a throwaway one)
         env:
