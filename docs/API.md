@@ -308,6 +308,26 @@ Every `POST /v1/query` 200 carries, alongside the answer:
   county, created_at) with the note that there is no push channel.
   Watches are also listed on `GET /v1/alerts`.
 
+## Trust & Intelligence Engine, Phase 7 endpoints
+
+- `POST /v1/decisions` — Decision Core assessment. Body
+  `{"claim": "..."}`. Returns the claim's status (one of the six
+  Phase 3 assessment statuses, never a verdict), confidence,
+  distinct sources, supporting documents, contradiction flags,
+  official-source presence, and the full `reasoning` (one entry per
+  rule: rule, outcome, detail) plus a plain-words explanation. The
+  call is recorded in the audit log. Missing/empty `claim` or
+  invalid JSON is 400.
+- `GET /v1/graph` — knowledge-graph subgraphs, built live from the
+  store's events (up to 100). `?event=<id>` returns the event, its
+  entities, sources and claims (unknown id 404);
+  `?entity=<name>` with optional `?kind=` returns the entity and
+  its neighbours (an unknown entity is an empty graph, not an
+  error). One of the two parameters is required, otherwise 400; an
+  invalid `kind` is 400. The response carries the disambiguation
+  note: same-name persons in different counties are separate
+  nodes.
+
 ## Popular searches and freshness (Roadmap 6.4)
 
 - `GET /v1/popular?limit=N` returns the most-asked queries,

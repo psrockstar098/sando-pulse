@@ -688,6 +688,60 @@ paths:
             application/json:
               schema:
                 type: object
+  /v1/decisions:
+    post:
+      tags: [intelligence]
+      summary: Decision Core assessment, Phase 7 (no auth)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                claim:
+                  type: string
+                  example: "Fuel shortage hits Monrovia"
+      responses:
+        "200":
+          description: The claim's assessment with the full reasoning (the audit trail). Status is an assessment, never a verdict.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+  /v1/graph:
+    get:
+      tags: [intelligence]
+      summary: Knowledge-graph subgraphs, Phase 7 (no auth)
+      parameters:
+        - name: event
+          in: query
+          description: Event id (unknown id is 404).
+          schema:
+            type: string
+        - name: entity
+          in: query
+          description: Entity name (unknown entity is an empty graph).
+          schema:
+            type: string
+        - name: kind
+          in: query
+          description: Entity kind filter (person, organization, county, city, topic, event, source, claim).
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The subgraph around the event or entity.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
   /v1/events:
     get:
       tags: [intelligence]

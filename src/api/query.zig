@@ -20,6 +20,8 @@ const history_store = @import("../intelligence/history/event_store.zig");
 const history_recurring = @import("../intelligence/history/recurring_events.zig");
 const action_parser = @import("../intelligence/actions/query_parser.zig");
 const job_manager = @import("../intelligence/actions/job_manager.zig");
+const history_graph = @import("../intelligence/history/entity_graph.zig");
+const decision_core = @import("../intelligence/decision/decision_core.zig");
 const monitor = @import("../intelligence/monitor/account_monitor.zig");
 
 pub const QueryRequest = struct {
@@ -1664,7 +1666,86 @@ pub fn buildHistoryResponse(
     });
 }
 
-/// Trust & Intelligence Engine, Phase 6: one finished action job.
+/// Trust & Intelligence Engine, Phase 7: a Decision Core decision.
+/// The reasoning is the audit trail — every rule that fired, what
+/// it saw, and what it concluded.
+pub fn buildDecisionResponse(alloc: std.mem.Allocator, req_id: []const u8, d: decision_core.Decision) ![]u8 {
+    var steps: std.ArrayList(struct {
+        rule: []const u8,
+        outcome: []const u8,
+        detail: []const u8,
+    }) = .empty;
+    for (d.reasoning) |r| {
+        try steps.append(alloc, .{ .rule = r.rule, .outcome = r.outcome, .detail = r.detail });
+    }
+    var flags: std.ArrayList(struct {
+        doc_a: []const u8,
+        doc_b: []const u8,
+        source_a: []const u8,
+        source_b: []const u8,
+        similarity: f64,
+        note: []const u8,
+    }) = .empty;
+    for (d.flags) |f| {
+        try flags.append(alloc, .{ .doc_a = f.a_title, .doc_b = f.b_title, .source_a = f.a_source, .source_b = f.b_source, .similarity = f.similarity, .note = f.note });
+    }
+    return stringifyAlloc(alloc, .{
+        .claim = d.claim,
+        .status = d.status.name(),
+        .confidence = d.confidence,
+        .distinct_sources = d.distinct_sources,
+        .supporting_docs = d.supporting_docs,
+        .flags = flags.items,
+        .official_source_present = d.official_source_present,
+        .official_sources = d.official_sources,
+        .reasoning = steps.items,
+        .explanation = d.explanation,
+        .status_note = "Assessment, not a verdict. What \"decision like jev\" means beyond this rule-based assessment is unverified — see STATUS.md.",
+        .request_id = req_id,
+    });
+}
+
+/// Trust & Intelligence Engine, Phase 7: a knowledge-graph subgraph.
+pub fn buildGraphResponse(
+    alloc: std.mem.Allocator,
+    req_id: []const u8,
+    focus: []const u8,
+    graph: history_graph.Graph,
+) ![]u8 {
+    var nodes: std.ArrayList(struct {
+        id: []const u8,
+        kind: []const u8,
+        label: []const u8,
+        county: ?[]const u8,
+        weight: usize,
+    }) = .empty;
+    for (graph.nodes) |n| {
+        try nodes.append(alloc, .{
+            .id = n.id,
+            .kind = n.kind.toString(),
+            .label = n.label,
+            .county = n.county,
+            .weight = n.weight,
+        });
+    }
+    var edges: std.ArrayList(struct {
+        from: []const u8,
+        to: []const u8,
+        kind: []const u8,
+    }) = .empty;
+    for (graph.edges) |e| {
+        try edges.append(alloc, .{ .from = e.from, .to = e.to, .kind = e.kind.toString() });
+    }
+    return stringifyAlloc(alloc, .{
+        .focus = focus,
+        .total_nodes = nodes.items.len,
+        .total_edges = edges.items.len,
+        .nodes = nodes.items,
+        .edges = edges.items,
+        .disambiguation_note = "The same name + kind is one node, except persons: same-name persons in different counties are separate nodes (person:<name>:<county>). Two people sharing a name are not the same node.",
+        .request_id = req_id,
+    });
+}
 /// The result is the action's own response JSON, embedded as an
 /// object (not a string).
 pub fn buildJobResponse(alloc: std.mem.Allocator, req_id: []const u8, job: job_manager.Job) ![]u8 {

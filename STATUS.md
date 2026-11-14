@@ -1,6 +1,6 @@
 # Sando Pulse — Roadmap 1 STATUS
 
-Last verified: **2026-11-14 ~21:10 GMT**. Zig 0.17.1 (`~/.local/bin/zig`).
+Last verified: **2026-11-14 ~21:20 GMT**. Zig 0.17.1 (`~/.local/bin/zig`).
 
 ⚠ Environment note (2026-11-14 ~20:10–20:35): the VM was REPLACED —
 PostgreSQL and Redis packages were gone entirely and the `pulse_test`
@@ -1660,3 +1660,81 @@ returns. No migration.
 - `check_source_latest` without a named source returns the newest
   documents across all sources; `monitor_account` without a named
   account fails the job with a plain-words reason.
+
+## Trust & Intelligence Engine — Phase 7 — COMPLETE 2026-11-14 ~21:20 GMT
+
+Spec: `~/workspace/sando-pulse-trust-intelligence-engine.md` — Phase 7
+("knowledge graph + Decision Core", spec sections 7–8). No migration.
+
+### What was built
+
+- `src/intelligence/history/entity_graph.zig`: the graph. Nodes:
+  entity (person, organization, county, city, topic), event,
+  source, claim. Edges: mentions, reported_by, same_event,
+  corroborates, contradicts (the last when the event's documents
+  carry a contradiction flag). Disambiguation: the same name + kind
+  is one node, EXCEPT persons — same-name persons in different
+  counties are separate nodes (`person:<name>:<county>` when a
+  county is known from the same document), and the response says so.
+  `graphForEntity` (by name + optional kind) and `graphForEvent`
+  (by store id) return one-hop subgraphs.
+- `src/intelligence/decision/decision_core.zig`: the Decision Core.
+  It reuses the Phase 3 assessment for status + confidence and adds
+  the decision's own rules — official-source presence (a supporting
+  document from a registry source with reliability >= 0.88, the
+  government grade), recency, volume — and returns the FULL
+  REASONING (one entry per rule: rule, outcome, detail) as the
+  audit trail. The handler also records the call in the audit log
+  (route /v1/decisions).
+- API (public, REST only): `POST /v1/decisions` (body
+  `{"claim": "..."}`) and `GET /v1/graph?event=<id>` /
+  `?entity=<name>&kind=`.
+- Docs: README (API table + Phase 7 section + test count), STATUS.md
+  (this section), docs/API.md, docs/openapi.yaml.
+
+### Verified 2026-11-14 ~21:15–21:20
+
+- `zig build` passes; `zig build test` **322/322 pass** (318 baseline
+  + 4 new: 2 graph, 2 decision core).
+- Smoke test on Postgres (port 19093; 133 docs / 50 events):
+  decision "Fuel shortage hits Monrovia" → unconfirmed, confidence
+  0.3, 0 distinct sources, 0 supporting documents (search returned
+  20, none similar enough to count — the volume rule now says that
+  plainly), official false, all 6 reasoning steps; "Zebra migration
+  patterns" → unconfirmed 0.3; empty body 400. Graph: entity
+  Montserrado (county) → 25 nodes, 31 edges (person "Boakai" weight
+  15, city Monrovia, topics); Zanzibar → empty graph; bad kind 400;
+  event subgraph → 8 nodes, 7 edges, kinds claim/county/event/
+  person/source/topic, edge kinds mentions/reported_by/same_event;
+  bogus event 404, no params 400.
+- One real bug caught by the smoke test and fixed in this commit:
+  `supporting_docs` counted search hits (20) while
+  `distinct_sources` counted only similarity-passing documents (0)
+  — the two numbers contradicted each other. `supporting_docs` now
+  counts the similarity-passing documents, and the volume rule
+  states both numbers.
+
+### Phase 7 honest gaps
+
+- **"Decision like jev" stays UNVERIFIED**: ChatGPT interpreted
+  Dominic's phrase as a standalone decision engine; his original
+  prompt is not visible on the shared design page. What is built
+  here is a rule-based claim assessment with a full reasoning
+  trail — if he meant something else (an autonomous decision maker,
+  a different engine), that is a different build, and his call is
+  needed.
+- Official-source presence is always false on real data: no
+  registry source carries reliability >= 0.88 (all 12 are news at
+  0.70). The rule fires only when a government source is
+  registered.
+- The 0.5 title-similarity bar is strict for long titles: a claim
+  that is the first half of a long event title scores below it and
+  counts as unconfirmed even when the event is the same story. That
+  is the shared Phase 3 rule, not a Phase 7 bug — but it makes
+  `verified` hard to reach on real data.
+- The graph is built live from at most 100 events on every request
+  (entity extraction over every event document) — no caching, so a
+  large store makes /v1/graph slow.
+- Person extraction returns surnames only ("Boakai", not "Joseph
+  Boakai") — the static entity tables' behaviour, carried into the
+  graph as-is.

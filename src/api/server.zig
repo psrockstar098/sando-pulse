@@ -15,6 +15,8 @@
 //!   POST /v1/actions public — run a plain-words action, returns a job (Phase 6)
 //!   GET  /v1/actions/jobs public — poll a job by ?id= (Phase 6)
 //!   GET  /v1/actions/watches public — standing watches (Phase 6)
+//!   POST /v1/decisions public — Decision Core assessment (Phase 7)
+//!   GET  /v1/graph public — knowledge-graph subgraphs (Phase 7)
 //!   GET  /v1/events   public — persisted event clusters (Roadmap 3.4)
 //!   GET  /v1/trends   public — Geez + trending engine (Roadmap 4.2)
 //!   GET  /v1/forecast public — predictive trends (Roadmap 7.1)
@@ -59,6 +61,8 @@ const history_store = @import("../intelligence/history/event_store.zig");
 const history_recurring = @import("../intelligence/history/recurring_events.zig");
 const action_parser = @import("../intelligence/actions/query_parser.zig");
 const job_manager = @import("../intelligence/actions/job_manager.zig");
+const history_graph = @import("../intelligence/history/entity_graph.zig");
+const decision_core = @import("../intelligence/decision/decision_core.zig");
 const events_intel = @import("../intelligence/events.zig");
 const monitor_mod = @import("../intelligence/monitor/account_monitor.zig");
 const fuzzy = @import("../engine/fuzzy.zig");
@@ -735,6 +739,44 @@ pub const Server = struct {
         return trust_score.scoreAll(alloc, docs.items, evts.items, now);
     }
 
+    /// Shared by verify_claim (Phase 6) and the Decision Core
+    /// (Phase 7): plan the claim's search terms and fetch the
+    /// supporting documents from the store.
+    fn searchClaimInputs(self: *Server, alloc: std.mem.Allocator, claim: []const u8, now: i64) !struct { inputs: []trust_corroboration.EvidenceInput, newest: i64 } {
+        var enabled: std.ArrayList([]const u8) = .empty;
+        for (sources.sources) |s| {
+            if (s.enabled) try enabled.append(alloc, s.id);
+        }
+        const p = planner.plan(alloc, claim, enabled.items, now, self.cfg.tz_offset_minutes) catch {
+            return error.PlannerFailed;
+        };
+        var inputs: std.ArrayList(trust_corroboration.EvidenceInput) = .empty;
+        var newest: i64 = now;
+        if (p.terms.len > 0) {
+            const docs = self.repo.search(alloc, .{ .terms = p.terms, .limit = 20 }) catch {
+                return error.SearchFailed;
+            };
+            for (docs) |d| {
+                try inputs.append(alloc, .{
+                    .source_id = d.source_id,
+                    .source_name = d.source_name,
+                    .title = d.title,
+                    .url = d.url,
+                    .published_at = knowledge.docTs(d),
+                    .reliability = d.reliability,
+                });
+            }
+            if (inputs.items.len > 0) {
+                var m: i64 = inputs.items[0].published_at;
+                for (inputs.items) |inp| {
+                    if (inp.published_at > m) m = inp.published_at;
+                }
+                newest = m;
+            }
+        }
+        return .{ .inputs = inputs.items, .newest = newest };
+    }
+
     /// Trust & Intelligence Engine, Phase 6: run a parsed action
     /// synchronously and return its result JSON. The caller stores
     /// the result on the job. An error here fails the job with a
@@ -758,38 +800,8 @@ pub const Server = struct {
             },
             .verify_claim => {
                 const claim = action.claim orelse return error.MissingClaim;
-                var enabled: std.ArrayList([]const u8) = .empty;
-                for (sources.sources) |s| {
-                    if (s.enabled) try enabled.append(alloc, s.id);
-                }
-                const p = planner.plan(alloc, claim, enabled.items, now, self.cfg.tz_offset_minutes) catch {
-                    return error.PlannerFailed;
-                };
-                var inputs: std.ArrayList(trust_corroboration.EvidenceInput) = .empty;
-                var newest: i64 = now;
-                if (p.terms.len > 0) {
-                    const docs = self.repo.search(alloc, .{ .terms = p.terms, .limit = 20 }) catch {
-                        return error.SearchFailed;
-                    };
-                    for (docs) |d| {
-                        try inputs.append(alloc, .{
-                            .source_id = d.source_id,
-                            .source_name = d.source_name,
-                            .title = d.title,
-                            .url = d.url,
-                            .published_at = knowledge.docTs(d),
-                            .reliability = d.reliability,
-                        });
-                    }
-                    if (inputs.items.len > 0) {
-                        var m: i64 = inputs.items[0].published_at;
-                        for (inputs.items) |inp| {
-                            if (inp.published_at > m) m = inp.published_at;
-                        }
-                        newest = m;
-                    }
-                }
-                const rec = trust_corroboration.assess(alloc, claim, inputs.items, "reported", false, newest, now, null) catch {
+                const found = try self.searchClaimInputs(alloc, claim, now);
+                const rec = trust_corroboration.assess(alloc, claim, found.inputs, "reported", false, found.newest, now, null) catch {
                     return error.AssessFailed;
                 };
                 return query_json.buildEvidenceResponse(alloc, req_id, rec);
@@ -1879,6 +1891,108 @@ pub const Server = struct {
             return;
         }
 
+        if (method == .POST and std.mem.eql(u8, path, "/v1/decisions")) {
+            // Trust & Intelligence Engine, Phase 7: PULSE Decision
+            // Core. Body {"claim": "..."} — a rule-based assessment
+            // with the FULL REASONING (every rule, what it saw, what
+            // it concluded) as the audit trail. The status is an
+            // assessment, never a verdict. The call is recorded in
+            // the audit log like other calls. Public.
+            const now = timex.nowSeconds(self.io);
+            const raw = readBody(req, alloc) catch {
+                self.respondError(req, alloc, req_id, .bad_request, "bad_body", "Request body required");
+                return;
+            };
+            const parsed_json = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch {
+                self.respondError(req, alloc, req_id, .bad_request, "bad_json", "Request body is not valid JSON");
+                return;
+            };
+            defer parsed_json.deinit();
+            if (parsed_json.value != .object) {
+                self.respondError(req, alloc, req_id, .bad_request, "bad_json", "Request body must be a JSON object");
+                return;
+            }
+            const claim_val = parsed_json.value.object.get("claim") orelse {
+                self.respondError(req, alloc, req_id, .bad_request, "missing_claim", "Body must contain {\"claim\": \"...\"}");
+                return;
+            };
+            if (claim_val != .string or claim_val.string.len == 0) {
+                self.respondError(req, alloc, req_id, .bad_request, "missing_claim", "Body must contain {\"claim\": \"...\"}");
+                return;
+            }
+            const found = self.searchClaimInputs(alloc, claim_val.string, now) catch {
+                self.respondError(req, alloc, req_id, .internal_server_error, "search_failed", "Failed to search for the claim");
+                return;
+            };
+            const decision = decision_core.assessDecision(alloc, claim_val.string, found.inputs, "reported", false, found.newest, now, null) catch {
+                self.respondError(req, alloc, req_id, .internal_server_error, "assess_failed", "Failed to assess the claim");
+                return;
+            };
+            const body = try query_json.buildDecisionResponse(alloc, req_id, decision);
+            self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+            self.auditCall(head, alloc, req_id, 200);
+            try respondJson(req, .ok, body, req_id);
+            return;
+        }
+
+        if (method == .GET and std.mem.eql(u8, path, "/v1/graph")) {
+            // Trust & Intelligence Engine, Phase 7: knowledge graph
+            // subgraphs, built live from the store's events.
+            // `?event=<id>` (unknown id 404) or `?entity=<name>`
+            // with optional `?kind=<person|organization|county|
+            // city|topic|event|source|claim>` (unknown entity is an
+            // empty graph, not an error — the graph is computed live).
+            // One of the two parameters is required. Public.
+            if (self.knowledge) |k| {
+                const all = k.listEvents(alloc, 100) catch &.{};
+                var ed_list: std.ArrayList(history_graph.EventDocs) = .empty;
+                for (all) |e| {
+                    const docs = k.eventDocs(alloc, e.id) catch continue;
+                    ed_list.append(alloc, .{ .event = e, .docs = docs }) catch continue;
+                }
+                const graph = history_graph.buildGraph(alloc, ed_list.items) catch {
+                    self.respondError(req, alloc, req_id, .internal_server_error, "graph_failed", "Failed to build the graph");
+                    return;
+                };
+                if (queryParam(head.query, "event")) |ev_id| {
+                    const sub = history_graph.graphForEvent(alloc, graph, ev_id) catch {
+                        self.respondError(req, alloc, req_id, .internal_server_error, "graph_failed", "Failed to build the subgraph");
+                        return;
+                    };
+                    const s = sub orelse {
+                        self.respondError(req, alloc, req_id, .not_found, "event_not_found", "No such event");
+                        return;
+                    };
+                    const body = try query_json.buildGraphResponse(alloc, req_id, ev_id, s);
+                    self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+                    try respondJson(req, .ok, body, req_id);
+                    return;
+                }
+                if (queryParam(head.query, "entity")) |name| {
+                    var kind: ?history_graph.NodeKind = null;
+                    if (queryParam(head.query, "kind")) |ks| {
+                        kind = history_graph.NodeKind.fromString(ks) orelse {
+                            self.respondError(req, alloc, req_id, .bad_request, "invalid_kind", "kind must be person, organization, county, city, topic, event, source or claim");
+                            return;
+                        };
+                    }
+                    const sub = history_graph.graphForEntity(alloc, graph, name, kind) catch {
+                        self.respondError(req, alloc, req_id, .internal_server_error, "graph_failed", "Failed to build the subgraph");
+                        return;
+                    };
+                    const s = sub orelse history_graph.Graph{ .nodes = &.{}, .edges = &.{} };
+                    const body = try query_json.buildGraphResponse(alloc, req_id, name, s);
+                    self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+                    try respondJson(req, .ok, body, req_id);
+                    return;
+                }
+                self.respondError(req, alloc, req_id, .bad_request, "missing_param", "Pass ?event=<id> or ?entity=<name>");
+                return;
+            }
+            self.respondError(req, alloc, req_id, .internal_server_error, "events_unavailable", "Knowledge store unavailable");
+            return;
+        }
+
         if (method == .GET and std.mem.eql(u8, path, "/v1/events")) {
             if (self.knowledge) |k| {
                 // Detail: /v1/events?id=<event_id> — the event plus
@@ -2751,6 +2865,7 @@ pub const Server = struct {
                 std.mem.eql(u8, path, "/v1/history") or std.mem.eql(u8, path, "/v1/history/similar") or
                 std.mem.eql(u8, path, "/v1/actions/jobs") or std.mem.eql(u8, path, "/v1/actions/watches") or
                 std.mem.eql(u8, path, "/v1/actions") or
+                std.mem.eql(u8, path, "/v1/decisions") or std.mem.eql(u8, path, "/v1/graph") or
                 std.mem.eql(u8, path, "/v1/events") or std.mem.eql(u8, path, "/v1/trends") or
                 std.mem.eql(u8, path, "/v1/forecast") or std.mem.eql(u8, path, "/v1/alerts") or
                 std.mem.eql(u8, path, "/v1/social") or
