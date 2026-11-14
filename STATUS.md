@@ -1,6 +1,6 @@
 # Sando Pulse — Roadmap 1 STATUS
 
-Last verified: **2026-11-13 ~21:17 GMT**. Zig 0.17.1 (`~/.local/bin/zig`).
+Last verified: **2026-11-14 ~18:45 GMT**. Zig 0.17.1 (`~/.local/bin/zig`).
 Project: `~/workspace/pulse`. Local git only — no remote, nothing pushed.
 
 ## Verdict
@@ -1206,3 +1206,64 @@ Ordered 2026-11-13 ~19:57 ("fix those with the x mark and update it and make it 
 ### Note for the next CI build
 
 The CI-published Docker image (`docker.io/dominic908/sando-pulse:all-in-one-0.1.0`, boot-tested 2026-11-13 ~20:03, health ok, `sources_enabled: 5`) predates this fix. The next CI build after this push carries 9 enabled sources. The `ci.yml` pre-flight audit step still fails on stock postgres:16 (missing pgvector/PostGIS/pg_trgm) — known gap, separate decision.
+
+## Trust & Intelligence Engine — Phase 1 — COMPLETE 2026-11-14 ~18:45 GMT
+
+Spec: `~/workspace/sando-pulse-trust-intelligence-engine.md` — Phase 1 only
+("Source registry, source profiles and county categorization", spec section 1).
+Ranking/scoring is Phase 4, monitoring Phase 2, evidence/verification Phase 3,
+Decision Core Phase 7 — none of those were built.
+
+### What was built
+
+- `src/intelligence/trust/source_registry.zig`: profiles derived from the
+  ingestion registry (`profileFromSource` — the two can never drift), plus
+  county categorization over the canonical 15-county list
+  (`geo.county_capitals`, never duplicated). `county` is the outlet's BASE
+  county (headquarters), not coverage: all 12 are national outlets based in
+  Monrovia, Montserrado.
+- `src/intelligence/trust/source_history.zig`: bounded (500) append-only audit
+  log — `profile_created` / `status_changed` / `profile_updated` with
+  timestamps. Phase 1 seeds one `profile_created` entry per source at boot.
+- Migration `013_source_profiles.sql`: `source_profiles` +
+  `source_profile_history`, 12 profiles + 12 history rows seeded; re-runs
+  are no-ops (verified by the live test's second `runMigrations`).
+- API (public, REST only, no WebSocket/SSE):
+  - `GET /v1/sources/profiles` — all 12 profiles; `?county=` (must name one
+    of the 15 counties, else 400), `?status=` (active/under_review/restricted/
+    removed, else 400); `?id=` returns one profile with its history (unknown
+    id is 404).
+  - `GET /v1/counties` — all 15 counties with capitals and source counts.
+- Docs: README (API table + Phase 1 section + test count), STATUS.md (this
+  section), docs/API.md, docs/openapi.yaml.
+
+### Verified 2026-11-14 ~18:45
+
+- `zig build` passes; `zig build test` **286/286 pass** (274 baseline + 12
+  new: 6 registry, 2 history, 3 renderers, 1 migration live test).
+- Migration 013 applied to `pulse_test`: `source_profiles` 12 rows (9 active),
+  `source_profile_history` 12 `profile_created` rows; spot checks pass
+  (local-voices unverified, spoon-tv removed).
+- Smoke test (Postgres store, port 19095): health ok (documents 3,
+  sources_enabled 9); `/v1/sources/profiles` total 12; `?county=Montserrado`
+  12; `?county=Nimba` 0 with an empty list (honest); `?county=Bogus` 400;
+  `?status=removed` 3 (spoon-tv, bush-chicken, new-republic);
+  `?status=bogus` 400; `?id=frontpage-africa` full profile + 1 history
+  entry (`profile_created`); `?id=nope` 404; `/v1/counties` 15 counties,
+  12 sources (Montserrado only); old `/v1/sources` unchanged (12 sources).
+
+### Phase 1 honest gaps
+
+- **Local Voices Liberia's base county is unverified** (not stated on its
+  site) — recorded as Montserrado with `county_confidence: "unverified"`
+  and a note saying so. KMTV's Monrovia base was verified live from its own
+  structured data (Camp Johnson Road, Monrovia, Montserrado, 2026-11-14).
+- `coverage` is `general` for every source — topic-level coverage profiling
+  from ingested articles is a later phase; no per-source topics invented.
+- `activity.posting_frequency` and `last_update` are null (the worker does
+  not yet track per-source freshness); only `documents_total` is live.
+- `performance` is null (not measured until Phase 4).
+- `reliability` renders as `0.699999988079071` in JSON — the f32 0.70
+  approximation, same as the existing `/v1/sources` field.
+- The history log holds only the boot-seeded `profile_created` entries;
+  real change rows arrive when a later phase first changes a profile.

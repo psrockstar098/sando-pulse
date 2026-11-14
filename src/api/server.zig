@@ -3,6 +3,8 @@
 //! Routes:
 //!   GET  /v1/health   public — liveness + index size
 //!   GET  /v1/sources  public — source registry + per-source doc counts
+//!   GET  /v1/sources/profiles public — source profiles (Trust & Intelligence Engine, Phase 1)
+//!   GET  /v1/counties public — all 15 counties + source counts (Phase 1)
 //!   GET  /v1/events   public — persisted event clusters (Roadmap 3.4)
 //!   GET  /v1/trends   public — Geez + trending engine (Roadmap 4.2)
 //!   GET  /v1/forecast public — predictive trends (Roadmap 7.1)
@@ -39,6 +41,7 @@ const pipeline = @import("../ingestion/pipeline.zig");
 const facebook = @import("../ingestion/connectors/facebook/facebook.zig");
 const fb_webhooks = @import("../ingestion/connectors/facebook/webhooks.zig");
 const trending = @import("../intelligence/trending.zig");
+const trust_registry = @import("../intelligence/trust/source_registry.zig");
 const forecast_mod = @import("../intelligence/forecast.zig");
 const statanswer = @import("../intelligence/statanswer.zig");
 const alerts_mod = @import("../intelligence/alerts.zig");
@@ -144,6 +147,10 @@ pub const Server = struct {
     /// posts only, fed by connector collection jobs. Always
     /// present; empty until a social connector is authorized.
     social: *social_mod.SocialRegistry,
+    /// Trust & Intelligence Engine, Phase 1: source profiles +
+    /// county categorization. Static (the 12 real sources) with a
+    /// history log seeded at boot. Always present.
+    trust_registry: *trust_registry.Registry,
     /// Process environment map, for connector availability checks
     /// (tokens live in env vars). Null in tests — connectors then
     /// report unavailable with their reasons.
@@ -1046,6 +1053,71 @@ pub const Server = struct {
             return;
         }
 
+        if (method == .GET and std.mem.eql(u8, path, "/v1/sources/profiles")) {
+            // Trust & Intelligence Engine, Phase 1: source profiles.
+            // Public, like /v1/sources. `?id=` returns one profile
+            // with its history; otherwise the list, optionally
+            // filtered by `?county=` (must name one of the 15
+            // counties) and/or `?status=` (active, under_review,
+            // restricted, removed). Unknown county/status is a 400;
+            // unknown id is a 404. An `?id=` wins over the filters.
+            const counts = try self.repo.countBySource(alloc);
+            const q = head.query;
+            if (queryParam(q, "id")) |pid| {
+                const prof = self.trust_registry.profile(pid) orelse {
+                    self.respondError(req, alloc, req_id, .not_found, "profile_not_found", "No source profile with that id");
+                    return;
+                };
+                var n: usize = 0;
+                for (counts) |c| {
+                    if (std.mem.eql(u8, c.source_id, pid)) {
+                        n = c.count;
+                        break;
+                    }
+                }
+                const hist = self.trust_registry.historyFor(alloc, pid) catch &.{};
+                const body = try query_json.buildSourceProfileResponse(alloc, req_id, prof, n, hist);
+                self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+                try respondJson(req, .ok, body, req_id);
+                return;
+            }
+            var list = try self.trust_registry.allProfiles(alloc);
+            if (queryParam(q, "county")) |c| {
+                if (!trust_registry.Registry.isKnownCounty(c)) {
+                    self.respondError(req, alloc, req_id, .bad_request, "unknown_county", "No such Liberian county — use one of the 15 counties");
+                    return;
+                }
+                list = try self.trust_registry.profilesForCounty(alloc, c);
+            }
+            if (queryParam(q, "status")) |st| {
+                const wanted = trust_registry.ProfileStatus.parse(st) orelse {
+                    self.respondError(req, alloc, req_id, .bad_request, "invalid_status", "status must be active, under_review, restricted, or removed");
+                    return;
+                };
+                var kept: std.ArrayList(trust_registry.SourceProfile) = .empty;
+                for (list) |p| {
+                    if (p.status == wanted) try kept.append(alloc, p);
+                }
+                list = kept.items;
+            }
+            const body = try query_json.buildSourceProfilesResponse(alloc, req_id, list, counts);
+            self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+            try respondJson(req, .ok, body, req_id);
+            return;
+        }
+
+        if (method == .GET and std.mem.eql(u8, path, "/v1/counties")) {
+            // Trust & Intelligence Engine, Phase 1: county
+            // categorization. All 15 counties with their source
+            // counts; every county except Montserrado is honestly
+            // zero until Phase 2 registers county sources.
+            const counties = try self.trust_registry.countByCounty(alloc);
+            const body = try query_json.buildCountiesResponse(alloc, req_id, counties);
+            self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+            try respondJson(req, .ok, body, req_id);
+            return;
+        }
+
         if (method == .GET and std.mem.eql(u8, path, "/v1/events")) {
             if (self.knowledge) |k| {
                 // Detail: /v1/events?id=<event_id> — the event plus
@@ -1911,6 +1983,7 @@ pub const Server = struct {
 
         if ((method == .GET or method == .POST) and
             (std.mem.eql(u8, path, "/v1/health") or std.mem.eql(u8, path, "/v1/sources") or
+                std.mem.eql(u8, path, "/v1/sources/profiles") or std.mem.eql(u8, path, "/v1/counties") or
                 std.mem.eql(u8, path, "/v1/events") or std.mem.eql(u8, path, "/v1/trends") or
                 std.mem.eql(u8, path, "/v1/forecast") or std.mem.eql(u8, path, "/v1/alerts") or
                 std.mem.eql(u8, path, "/v1/social") or

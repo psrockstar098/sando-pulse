@@ -2338,6 +2338,59 @@ test "postgres: live" {
     try runMigrations(alloc, io, url, "/home/hatch/workspace/pulse/migrations");
 }
 
+test "postgres: source profiles migration 013 seeds 12 profiles (live, Phase 1)" {
+    const alloc = testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const url = (try getTestEnvVar(alloc, io, "PULSE_TEST_POSTGRES_URL")) orelse {
+        std.debug.print("skip: PULSE_TEST_POSTGRES_URL not set\n", .{});
+        return;
+    };
+    defer alloc.free(url);
+
+    var client = PgClient.connect(alloc, io, url) catch |err| {
+        std.debug.print("live test: connect failed: {any}\n", .{err});
+        return err;
+    };
+    defer client.close();
+
+    try runMigrations(alloc, io, url, "/home/hatch/workspace/pulse/migrations");
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var res = try client.query(a, "SELECT count(*) FROM source_profiles");
+    defer res.deinit(a);
+    try testing.expectEqual(@as(usize, 1), res.rows.len);
+    const profiles_n = try std.fmt.parseInt(usize, res.rows[0].cols[0].?, 10);
+    try testing.expectEqual(@as(usize, 12), profiles_n);
+
+    var res2 = try client.query(a, "SELECT count(*) FROM source_profile_history WHERE action = 'profile_created'");
+    defer res2.deinit(a);
+    const hist_n = try std.fmt.parseInt(usize, res2.rows[0].cols[0].?, 10);
+    try testing.expectEqual(@as(usize, 12), hist_n);
+
+    // Spot checks: Montserrado base county for all, 9 active / 3
+    // removed, Local Voices the one unverified assignment.
+    var res3 = try client.query(a, "SELECT count(*) FROM source_profiles WHERE county = 'Montserrado'");
+    defer res3.deinit(a);
+    try testing.expectEqual(@as(usize, 12), try std.fmt.parseInt(usize, res3.rows[0].cols[0].?, 10));
+    var res4 = try client.query(a, "SELECT count(*) FROM source_profiles WHERE status = 'active'");
+    defer res4.deinit(a);
+    try testing.expectEqual(@as(usize, 9), try std.fmt.parseInt(usize, res4.rows[0].cols[0].?, 10));
+    var res5 = try client.query(a, "SELECT county_confidence FROM source_profiles WHERE source_id = 'local-voices'");
+    defer res5.deinit(a);
+    try testing.expectEqual(@as(usize, 1), res5.rows.len);
+    try testing.expectEqualStrings("unverified", res5.rows[0].cols[0].?);
+
+    // Re-running the migration is a no-op for the history seed.
+    try runMigrations(alloc, io, url, "/home/hatch/workspace/pulse/migrations");
+    var res6 = try client.query(a, "SELECT count(*) FROM source_profile_history WHERE action = 'profile_created'");
+    defer res6.deinit(a);
+    try testing.expectEqual(@as(usize, 12), try std.fmt.parseInt(usize, res6.rows[0].cols[0].?, 10));
+}
+
 test "postgres: prepared statements (live, Roadmap 6.8)" {
     const alloc = testing.allocator;
     var threaded = std.Io.Threaded.init(alloc, .{});

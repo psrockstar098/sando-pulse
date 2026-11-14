@@ -185,6 +185,27 @@ Every `POST /v1/query` 200 carries, alongside the answer:
   `routing_reason: "semantic_only"` and uses the local lexical
   embedding, labelled as such.
 
+## Trust & Intelligence Engine, Phase 1 endpoints
+
+- `GET /v1/sources/profiles` — the 12 source profiles (`id`, `name`,
+  `platform`, `home_url`, `feed_url`, `county`, `county_confidence`,
+  `county_note`, `district`, `community`, `scope`, `coverage`,
+  `reliability`, `status`, `disabled_reason`, `activity`
+  (`documents_total` live from the store, `posting_frequency` and
+  `last_update` null until the worker tracks per-source freshness),
+  `evidence` (`documents_indexed`), `performance` (null — not
+  measured until Phase 4). `reliability` is the registry's
+  design-doc grade, not a credibility score. Filters: `?county=`
+  (one of the 15 counties, else 400), `?status=` (active,
+  under_review, restricted, removed, else 400). `?id=` returns one
+  profile plus its `history` (profile_created at boot); unknown id
+  is 404.
+- `GET /v1/counties` — all 15 counties with `capital`, `sources`
+  (count of sources based there) and a `note`. Montserrado holds
+  the 12 national outlets; every other county is honestly zero
+  until Phase 2 registers county sources. `county` is the outlet's
+  base county (headquarters), not its coverage.
+
 ## Popular searches and freshness (Roadmap 6.4)
 
 - `GET /v1/popular?limit=N` returns the most-asked queries,

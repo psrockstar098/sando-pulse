@@ -435,6 +435,49 @@ paths:
                     type: array
                     items:
                       type: object
+  /v1/sources/profiles:
+    get:
+      tags: [intelligence]
+      summary: Source profiles, Trust & Intelligence Engine Phase 1 (no auth)
+      parameters:
+        - name: id
+          in: query
+          description: One profile by source id, with its history (unknown id is 404).
+          schema:
+            type: string
+        - name: county
+          in: query
+          description: Filter by base county; must name one of the 15 counties (else 400).
+          schema:
+            type: string
+        - name: status
+          in: query
+          description: Filter by profile status (else 400).
+          schema:
+            type: string
+            enum: [active, under_review, restricted, removed]
+      responses:
+        "200":
+          description: Profile list or single profile with history.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/counties:
+    get:
+      tags: [intelligence]
+      summary: All 15 counties with source counts, Phase 1 (no auth)
+      responses:
+        "200":
+          description: County list (15 counties; every county except Montserrado is honestly zero until Phase 2).
+          content:
+            application/json:
+              schema:
+                type: object
   /v1/events:
     get:
       tags: [intelligence]

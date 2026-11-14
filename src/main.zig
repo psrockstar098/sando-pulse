@@ -45,6 +45,7 @@ const server = @import("api/server.zig");
 const l1cache = @import("api/l1cache.zig");
 const popular = @import("api/popular.zig");
 const social = @import("intelligence/social.zig");
+const trust_registry = @import("intelligence/trust/source_registry.zig");
 const cache = @import("api/cache.zig");
 const memindex = @import("engine/memindex.zig");
 const autotune = @import("engine/autotune.zig");
@@ -581,6 +582,12 @@ pub fn main(init: std.process.Init) !void {
     var social_registry = social.SocialRegistry.init(alloc);
     defer social_registry.deinit();
 
+    // Trust & Intelligence Engine, Phase 1: source profiles + county
+    // categorization. Static (the 12 real sources); the history log
+    // is seeded with one profile_created entry per source at boot.
+    var trust_reg = try trust_registry.Registry.init(alloc, timex.nowSeconds(io));
+    defer trust_reg.deinit();
+
     var srv = server.Server{
         .alloc = alloc,
         .io = io,
@@ -593,6 +600,7 @@ pub fn main(init: std.process.Init) !void {
         .embedder = embedder,
         .knowledge = ks,
         .social = &social_registry,
+        .trust_registry = &trust_reg,
         .environ = init.environ_map,
         .facebook = &fb_connector,
         .redis = redis_client,

@@ -11,6 +11,8 @@ const planner = @import("../engine/planner.zig");
 const search = @import("../engine/search.zig");
 const temporal = @import("../engine/temporal.zig");
 const sources = @import("../ingestion/sources.zig");
+const trust_registry = @import("../intelligence/trust/source_registry.zig");
+const trust_history = @import("../intelligence/trust/source_history.zig");
 
 pub const QueryRequest = struct {
     query: []const u8,
@@ -377,6 +379,138 @@ pub fn buildSourcesResponse(
     }
     return stringifyAlloc(alloc, .{
         .sources = list.items,
+        .request_id = req_id,
+    });
+}
+
+/// One source profile as JSON (Trust & Intelligence Engine, Phase 1).
+/// `performance` is always null — not measured until Phase 4.
+/// `posting_frequency` / `last_update` are null until the worker
+/// tracks per-source freshness; `documents_total` IS live, from the
+/// store's per-source counts.
+const ProfileJson = struct {
+    id: []const u8,
+    name: []const u8,
+    platform: []const u8,
+    home_url: []const u8,
+    feed_url: []const u8,
+    county: []const u8,
+    county_confidence: []const u8,
+    county_note: []const u8,
+    district: ?[]const u8,
+    community: ?[]const u8,
+    scope: []const u8,
+    coverage: []const []const u8,
+    reliability: f32,
+    status: []const u8,
+    disabled_reason: ?[]const u8,
+    activity: struct {
+        documents_total: usize,
+        posting_frequency: ?[]const u8,
+        last_update: ?[]const u8,
+    },
+    evidence: struct {
+        documents_indexed: usize,
+    },
+    performance: ?[]const u8,
+};
+
+fn documentsFor(counts: []const types.SourceCount, id: []const u8) usize {
+    for (counts) |c| {
+        if (std.mem.eql(u8, c.source_id, id)) return c.count;
+    }
+    return 0;
+}
+
+fn profileJson(p: trust_registry.SourceProfile, documents: usize) ProfileJson {
+    return .{
+        .id = p.id,
+        .name = p.name,
+        .platform = p.platform,
+        .home_url = p.home_url,
+        .feed_url = p.feed_url,
+        .county = p.county,
+        .county_confidence = p.county_confidence,
+        .county_note = p.county_note,
+        .district = p.district,
+        .community = p.community,
+        .scope = p.scope,
+        .coverage = p.coverage,
+        .reliability = p.reliability,
+        .status = p.status.name(),
+        .disabled_reason = p.disabled_reason,
+        .activity = .{ .documents_total = documents, .posting_frequency = null, .last_update = null },
+        .evidence = .{ .documents_indexed = documents },
+        .performance = null,
+    };
+}
+
+/// GET /v1/sources/profiles — source profiles (Phase 1). The list is
+/// already filtered by the handler (county / status); `counts` are
+/// the live per-source document counts from the store.
+pub fn buildSourceProfilesResponse(
+    alloc: std.mem.Allocator,
+    req_id: []const u8,
+    profiles: []const trust_registry.SourceProfile,
+    counts: []const types.SourceCount,
+) ![]u8 {
+    var list: std.ArrayList(ProfileJson) = .empty;
+    for (profiles) |p| try list.append(alloc, profileJson(p, documentsFor(counts, p.id)));
+    return stringifyAlloc(alloc, .{
+        .profiles = list.items,
+        .total = list.items.len,
+        .reliability_note = "reliability is the registry's design-doc grade (news 0.70), not a computed credibility score — scoring is Phase 4.",
+        .request_id = req_id,
+    });
+}
+
+const HistoryJson = struct {
+    seq: u64,
+    action: []const u8,
+    detail: []const u8,
+    at: i64,
+};
+
+/// GET /v1/sources/profiles?id=<id> — one profile with its history.
+pub fn buildSourceProfileResponse(
+    alloc: std.mem.Allocator,
+    req_id: []const u8,
+    profile: trust_registry.SourceProfile,
+    documents: usize,
+    history: []const trust_history.HistoryEntry,
+) ![]u8 {
+    var hist: std.ArrayList(HistoryJson) = .empty;
+    for (history) |h| try hist.append(alloc, .{ .seq = h.seq, .action = h.action, .detail = h.detail, .at = h.at });
+    return stringifyAlloc(alloc, .{
+        .profile = profileJson(profile, documents),
+        .history = hist.items,
+        .request_id = req_id,
+    });
+}
+
+const CountyJson = struct {
+    county: []const u8,
+    capital: []const u8,
+    sources: usize,
+    note: []const u8,
+};
+
+/// GET /v1/counties — all 15 counties with source counts (Phase 1).
+pub fn buildCountiesResponse(
+    alloc: std.mem.Allocator,
+    req_id: []const u8,
+    counties: []const trust_registry.CountyCount,
+) ![]u8 {
+    var list: std.ArrayList(CountyJson) = .empty;
+    var total: usize = 0;
+    for (counties) |c| {
+        total += c.sources;
+        try list.append(alloc, .{ .county = c.county, .capital = c.capital, .sources = c.sources, .note = c.note });
+    }
+    return stringifyAlloc(alloc, .{
+        .counties = list.items,
+        .total_counties = list.items.len,
+        .total_sources = total,
         .request_id = req_id,
     });
 }
@@ -912,6 +1046,66 @@ test "buildSocialResponse is honestly empty until real data arrives (Roadmap 7.7
     try std.testing.expect(std.mem.indexOf(u8, out2, "\"social_available\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, out2, "\"post_count\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, out2, "\"tag\":\"geez\"") != null);
+}
+
+test "buildSourceProfilesResponse lists 12 profiles with live counts (Phase 1)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var reg = try trust_registry.Registry.init(alloc, 1763145600);
+    defer reg.deinit();
+    const all = try reg.allProfiles(alloc);
+    const counts = [_]types.SourceCount{
+        .{ .source_id = "new-dawn", .count = 15 },
+        .{ .source_id = "frontpage-africa", .count = 10 },
+    };
+    const out = try buildSourceProfilesResponse(alloc, "req-test", all, &counts);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"total\":12") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"id\":\"frontpage-africa\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"county\":\"Montserrado\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"status\":\"active\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"status\":\"removed\"") != null);
+    // Live counts land on the right profiles; uncounted sources read 0.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"documents_total\":15") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"documents_total\":10") != null);
+    // Honesty labels: not-yet-measured fields are null, and the
+    // reliability note says the grade is not a credibility score.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"performance\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"posting_frequency\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "not a computed credibility score") != null);
+    // Local Voices is the one unverified county assignment.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"county_confidence\":\"unverified\"") != null);
+}
+
+test "buildSourceProfileResponse carries one profile plus its history (Phase 1)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var reg = try trust_registry.Registry.init(alloc, 1763145600);
+    defer reg.deinit();
+    const prof = reg.profile("new-dawn").?;
+    const hist = try reg.historyFor(alloc, "new-dawn");
+    const out = try buildSourceProfileResponse(alloc, "req-test", prof, 15, hist);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"id\":\"new-dawn\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"documents_total\":15") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"action\":\"profile_created\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"at\":1763145600") != null);
+}
+
+test "buildCountiesResponse lists 15 counties, 12 sources, honest zeros (Phase 1)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var reg = try trust_registry.Registry.init(alloc, 1763145600);
+    defer reg.deinit();
+    const counties = try reg.countByCounty(alloc);
+    const out = try buildCountiesResponse(alloc, "req-test", counties);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"total_counties\":15") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"total_sources\":12") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"county\":\"Nimba\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"capital\":\"Sanniquellie\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"county\":\"Montserrado\",\"capital\":\"Monrovia\",\"sources\":12") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "No sources registered for this county yet") != null);
 }
 
 test "buildQueryResponse carries path, latency_ms and routing_reason" {

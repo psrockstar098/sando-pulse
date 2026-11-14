@@ -71,6 +71,8 @@ published**. The API container runs migrations on boot.
 |---|---|---|---|
 | GET | `/v1/health` | no | `{"status":"ok","version","documents","sources_enabled","store"}` |
 | GET | `/v1/sources` | no | All 12 sources with enabled flags and disabled reasons |
+| GET | `/v1/sources/profiles` | no | Source profiles (Trust & Intelligence Engine, Phase 1): identity, location, coverage, activity, reliability, status; `?id=`, `?county=`, `?status=` |
+| GET | `/v1/counties` | no | All 15 counties with source counts; every county except Montserrado is honestly zero until Phase 2 |
 | GET | `/v1/trends` | no | Geez + geo trends; carries `computed_at` + `stale` (Roadmap 6.4) |
 | GET | `/v1/briefing` | no | Precomputed briefing; carries `cached` + `stale` (Roadmap 6.4) |
 | GET | `/v1/popular` | no | Most-asked queries with counts (Roadmap 6.4) |
@@ -198,6 +200,15 @@ for concurrency, the threaded accept loop recorded as a gap in
 - **Social ingestion — gated** (`GET /v1/social`, `social` section in `/v1/trends`): the registry is fed only by authorized connector data. Today no social connector is configured (no Meta app/token, X and Reddit are stubs), so the endpoint reports `social_available: false` with every connector's unavailable reason. No scrapers, no faked posts.
 - **Semantic search — blocked**: the external embedding provider exists but has no API key and is never called live. Deep queries use the lexical local embedding and say so. Real semantic search needs Dominic's API-key step.
 
+## Trust & Intelligence Engine — Phase 1
+
+Source profiles + county categorization (spec: `~/workspace/sando-pulse-trust-intelligence-engine.md`, Phase 1 only — no ranking/scoring, monitoring, verification, or Decision Core):
+
+- **Profiles** (`GET /v1/sources/profiles`, `?id=`, `?county=`, `?status=`): the 12 real registry sources, each with identity (account name, platform, URLs), location (base county, district/community null), coverage (`general` — topic profiling from ingested articles is a later phase), activity (`documents_total` live from the store; posting frequency / last update null until the worker tracks per-source freshness), reliability (the registry's design-doc grade 0.70 — **not** a credibility score; the 1–5 score is Phase 4), evidence (documents indexed), performance (null — not measured until Phase 4), status (`active` 9 / `removed` 3). One profile's history (`profile_created` at boot) rides on the `?id=` detail view.
+- **County categorization** (`GET /v1/counties`): all 15 counties with capitals and source counts. `county` is the outlet's **base** county (headquarters), not its coverage: all 12 are national outlets based in Monrovia, Montserrado, so Montserrado holds 12 and the other 14 counties honestly report zero until Phase 2 registers genuine county sources. Never invented to fill a county.
+- **Storage**: migration 013 (`source_profiles` + `source_profile_history`, 12 profiles + 12 `profile_created` rows seeded, re-runs are no-ops).
+- **Honest gaps**: Local Voices Liberia's base county is **unverified** (not stated on its site) — recorded as Montserrado with `county_confidence: "unverified"`; KMTV's Monrovia base was verified live from its own structured data (Camp Johnson Road, Monrovia, Montserrado). `reliability` renders as `0.699999988079071` in JSON — the f32 0.70 approximation, same as the existing `/v1/sources` field.
+
 ## Sources (12 Liberian outlets)
 
 Verified live 2026-11-13 (see STATUS.md for the full evidence):
@@ -253,7 +264,7 @@ docs/INTERFACES.md      internal module interfaces
 
 ## Tests
 
-`zig build test` — 274 tests (planner, ranking, index, RSS parsing, fetcher
+`zig build test` — 286 tests (planner, ranking, index, RSS parsing, fetcher
 parsing, auth, rate limiting, metrics, JSON, Postgres wire protocol, Redis
 RESP2, S3 signing). The Postgres and Redis live tests are gated on
 `PULSE_TEST_POSTGRES_URL` / `PULSE_TEST_REDIS_URL` and skip without servers.
