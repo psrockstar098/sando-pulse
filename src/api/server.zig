@@ -10,6 +10,8 @@
 //!   GET  /v1/claims public — claims extracted from one event (Phase 3)
 //!   GET  /v1/sources/scores public — credibility scores, all sources (Phase 4)
 //!   GET  /v1/rankings public — per-county source ranking (Phase 4)
+//!   GET  /v1/history public — historical search + recurring stories (Phase 5)
+//!   GET  /v1/history/similar public — events similar to one event (Phase 5)
 //!   GET  /v1/events   public — persisted event clusters (Roadmap 3.4)
 //!   GET  /v1/trends   public — Geez + trending engine (Roadmap 4.2)
 //!   GET  /v1/forecast public — predictive trends (Roadmap 7.1)
@@ -50,6 +52,8 @@ const trust_registry = @import("../intelligence/trust/source_registry.zig");
 const trust_evidence = @import("../intelligence/trust/evidence_tracker.zig");
 const trust_corroboration = @import("../intelligence/trust/corroboration.zig");
 const trust_score = @import("../intelligence/trust/credibility_score.zig");
+const history_store = @import("../intelligence/history/event_store.zig");
+const history_recurring = @import("../intelligence/history/recurring_events.zig");
 const events_intel = @import("../intelligence/events.zig");
 const monitor_mod = @import("../intelligence/monitor/account_monitor.zig");
 const fuzzy = @import("../engine/fuzzy.zig");
@@ -729,6 +733,43 @@ pub const Server = struct {
         for (scores) |s| {
             self.trust_registry.noteScore(s.source_id, s.rating, s.total, now) catch {};
         }
+    }
+
+    /// Trust & Intelligence Engine, Phase 5: load the store's events
+    /// (up to 100, newest first) with the counties their documents
+    /// mention. A county counts when an event document's title or
+    /// text names it (entities.extract) — approximate, documented on
+    /// the response.
+    fn loadEventsWithCounties(self: *Server, alloc: std.mem.Allocator, k: knowledge.KnowledgeStore) ![]history_store.EventWithCounties {
+        _ = self;
+        const all = k.listEvents(alloc, 100) catch &.{};
+        var out: std.ArrayList(history_store.EventWithCounties) = .empty;
+        for (all) |e| {
+            const docs = k.eventDocs(alloc, e.id) catch continue;
+            var counties: std.ArrayList([]const u8) = .empty;
+            for (docs) |d| {
+                const ent = entities.extract(alloc, d.title) catch continue;
+                defer entities.freeEntities(alloc, ent);
+                const ent2 = entities.extract(alloc, d.text) catch continue;
+                defer entities.freeEntities(alloc, ent2);
+                for (ent.counties) |c| {
+                    var seen = false;
+                    for (counties.items) |x| {
+                        if (std.mem.eql(u8, x, c)) seen = true;
+                    }
+                    if (!seen) try counties.append(alloc, c);
+                }
+                for (ent2.counties) |c| {
+                    var seen = false;
+                    for (counties.items) |x| {
+                        if (std.mem.eql(u8, x, c)) seen = true;
+                    }
+                    if (!seen) try counties.append(alloc, c);
+                }
+            }
+            try out.append(alloc, .{ .event = e, .counties = counties.items });
+        }
+        return out.toOwnedSlice(alloc);
     }
 
     /// Result of running the full query pipeline (Roadmap 6.4 warming).
@@ -1484,6 +1525,94 @@ pub const Server = struct {
             const body = try query_json.buildRankingsResponse(alloc, req_id, county, capital, ids.items.len, ranked, note);
             self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
             try respondJson(req, .ok, body, req_id);
+            return;
+        }
+
+        if (method == .GET and std.mem.eql(u8, path, "/v1/history")) {
+            // Trust & Intelligence Engine, Phase 5: historical search
+            // over the persisted events. `?query=` (substring of
+            // title/topic), `?year=` (of first_seen), `?county=` (an
+            // event counts for a county when its documents mention
+            // it). The response also carries a monthly timeline of
+            // the matches and the recurring (topic, county) groups
+            // among them. Public.
+            if (self.knowledge) |k| {
+                const q = head.query;
+                var query: ?[]const u8 = null;
+                if (queryParam(q, "query")) |raw| query = urlDecode(alloc, raw) catch raw;
+                var year: ?i64 = null;
+                if (queryParam(q, "year")) |ys| {
+                    year = std.fmt.parseInt(i64, ys, 10) catch {
+                        self.respondError(req, alloc, req_id, .bad_request, "invalid_year", "year must be a number, e.g. 2026");
+                        return;
+                    };
+                }
+                const county = queryParam(q, "county");
+                if (county) |c| {
+                    if (!trust_registry.Registry.isKnownCounty(c)) {
+                        self.respondError(req, alloc, req_id, .bad_request, "unknown_county", "No such county");
+                        return;
+                    }
+                }
+                const with_counties = self.loadEventsWithCounties(alloc, k) catch {
+                    self.respondError(req, alloc, req_id, .internal_server_error, "history_failed", "Failed to load events");
+                    return;
+                };
+                const filtered = history_store.searchHistory(alloc, with_counties, query, year, county) catch {
+                    self.respondError(req, alloc, req_id, .internal_server_error, "history_failed", "Failed to search history");
+                    return;
+                };
+                const buckets = history_store.timelineByMonth(alloc, filtered) catch {
+                    self.respondError(req, alloc, req_id, .internal_server_error, "history_failed", "Failed to build the timeline");
+                    return;
+                };
+                const recurring = history_recurring.detectRecurring(alloc, filtered) catch {
+                    self.respondError(req, alloc, req_id, .internal_server_error, "history_failed", "Failed to detect recurring stories");
+                    return;
+                };
+                const body = try query_json.buildHistoryResponse(alloc, req_id, filtered, buckets, recurring, query, year, county);
+                self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+                try respondJson(req, .ok, body, req_id);
+                return;
+            }
+            self.respondError(req, alloc, req_id, .internal_server_error, "events_unavailable", "Knowledge store unavailable");
+            return;
+        }
+
+        if (method == .GET and std.mem.eql(u8, path, "/v1/history/similar")) {
+            // Trust & Intelligence Engine, Phase 5: events similar to
+            // one event — title similarity >= 0.5, or the same topic
+            // in a shared county. `?event=<id>` is required. Public.
+            if (queryParam(head.query, "event")) |ev_id| {
+                if (self.knowledge) |k| {
+                    const ev = (k.getEvent(alloc, ev_id) catch {
+                        self.respondError(req, alloc, req_id, .internal_server_error, "event_failed", "Failed to load event");
+                        return;
+                    }) orelse {
+                        self.respondError(req, alloc, req_id, .not_found, "event_not_found", "No such event");
+                        return;
+                    };
+                    const with_counties = self.loadEventsWithCounties(alloc, k) catch {
+                        self.respondError(req, alloc, req_id, .internal_server_error, "history_failed", "Failed to load events");
+                        return;
+                    };
+                    var target_counties: []const []const u8 = &.{};
+                    for (with_counties) |e| {
+                        if (std.mem.eql(u8, e.event.id, ev.id)) target_counties = e.counties;
+                    }
+                    const sims = history_recurring.similarEvents(alloc, ev, target_counties, with_counties) catch {
+                        self.respondError(req, alloc, req_id, .internal_server_error, "history_failed", "Failed to find similar events");
+                        return;
+                    };
+                    const body = try query_json.buildSimilarResponse(alloc, req_id, ev.id, sims);
+                    self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+                    try respondJson(req, .ok, body, req_id);
+                    return;
+                }
+                self.respondError(req, alloc, req_id, .internal_server_error, "events_unavailable", "Knowledge store unavailable");
+                return;
+            }
+            self.respondError(req, alloc, req_id, .bad_request, "missing_param", "Pass ?event=<id>");
             return;
         }
 
@@ -2356,6 +2485,7 @@ pub const Server = struct {
                 std.mem.eql(u8, path, "/v1/monitor") or
                 std.mem.eql(u8, path, "/v1/evidence") or std.mem.eql(u8, path, "/v1/claims") or
                 std.mem.eql(u8, path, "/v1/sources/scores") or std.mem.eql(u8, path, "/v1/rankings") or
+                std.mem.eql(u8, path, "/v1/history") or std.mem.eql(u8, path, "/v1/history/similar") or
                 std.mem.eql(u8, path, "/v1/events") or std.mem.eql(u8, path, "/v1/trends") or
                 std.mem.eql(u8, path, "/v1/forecast") or std.mem.eql(u8, path, "/v1/alerts") or
                 std.mem.eql(u8, path, "/v1/social") or

@@ -274,6 +274,22 @@ Every `POST /v1/query` 200 carries, alongside the answer:
   note. A known county with no sources returns an empty list with
   the honest note; an unknown county or a missing `county` is 400.
 
+## Trust & Intelligence Engine, Phase 5 endpoints
+
+- `GET /v1/history` — historical search over the persisted events
+  (up to 100, newest first). Filters: `?query=` (case-insensitive
+  substring of title or topic), `?year=` (of first_seen, must be a
+  number), `?county=` (an event counts for a county when at least
+  one of its documents mentions it). Returns the matching events
+  (with their counties), a `timeline` of monthly buckets (oldest
+  first), and the `recurring` (topic, county) groups among the
+  matches (two or more distinct months). Unknown county or bad year
+  is 400.
+- `GET /v1/history/similar?event=<id>` — events similar to one
+  event: title similarity >= 0.5, or the same topic in a shared
+  county, most similar first, each with its `reason`. Missing
+  `event` is 400, unknown id is 404.
+
 ## Popular searches and freshness (Roadmap 6.4)
 
 - `GET /v1/popular?limit=N` returns the most-asked queries,

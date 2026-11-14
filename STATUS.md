@@ -1,6 +1,6 @@
 # Sando Pulse — Roadmap 1 STATUS
 
-Last verified: **2026-11-14 ~20:45 GMT**. Zig 0.17.1 (`~/.local/bin/zig`).
+Last verified: **2026-11-14 ~21:00 GMT**. Zig 0.17.1 (`~/.local/bin/zig`).
 
 ⚠ Environment note (2026-11-14 ~20:10–20:35): the VM was REPLACED —
 PostgreSQL and Redis packages were gone entirely and the `pulse_test`
@@ -1522,3 +1522,71 @@ demand. No migration.
   sources are Montserrado-based, so 14 counties rank empty until
   county sources are registered. Phase 4 ranks what is registered;
   it does not invent candidates.
+
+## Trust & Intelligence Engine — Phase 5 — COMPLETE 2026-11-14 ~21:00 GMT
+
+Spec: `~/workspace/sando-pulse-trust-intelligence-engine.md` — Phase 5
+("historical / recurring-event intelligence", spec section 6), mapped
+onto the R7.5 event grouping + R7.1 monthly series instead of a
+parallel store. No migration: everything is computed live from the
+persisted events.
+
+### What was built
+
+- `src/intelligence/history/event_store.zig`: historical search
+  (`searchHistory` — query substring of title/topic, year of
+  first_seen, county) and `timelineByMonth` (monthly buckets, oldest
+  first). `yearOf`/`monthKey` use the same civil-from-days algorithm
+  as `query.formatIso`.
+- `src/intelligence/history/recurring_events.zig`: `detectRecurring`
+  — (topic, county) signatures spanning two or more distinct months;
+  `similarEvents` — title similarity >= 0.5 or the same topic in a
+  shared county, most similar first, each with its reason. Never
+  grouped by person name alone (entity resolution is Phase 7).
+- API (public, REST only): `GET /v1/history` (filters + timeline +
+  recurring groups) and `GET /v1/history/similar?event=<id>`.
+  Errors: unknown county or bad year 400, unknown event 404,
+  missing `event` 400.
+- Docs: README (API table + Phase 5 section + test count), STATUS.md
+  (this section), docs/API.md, docs/openapi.yaml.
+
+### Verified 2026-11-14 ~20:55–21:00
+
+- `zig build` passes; `zig build test` **312/312 pass** (307 baseline
+  + 5 new: 3 event store, 2 recurring).
+- Smoke test on Postgres (port 19091; the Phase 4 worker run's 133
+  docs / 50 events): `/v1/history` returns all 50 events with the
+  timeline 2026-07 (6), 2026-08 (2), 2026-10 (5), 2026-11 (37) and
+  1 recurring group (economy/Montserrado, 2 events, months 2026-10 +
+  2026-11); `?query=electricity` → 1, `?query=economy` → 4,
+  `?query=fuel` → 0 (no event title/topic contains it — honest);
+  `?year=2026` → 50, `?year=2025` → 0; `?county=Montserrado` → 4;
+  unknown county 400, bad year 400; `/v1/history/similar` on an
+  economy event → 1 match ("same topic in a shared county",
+  similarity 0.03 — title dissimilar, topic+county match); on the
+  electricity event → 0 (nothing shares its topic+county or a
+  similar title); missing `event` 400, unknown id 404.
+- One real bug caught by the smoke test and fixed in this commit:
+  `monthKey` used the format `"{d:0>4}-{d:0>2}"`, which is not Zig
+  formatting — it rendered months as `"+2026-+11"`. It now uses the
+  codebase's own `format.writeZeroPadded`, and the fix was verified
+  live (timeline months render `2026-07` etc.). The unit tests
+  caught the same bug first; the smoke test caught that the served
+  binary had been built before the fix.
+
+### Phase 5 honest gaps
+
+- The history search reads at most 100 events (newest first). On a
+  store with more than 100 events, older history is silently out of
+  reach of these endpoints.
+- County attribution is approximate: an event counts for a county
+  when a document mentions it, so a story that mentions Nimba in
+  passing counts as a Nimba event. The response says so.
+- 28 of the 50 events have an empty topic (the event clustering did
+  not assign one), so topic-based grouping and the `?query=` topic
+  match are thin on real data; "same topic" matching treats two
+  empty topics as equal, which can surface weak similarities — the
+  response carries the reason so the reader can judge.
+- Recurring detection needs events in two distinct months; on a
+  young store (one day's ingest) only 1 group fired. It grows as
+  the store ages.

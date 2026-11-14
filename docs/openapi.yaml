@@ -581,6 +581,57 @@ paths:
                 type: object
         "400":
           $ref: "#/components/responses/BadRequest"
+  /v1/history:
+    get:
+      tags: [intelligence]
+      summary: Historical event search, Phase 5 (no auth)
+      parameters:
+        - name: query
+          in: query
+          description: Substring of the event title or topic.
+          schema:
+            type: string
+        - name: year
+          in: query
+          description: Year of first_seen, e.g. 2026.
+          schema:
+            type: integer
+        - name: county
+          in: query
+          description: County name; an event counts when its documents mention it.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Matching events with their counties, a monthly timeline, and the recurring (topic, county) groups among them.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+  /v1/history/similar:
+    get:
+      tags: [intelligence]
+      summary: Events similar to one event, Phase 5 (no auth)
+      parameters:
+        - name: event
+          in: query
+          required: true
+          description: Event id (unknown id is 404).
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Similar events (title similarity >= 0.5, or same topic in a shared county), most similar first.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
   /v1/events:
     get:
       tags: [intelligence]

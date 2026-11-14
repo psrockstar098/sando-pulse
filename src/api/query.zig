@@ -16,6 +16,8 @@ const trust_history = @import("../intelligence/trust/source_history.zig");
 const trust_evidence = @import("../intelligence/trust/evidence_tracker.zig");
 const trust_corroboration = @import("../intelligence/trust/corroboration.zig");
 const trust_score = @import("../intelligence/trust/credibility_score.zig");
+const history_store = @import("../intelligence/history/event_store.zig");
+const history_recurring = @import("../intelligence/history/recurring_events.zig");
 const monitor = @import("../intelligence/monitor/account_monitor.zig");
 
 pub const QueryRequest = struct {
@@ -1560,6 +1562,114 @@ pub fn buildRankingsResponse(
         .total = list.items.len,
         .rankings = list.items,
         .note = note,
+        .request_id = req_id,
+    });
+}
+
+/// Trust & Intelligence Engine, Phase 5: historical search. The
+/// response lists the matching events, a monthly timeline of the
+/// matches, and the recurring (topic, county) groups among them.
+pub fn buildHistoryResponse(
+    alloc: std.mem.Allocator,
+    req_id: []const u8,
+    events: []const history_store.EventWithCounties,
+    buckets: []const history_store.MonthBucket,
+    recurring: []const history_recurring.RecurringGroup,
+    query: ?[]const u8,
+    year: ?i64,
+    county: ?[]const u8,
+) ![]u8 {
+    var ev_list: std.ArrayList(struct {
+        id: []const u8,
+        title: []const u8,
+        topic: []const u8,
+        first_seen: []const u8,
+        last_seen: []const u8,
+        doc_count: usize,
+        distinct_sources: usize,
+        status: []const u8,
+        counties: []const []const u8,
+    }) = .empty;
+    for (events) |e| {
+        try ev_list.append(alloc, .{
+            .id = e.event.id,
+            .title = e.event.title,
+            .topic = e.event.topic,
+            .first_seen = try formatIso(alloc, e.event.first_seen),
+            .last_seen = try formatIso(alloc, e.event.last_seen),
+            .doc_count = e.event.doc_count,
+            .distinct_sources = e.event.distinct_sources,
+            .status = e.event.status,
+            .counties = e.counties,
+        });
+    }
+    var month_list: std.ArrayList(struct {
+        month: []const u8,
+        count: usize,
+    }) = .empty;
+    for (buckets) |b| try month_list.append(alloc, .{ .month = b.month, .count = b.count });
+    var rec_list: std.ArrayList(struct {
+        topic: []const u8,
+        county: []const u8,
+        event_ids: []const []const u8,
+        months: []const []const u8,
+        count: usize,
+        first_seen: []const u8,
+        last_seen: []const u8,
+    }) = .empty;
+    for (recurring) |r| {
+        try rec_list.append(alloc, .{
+            .topic = r.topic,
+            .county = r.county,
+            .event_ids = r.event_ids,
+            .months = r.months,
+            .count = r.count,
+            .first_seen = try formatIso(alloc, r.first_seen),
+            .last_seen = try formatIso(alloc, r.last_seen),
+        });
+    }
+    return stringifyAlloc(alloc, .{
+        .query = query,
+        .year = year,
+        .county = county,
+        .total = ev_list.items.len,
+        .events = ev_list.items,
+        .timeline = month_list.items,
+        .recurring = rec_list.items,
+        .county_note = "An event counts for a county when at least one of its documents mentions it — approximate, not a verified location.",
+        .request_id = req_id,
+    });
+}
+
+/// Trust & Intelligence Engine, Phase 5: events similar to one event.
+pub fn buildSimilarResponse(
+    alloc: std.mem.Allocator,
+    req_id: []const u8,
+    event_id: []const u8,
+    similar: []const history_recurring.SimilarEvent,
+) ![]u8 {
+    var list: std.ArrayList(struct {
+        id: []const u8,
+        title: []const u8,
+        topic: []const u8,
+        first_seen: []const u8,
+        similarity: f64,
+        reason: []const u8,
+    }) = .empty;
+    for (similar) |s| {
+        try list.append(alloc, .{
+            .id = s.event.id,
+            .title = s.event.title,
+            .topic = s.event.topic,
+            .first_seen = try formatIso(alloc, s.event.first_seen),
+            .similarity = s.similarity,
+            .reason = s.reason,
+        });
+    }
+    return stringifyAlloc(alloc, .{
+        .event_id = event_id,
+        .total = list.items.len,
+        .similar = list.items,
         .request_id = req_id,
     });
 }
