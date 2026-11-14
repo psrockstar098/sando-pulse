@@ -243,25 +243,27 @@ pub const FacebookConnector = struct {
         return @import("client.zig").fetchGraph(alloc, io, url, self.auth_cfg, environ);
     }
 
+    /// Pending webhook notifications in the store (Phase 2 monitor:
+    /// pages with a missed notification are due for reconciliation).
+    pub fn pendingNotificationCount(self: *FacebookConnector, alloc: std.mem.Allocator) usize {
+        const store = self.notification_store orelse return 0;
+        const pend = store.pending(alloc) catch return 0;
+        defer {
+            for (pend) |n| {
+                alloc.free(n.page_id);
+                alloc.free(n.kind);
+                alloc.free(n.object_id);
+            }
+            alloc.free(pend);
+        }
+        return pend.len;
+    }
+
     /// Status JSON for GET /v1/connectors/facebook. Never includes
     /// a credential value.
     pub fn statusJson(self: *FacebookConnector, alloc: std.mem.Allocator) ![]u8 {
         const reason = self.validate();
-        const pending: usize = blk: {
-            if (self.notification_store) |store| {
-                const pend = store.pending(alloc) catch break :blk 0;
-                defer {
-                    for (pend) |n| {
-                        alloc.free(n.page_id);
-                        alloc.free(n.kind);
-                        alloc.free(n.object_id);
-                    }
-                    alloc.free(pend);
-                }
-                break :blk pend.len;
-            }
-            break :blk 0;
-        };
+        const pending: usize = self.pendingNotificationCount(alloc);
         return std.fmt.allocPrint(alloc,
             \\{{"connector":"facebook","available":{},"reason":{s},"registered_pages":{d},"pending_pages":{d},"pages_polled_total":{d},"pages_failed_total":{d},"notifications_pending":{d},"api_version":"{s}"}}
         , .{

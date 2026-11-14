@@ -13,6 +13,7 @@ const temporal = @import("../engine/temporal.zig");
 const sources = @import("../ingestion/sources.zig");
 const trust_registry = @import("../intelligence/trust/source_registry.zig");
 const trust_history = @import("../intelligence/trust/source_history.zig");
+const monitor = @import("../intelligence/monitor/account_monitor.zig");
 
 pub const QueryRequest = struct {
     query: []const u8,
@@ -511,6 +512,98 @@ pub fn buildCountiesResponse(
         .counties = list.items,
         .total_counties = list.items.len,
         .total_sources = total,
+        .request_id = req_id,
+    });
+}
+
+/// Facebook connector state inside the monitor response (Phase 2).
+/// Null when no connector is configured on the server at all.
+pub const FacebookMonitorJson = struct {
+    available: bool,
+    reason: ?[]const u8,
+    registered_pages: usize,
+    pending_pages: usize,
+    pages_polled_total: usize,
+    pages_failed_total: usize,
+    notifications_pending: usize,
+};
+
+const MonitorStatusJson = struct {
+    source_id: []const u8,
+    name: []const u8,
+    channel: []const u8,
+    enabled: bool,
+    last_checked_at: ?[]const u8,
+    last_success_at: ?[]const u8,
+    last_new_at: ?[]const u8,
+    consecutive_failures: usize,
+    documents_total: usize,
+    last_error: ?[]const u8,
+    freshness: []const u8,
+    change_detection: []const u8,
+    latest_doc: ?struct {
+        title: []const u8,
+        url: []const u8,
+        fetched_at: []const u8,
+    },
+    note: []const u8,
+};
+
+fn isoOrNull(alloc: std.mem.Allocator, ts: ?i64) !?[]u8 {
+    const t = ts orelse return null;
+    return try formatIso(alloc, t);
+}
+
+/// GET /v1/monitor — live account monitoring (Trust & Intelligence
+/// Engine, Phase 2). One status per registry source plus the
+/// Facebook connector state. `freshness` is fresh/stale/unknown per
+/// the 2x-ingest-interval rule; `last_new_at` moves only when a run
+/// inserts a document. Timestamps are ISO strings, null when the
+/// event has never happened.
+pub fn buildMonitorResponse(
+    alloc: std.mem.Allocator,
+    req_id: []const u8,
+    statuses: []const monitor.MonitorStatus,
+    facebook: ?FacebookMonitorJson,
+    interval_s: i64,
+) ![]u8 {
+    var list: std.ArrayList(MonitorStatusJson) = .empty;
+    var fresh: usize = 0;
+    var stale: usize = 0;
+    var unknown: usize = 0;
+    for (statuses) |s| {
+        switch (s.freshness) {
+            .fresh => fresh += 1,
+            .stale => stale += 1,
+            .unknown => unknown += 1,
+        }
+        try list.append(alloc, .{
+            .source_id = s.source_id,
+            .name = s.name,
+            .channel = s.channel,
+            .enabled = s.enabled,
+            .last_checked_at = try isoOrNull(alloc, s.last_checked_at),
+            .last_success_at = try isoOrNull(alloc, s.last_success_at),
+            .last_new_at = try isoOrNull(alloc, s.last_new_at),
+            .consecutive_failures = s.consecutive_failures,
+            .documents_total = s.documents_total,
+            .last_error = s.last_error,
+            .freshness = s.freshness.name(),
+            .change_detection = s.change_detection,
+            .latest_doc = if (s.latest) |l| .{
+                .title = l.title,
+                .url = l.url,
+                .fetched_at = try formatIso(alloc, l.fetched_at),
+            } else null,
+            .note = s.note,
+        });
+    }
+    return stringifyAlloc(alloc, .{
+        .sources = list.items,
+        .facebook = facebook,
+        .interval_s = interval_s,
+        .summary = .{ .fresh = fresh, .stale = stale, .unknown = unknown },
+        .freshness_rule = "fresh: last success within twice the ingest interval; stale: older; unknown: never succeeded",
         .request_id = req_id,
     });
 }

@@ -95,6 +95,11 @@ pub const SourceHealth = struct {
     last_error: ?[]const u8 = null,
     consecutive_failures: usize = 0,
     docs_total: usize = 0,
+    /// Last time a run INSERTED a new document for this source
+    /// (Phase 2 monitoring). Null until the first insert — a fetch
+    /// that returns nothing new is not activity, and the value is
+    /// never backfilled or guessed.
+    last_new_at: ?i64 = null,
 };
 
 pub const KnowledgeCounts = struct {
@@ -589,6 +594,7 @@ pub const MemoryKnowledge = struct {
                     .last_error = if (health.last_error) |e| try self.alloc.dupe(u8, e) else null,
                     .consecutive_failures = health.consecutive_failures,
                     .docs_total = health.docs_total,
+                    .last_new_at = health.last_new_at,
                 };
                 return;
             }
@@ -600,6 +606,7 @@ pub const MemoryKnowledge = struct {
             .last_error = if (health.last_error) |e| try self.alloc.dupe(u8, e) else null,
             .consecutive_failures = health.consecutive_failures,
             .docs_total = health.docs_total,
+            .last_new_at = health.last_new_at,
         });
     }
 
@@ -614,6 +621,7 @@ pub const MemoryKnowledge = struct {
                     .last_error = if (h.last_error) |e| try alloc.dupe(u8, e) else null,
                     .consecutive_failures = h.consecutive_failures,
                     .docs_total = h.docs_total,
+                    .last_new_at = h.last_new_at,
                 };
             }
         }

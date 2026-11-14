@@ -214,7 +214,7 @@ pub const Registry = struct {
                 .capital = cc.capital,
                 .sources = n,
                 .note = if (n == 0)
-                    "No sources registered for this county yet — county-level discovery is Phase 2."
+                    "No sources registered for this county yet — no registration mechanism exists yet; Phase 4 ranks the sources that are registered, it does not invent new ones."
                 else
                     "National outlets based in Monrovia; coverage is national, not county-limited.",
             });

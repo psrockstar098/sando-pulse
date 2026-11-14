@@ -81,6 +81,7 @@ pub const intelligence_social = @import("intelligence/social.zig");
 pub const intelligence_quality = @import("intelligence/quality.zig");
 pub const intelligence_trust_registry = @import("intelligence/trust/source_registry.zig");
 pub const intelligence_trust_history = @import("intelligence/trust/source_history.zig");
+pub const intelligence_monitor = @import("intelligence/monitor/account_monitor.zig");
 pub const cli_loadtest = @import("cli/loadtest.zig");
 pub const cli_audit = @import("cli/audit.zig");
 pub const cli_backup = @import("cli/backup.zig");

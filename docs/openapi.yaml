@@ -478,6 +478,30 @@ paths:
             application/json:
               schema:
                 type: object
+  /v1/monitor:
+    get:
+      tags: [intelligence]
+      summary: Live account monitoring, Phase 2 (no auth)
+      parameters:
+        - name: source
+          in: query
+          description: One source id for its single status (unknown id is 404).
+          schema:
+            type: string
+        - name: channel
+          in: query
+          description: Filter by channel, rss or facebook (else 400).
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Per-source monitoring state (last check / success / new item, freshness, change detection, newest document) plus the Facebook connector state.
+          content:
+            application/json:
+              schema:
+                type: object
+        "404":
+          $ref: "#/components/responses/NotFound"
   /v1/events:
     get:
       tags: [intelligence]

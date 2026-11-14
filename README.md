@@ -72,7 +72,8 @@ published**. The API container runs migrations on boot.
 | GET | `/v1/health` | no | `{"status":"ok","version","documents","sources_enabled","store"}` |
 | GET | `/v1/sources` | no | All 12 sources with enabled flags and disabled reasons |
 | GET | `/v1/sources/profiles` | no | Source profiles (Trust & Intelligence Engine, Phase 1): identity, location, coverage, activity, reliability, status; `?id=`, `?county=`, `?status=` |
-| GET | `/v1/counties` | no | All 15 counties with source counts; every county except Montserrado is honestly zero until Phase 2 |
+| GET | `/v1/counties` | no | All 15 counties with source counts; every county except Montserrado is honestly zero until county sources are registered |
+| GET | `/v1/monitor` | no | Live account monitoring (Trust & Intelligence Engine, Phase 2): per-source last check / success / new item, freshness, change detection; `?source=`, `?channel=` |
 | GET | `/v1/trends` | no | Geez + geo trends; carries `computed_at` + `stale` (Roadmap 6.4) |
 | GET | `/v1/briefing` | no | Precomputed briefing; carries `cached` + `stale` (Roadmap 6.4) |
 | GET | `/v1/popular` | no | Most-asked queries with counts (Roadmap 6.4) |
@@ -209,6 +210,14 @@ Source profiles + county categorization (spec: `~/workspace/sando-pulse-trust-in
 - **Storage**: migration 013 (`source_profiles` + `source_profile_history`, 12 profiles + 12 `profile_created` rows seeded, re-runs are no-ops).
 - **Honest gaps**: Local Voices Liberia's base county is **unverified** (not stated on its site) — recorded as Montserrado with `county_confidence: "unverified"`; KMTV's Monrovia base was verified live from its own structured data (Camp Johnson Road, Monrovia, Montserrado). `reliability` renders as `0.699999988079071` in JSON — the f32 0.70 approximation, same as the existing `/v1/sources` field.
 
+## Trust & Intelligence Engine — Phase 2
+
+Live account monitoring (spec: `~/workspace/sando-pulse-trust-intelligence-engine.md`, Phase 2 — "live account-monitoring system", spec section 4, mapped onto the existing worker + Facebook connector instead of a parallel system):
+
+- **Monitor** (`GET /v1/monitor`, `?source=`, `?channel=rss|facebook`): one status per registry source — last check, last success, last new item (`last_new_at`, migration 014; moves only when a run inserts a document, never on a fetch that returns nothing new), consecutive failures, documents total, last error, newest document (title + URL + fetch time), and `freshness` (`fresh` = last success within twice the ingest interval, `stale` = older, `unknown` = never succeeded). Change detection is labelled per channel: RSS is `new_items_only` (a feed cannot report edits or deletions); Facebook is `webhook_events` (Meta webhooks + poll reconciliation); disabled sources are `none`. The response also carries the Facebook connector state (available/reason, registered pages, pending pages, polls, pending webhook notifications) — honestly unavailable until a token + pages are configured.
+- **Storage**: migration 014 (`source_health.last_new_at`); the pipeline's `recordHealth` stamps it on inserting runs and preserves it otherwise.
+- **Honest gaps**: county-source discovery was described in Phase 1 docs as "Phase 2" — it is not: Phase 2 monitors the 12 registered sources; no new county sources are registered here, and none are invented. Registration of county bloggers/pages is still an open step (Phase 4 ranks whatever is registered). `last_new_at` is null for every source until a worker run inserts a document after migration 014.
+
 ## Sources (12 Liberian outlets)
 
 Verified live 2026-11-13 (see STATUS.md for the full evidence):
@@ -264,7 +273,7 @@ docs/INTERFACES.md      internal module interfaces
 
 ## Tests
 
-`zig build test` — 286 tests (planner, ranking, index, RSS parsing, fetcher
+`zig build test` — 295 tests (planner, ranking, index, RSS parsing, fetcher
 parsing, auth, rate limiting, metrics, JSON, Postgres wire protocol, Redis
-RESP2, S3 signing). The Postgres and Redis live tests are gated on
+RESP2, S3 signing, Trust & Intelligence Engine Phases 1–2). The Postgres and Redis live tests are gated on
 `PULSE_TEST_POSTGRES_URL` / `PULSE_TEST_REDIS_URL` and skip without servers.

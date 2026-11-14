@@ -1,6 +1,6 @@
 # Sando Pulse — Roadmap 1 STATUS
 
-Last verified: **2026-11-14 ~18:45 GMT**. Zig 0.17.1 (`~/.local/bin/zig`).
+Last verified: **2026-11-14 ~20:00 GMT**. Zig 0.17.1 (`~/.local/bin/zig`).
 Project: `~/workspace/pulse`. Local git only — no remote, nothing pushed.
 
 ## Verdict
@@ -1267,3 +1267,81 @@ Decision Core Phase 7 — none of those were built.
   approximation, same as the existing `/v1/sources` field.
 - The history log holds only the boot-seeded `profile_created` entries;
   real change rows arrive when a later phase first changes a profile.
+
+## Trust & Intelligence Engine — Phase 2 — COMPLETE 2026-11-14 ~20:00 GMT
+
+Spec: `~/workspace/sando-pulse-trust-intelligence-engine.md` — Phase 2
+("live account-monitoring system", spec section 4), mapped onto the
+existing worker + Facebook connector instead of a parallel system.
+Webhooks + polling were already in the connector; Phase 2 adds the
+monitoring state on top of them.
+
+### What was built
+
+- `src/intelligence/monitor/account_monitor.zig`: pure monitor logic —
+  `freshness` (fresh = last success within twice the ingest interval,
+  stale = older, unknown = never succeeded), per-channel change
+  capability (RSS `new_items_only`, Facebook `webhook_events`, disabled
+  `none`), webhook-kind labels (`feed` → new_post_or_update, `delete` →
+  deleted_post, `edit` → edited_post, unknown kinds passed through),
+  `statusFromHealth` assembling one status from the registry source +
+  persisted health + newest document.
+- Migration `014_monitor_last_new.sql`: `source_health.last_new_at`.
+  The pipeline's `recordHealth` stamps it only when a run inserts a
+  document for the source and preserves it otherwise — a fetch that
+  returns nothing new is not activity, and the stamp never moves
+  backwards. (Also fixed a leak the new test caught: `recordHealth`
+  fetched the previous health via `getSourceHealth`, which dupes its
+  strings, and never freed them.)
+- `src/ingestion/connectors/facebook/facebook.zig`: new
+  `pendingNotificationCount()` (extracted from `statusJson`, same
+  logic) so the monitor can report pending webhook notifications
+  without parsing JSON.
+- API (public, REST only): `GET /v1/monitor` — one status per registry
+  source (last check / last success / last new item, consecutive
+  failures, documents total, last error, freshness, change detection,
+  newest document, plain-words note) + the Facebook connector state
+  (available/reason, registered/pending pages, polls, pending
+  notifications). `?source=<id>` (unknown id 404), `?channel=rss|facebook`
+  (else 400).
+- Docs: README (API table + Phase 2 section + test count), STATUS.md (this
+  section), docs/API.md, docs/openapi.yaml.
+
+### Verified 2026-11-14 ~20:00
+
+- `zig build` passes; `zig build test` **295/295 pass** (286 baseline + 9
+  new: 8 monitor, 1 pipeline `last_new_at`).
+- Migration 014 applied to a fresh `pulse_test`: 14 migrations,
+  `last_new_at` column present.
+- Worker `--once` vs the fresh DB: docs **0 → 130** (10 sources,
+  `had_error: false`, 48s); all 9 enabled sources got `last_new_at`
+  stamped, 0 consecutive failures (daily-observer 50, the other eight
+  10 each).
+- Smoke test (Postgres store, port 19097): health ok (documents 0
+  before the worker run, sources_enabled 9); `/v1/monitor` summary
+  fresh 9 / stale 0 / unknown 3 (the 3 disabled sources) after the
+  worker run, each fresh source with `last_new_at` set and its newest
+  document titled; `?source=new-dawn` single status; `?source=bogus`
+  404; `?channel=facebook` empty list + facebook unavailable with the
+  exact token reason; `?channel=bogus` 400; `?source=spoon-tv`
+  `change_detection: "none"` with the parked-site note; `/v1/counties`
+  note updated. On the fresh DB before any worker run every source
+  honestly reported `freshness: "unknown"` with "Never checked".
+
+### Phase 2 honest gaps
+
+- **County-source discovery was described in Phase 1 docs as "Phase 2"
+  — it is not.** Phase 2 monitors the 12 registered sources; no new
+  county sources are registered here and none are invented. The Phase 1
+  wording ("until Phase 2") and the county note are corrected in this
+  commit: registration of county bloggers/pages is still an open step,
+  and Phase 4 ranks whatever is registered.
+- `last_new_at` is null for every source until a worker run inserts a
+  document after migration 014; on a fresh DB all sources read
+  `unknown` until the first worker run.
+- Deleted/edited-post detection exists only where the platform reports
+  it (Facebook webhooks); RSS can only ever report new items, and the
+  API says so per source.
+- The monitor reads health from the store — it does not run checks
+  itself. If the worker stops, statuses go `stale` on schedule, which
+  is the intended signal, not a monitor failure.

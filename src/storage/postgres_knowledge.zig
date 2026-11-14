@@ -434,17 +434,20 @@ pub const PostgresKnowledge = struct {
         defer alloc.free(ok_s);
         const err_s = try optLit(alloc, health.last_error);
         defer alloc.free(err_s);
+        const new_s = if (health.last_new_at) |t| try tsLit(alloc, t) else try alloc.dupe(u8, "NULL");
+        defer alloc.free(new_s);
         const sql = try std.fmt.allocPrint(alloc,
-            \\INSERT INTO source_health (source_id, last_run_at, last_success_at, last_error, consecutive_failures, docs_total, updated_at)
-            \\VALUES ({s}, {s}, {s}, {s}, {d}, {d}, now())
+            \\INSERT INTO source_health (source_id, last_run_at, last_success_at, last_error, consecutive_failures, docs_total, last_new_at, updated_at)
+            \\VALUES ({s}, {s}, {s}, {s}, {d}, {d}, {s}, now())
             \\ON CONFLICT (source_id) DO UPDATE SET
             \\  last_run_at = EXCLUDED.last_run_at,
             \\  last_success_at = EXCLUDED.last_success_at,
             \\  last_error = EXCLUDED.last_error,
             \\  consecutive_failures = EXCLUDED.consecutive_failures,
             \\  docs_total = EXCLUDED.docs_total,
+            \\  last_new_at = EXCLUDED.last_new_at,
             \\  updated_at = now()
-        , .{ esc_id, run_s, ok_s, err_s, health.consecutive_failures, health.docs_total });
+        , .{ esc_id, run_s, ok_s, err_s, health.consecutive_failures, health.docs_total, new_s });
         defer alloc.free(sql);
         try self.execLocked(alloc, sql);
     }
@@ -459,7 +462,8 @@ pub const PostgresKnowledge = struct {
             \\SELECT source_id,
             \\  extract(epoch from last_run_at)::bigint,
             \\  extract(epoch from last_success_at)::bigint,
-            \\  last_error, consecutive_failures, docs_total
+            \\  last_error, consecutive_failures, docs_total,
+            \\  extract(epoch from last_new_at)::bigint
             \\FROM source_health WHERE source_id = {s}
         , .{esc});
         defer alloc.free(sql);
@@ -467,7 +471,7 @@ pub const PostgresKnowledge = struct {
         defer res.deinit(alloc);
         if (res.rows.len == 0) return null;
         const c = res.rows[0].cols;
-        if (c.len != 6) return error.ProtocolError;
+        if (c.len != 7) return error.ProtocolError;
         return .{
             .source_id = try alloc.dupe(u8, c[0] orelse return error.ProtocolError),
             .last_run_at = if (c[1]) |v| try std.fmt.parseInt(i64, v, 10) else null,
@@ -475,6 +479,7 @@ pub const PostgresKnowledge = struct {
             .last_error = if (c[3]) |v| try alloc.dupe(u8, v) else null,
             .consecutive_failures = try std.fmt.parseInt(usize, c[4] orelse return error.ProtocolError, 10),
             .docs_total = try std.fmt.parseInt(usize, c[5] orelse return error.ProtocolError, 10),
+            .last_new_at = if (c[6]) |v| try std.fmt.parseInt(i64, v, 10) else null,
         };
     }
 

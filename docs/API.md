@@ -203,8 +203,29 @@ Every `POST /v1/query` 200 carries, alongside the answer:
 - `GET /v1/counties` — all 15 counties with `capital`, `sources`
   (count of sources based there) and a `note`. Montserrado holds
   the 12 national outlets; every other county is honestly zero
-  until Phase 2 registers county sources. `county` is the outlet's
+  until county sources are registered. `county` is the outlet's
   base county (headquarters), not its coverage.
+
+## Trust & Intelligence Engine, Phase 2 endpoints
+
+- `GET /v1/monitor` — live account monitoring, one status per
+  registry source: `source_id`, `name`, `channel` (`rss` for the 12
+  registry outlets), `enabled`, `last_checked_at`,
+  `last_success_at`, `last_new_at` (moves only when a run inserts a
+  document), `consecutive_failures`, `documents_total`,
+  `last_error`, `freshness` (`fresh`/`stale`/`unknown` — fresh is a
+  last success within twice the ingest interval),
+  `change_detection` (`new_items_only` for RSS, `webhook_events`
+  for Facebook, `none` for disabled sources), `latest_doc`
+  (newest document: `title`, `url`, `fetched_at`) and a plain-words
+  `note`. A `facebook` object carries the connector state
+  (`available`, `reason`, `registered_pages`, `pending_pages`,
+  `pages_polled_total`, `pages_failed_total`,
+  `notifications_pending`) — honestly unavailable until a token and
+  registered pages exist. `summary` counts fresh/stale/unknown.
+  Filters: `?source=<id>` (unknown id is 404), `?channel=rss|facebook`
+  (else 400). Timestamps are ISO strings, null when the event has
+  never happened.
 
 ## Popular searches and freshness (Roadmap 6.4)
 

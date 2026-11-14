@@ -63,6 +63,47 @@ test "archive key is a compressed object key" {
     try std.testing.expectEqualStrings("raw/new-dawn/1794441600.xml.zst", key);
 }
 
+test "pipeline recordHealth: last_new_at moves only on an inserting run" {
+    const alloc = std.testing.allocator;
+    var k = knowledge.MemoryKnowledge.init(alloc);
+    defer k.deinit();
+    const ks = k.asKnowledge();
+    // getSourceHealth dupes its strings into the caller's allocator;
+    // free each read before the next (the store keeps its own copies).
+    const freeHealth = struct {
+        fn free(a: std.mem.Allocator, h: knowledge.SourceHealth) void {
+            a.free(h.source_id);
+            if (h.last_error) |e| a.free(e);
+        }
+    }.free;
+    // First run inserts 2 docs: last_new_at stamps now.
+    recordHealth(ks, alloc, "new-dawn", 1000, true, null, 2);
+    var h = (try ks.getSourceHealth(alloc, "new-dawn")).?;
+    try std.testing.expectEqual(@as(?i64, 1000), h.last_new_at);
+    try std.testing.expectEqual(@as(usize, 2), h.docs_total);
+    freeHealth(alloc, h);
+    // Second run inserts nothing: the stamp stays, docs_total stays.
+    recordHealth(ks, alloc, "new-dawn", 2000, true, null, 0);
+    h = (try ks.getSourceHealth(alloc, "new-dawn")).?;
+    try std.testing.expectEqual(@as(?i64, 1000), h.last_new_at);
+    try std.testing.expectEqual(@as(usize, 2), h.docs_total);
+    try std.testing.expectEqual(@as(?i64, 2000), h.last_success_at);
+    freeHealth(alloc, h);
+    // A failing run keeps the stamp too.
+    recordHealth(ks, alloc, "new-dawn", 3000, false, "fetch failed", 0);
+    h = (try ks.getSourceHealth(alloc, "new-dawn")).?;
+    try std.testing.expectEqual(@as(?i64, 1000), h.last_new_at);
+    try std.testing.expectEqual(@as(usize, 1), h.consecutive_failures);
+    freeHealth(alloc, h);
+    // A later inserting run moves it forward.
+    recordHealth(ks, alloc, "new-dawn", 4000, true, null, 1);
+    h = (try ks.getSourceHealth(alloc, "new-dawn")).?;
+    try std.testing.expectEqual(@as(?i64, 4000), h.last_new_at);
+    try std.testing.expectEqual(@as(usize, 3), h.docs_total);
+    try std.testing.expectEqual(@as(usize, 0), h.consecutive_failures);
+    freeHealth(alloc, h);
+}
+
 test "pipeline retraction: publisher marker flips the event to retracted" {
     const memory = @import("../storage/memory.zig");
     const alloc = std.testing.allocator;
@@ -123,7 +164,17 @@ fn recordHealth(
         .last_error = if (ok) null else err_detail,
         .consecutive_failures = if (ok) 0 else if (prev) |p| p.consecutive_failures + 1 else 1,
         .docs_total = (if (prev) |p| p.docs_total else 0) + inserted,
+        // Phase 2 monitoring: a new document arrived in this run.
+        // Otherwise keep the previous value — a fetch with nothing
+        // new is not activity, and the stamp never moves backwards.
+        .last_new_at = if (ok and inserted > 0) now else if (prev) |p| p.last_new_at else null,
     };
+    // getSourceHealth dupes its strings into the caller's allocator;
+    // the health above only borrows scalars, so free them here.
+    if (prev) |p| {
+        alloc.free(p.source_id);
+        if (p.last_error) |e| alloc.free(e);
+    }
     ks.recordSourceHealth(alloc, health) catch |e| {
         logging.warn("source health record failed", &.{
             .{ .key = "source", .value = source_id },

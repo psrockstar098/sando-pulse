@@ -5,6 +5,7 @@
 //!   GET  /v1/sources  public — source registry + per-source doc counts
 //!   GET  /v1/sources/profiles public — source profiles (Trust & Intelligence Engine, Phase 1)
 //!   GET  /v1/counties public — all 15 counties + source counts (Phase 1)
+//!   GET  /v1/monitor public — live account monitoring (Trust & Intelligence Engine, Phase 2)
 //!   GET  /v1/events   public — persisted event clusters (Roadmap 3.4)
 //!   GET  /v1/trends   public — Geez + trending engine (Roadmap 4.2)
 //!   GET  /v1/forecast public — predictive trends (Roadmap 7.1)
@@ -42,6 +43,7 @@ const facebook = @import("../ingestion/connectors/facebook/facebook.zig");
 const fb_webhooks = @import("../ingestion/connectors/facebook/webhooks.zig");
 const trending = @import("../intelligence/trending.zig");
 const trust_registry = @import("../intelligence/trust/source_registry.zig");
+const monitor_mod = @import("../intelligence/monitor/account_monitor.zig");
 const forecast_mod = @import("../intelligence/forecast.zig");
 const statanswer = @import("../intelligence/statanswer.zig");
 const alerts_mod = @import("../intelligence/alerts.zig");
@@ -1118,6 +1120,75 @@ pub const Server = struct {
             return;
         }
 
+        if (method == .GET and std.mem.eql(u8, path, "/v1/monitor")) {
+            // Trust & Intelligence Engine, Phase 2: live account
+            // monitoring. One status per registry source (health from
+            // the knowledge store, newest document from the repo) plus
+            // the Facebook connector state. `?source=<id>` returns one
+            // status (404 when unknown); `?channel=rss|facebook`
+            // filters the list. Public, like /v1/sources.
+            const now = timex.nowSeconds(self.io);
+            const interval_s: i64 = @intCast(self.cfg.ingest_interval_s);
+            const q = head.query;
+            var healths: [sources.sources.len]?knowledge.SourceHealth = undefined;
+            for (&healths) |*h| h.* = null;
+            if (self.knowledge) |k| {
+                for (sources.sources, 0..) |s, i| {
+                    healths[i] = k.getSourceHealth(alloc, s.id) catch null;
+                }
+            }
+            var latests: [sources.sources.len]?monitor_mod.LatestDoc = undefined;
+            for (&latests) |*l| l.* = null;
+            const scanned = self.repo.scanDocuments(alloc, null, 500) catch &.{};
+            for (scanned) |d| {
+                for (sources.sources, 0..) |s, i| {
+                    if (latests[i] != null) continue;
+                    if (std.mem.eql(u8, d.source_id, s.id)) {
+                        latests[i] = .{ .title = d.title, .url = d.url, .fetched_at = d.fetched_at };
+                    }
+                }
+            }
+            var statuses = try monitor_mod.allStatuses(alloc, &healths, &latests, now, interval_s);
+            if (queryParam(q, "source")) |sid| {
+                var found: ?monitor_mod.MonitorStatus = null;
+                for (statuses) |st| {
+                    if (std.mem.eql(u8, st.source_id, sid)) found = st;
+                }
+                const one = found orelse {
+                    self.respondError(req, alloc, req_id, .not_found, "source_not_found", "No monitored source with that id");
+                    return;
+                };
+                statuses = @constCast(&[_]monitor_mod.MonitorStatus{one});
+            }
+            if (queryParam(q, "channel")) |ch| {
+                if (!std.mem.eql(u8, ch, "rss") and !std.mem.eql(u8, ch, "facebook")) {
+                    self.respondError(req, alloc, req_id, .bad_request, "invalid_channel", "channel must be rss or facebook");
+                    return;
+                }
+                var kept: std.ArrayList(monitor_mod.MonitorStatus) = .empty;
+                for (statuses) |st| {
+                    if (std.mem.eql(u8, st.channel, ch)) try kept.append(alloc, st);
+                }
+                statuses = kept.items;
+            }
+            var fb_json: ?query_json.FacebookMonitorJson = null;
+            if (self.facebook) |fb| {
+                fb_json = .{
+                    .available = fb.validate() == null,
+                    .reason = fb.validate(),
+                    .registered_pages = fb.registeredPages(),
+                    .pending_pages = fb.pendingPages(),
+                    .pages_polled_total = fb.pages_polled_total,
+                    .pages_failed_total = fb.pages_failed_total,
+                    .notifications_pending = fb.pendingNotificationCount(alloc),
+                };
+            }
+            const body = try query_json.buildMonitorResponse(alloc, req_id, statuses, fb_json, interval_s);
+            self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+            try respondJson(req, .ok, body, req_id);
+            return;
+        }
+
         if (method == .GET and std.mem.eql(u8, path, "/v1/events")) {
             if (self.knowledge) |k| {
                 // Detail: /v1/events?id=<event_id> — the event plus
@@ -1984,6 +2055,7 @@ pub const Server = struct {
         if ((method == .GET or method == .POST) and
             (std.mem.eql(u8, path, "/v1/health") or std.mem.eql(u8, path, "/v1/sources") or
                 std.mem.eql(u8, path, "/v1/sources/profiles") or std.mem.eql(u8, path, "/v1/counties") or
+                std.mem.eql(u8, path, "/v1/monitor") or
                 std.mem.eql(u8, path, "/v1/events") or std.mem.eql(u8, path, "/v1/trends") or
                 std.mem.eql(u8, path, "/v1/forecast") or std.mem.eql(u8, path, "/v1/alerts") or
                 std.mem.eql(u8, path, "/v1/social") or
