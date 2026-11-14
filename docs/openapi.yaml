@@ -550,6 +550,37 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
+  /v1/sources/scores:
+    get:
+      tags: [intelligence]
+      summary: Credibility scores, all sources, Phase 4 (no auth)
+      responses:
+        "200":
+          description: Weighted credibility scores (accuracy 30%, corroboration 20%, evidence 15%, original reporting 10%, timeliness 10%, corrections 10%, local knowledge 5%) over the last 30 days, with rating 1-5 (null when provisional) and the basis for each component.
+          content:
+            application/json:
+              schema:
+                type: object
+  /v1/rankings:
+    get:
+      tags: [intelligence]
+      summary: Per-county source ranking, Phase 4 (no auth)
+      parameters:
+        - name: county
+          in: query
+          required: true
+          description: County name (unknown county is 400).
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The county's registered sources ranked by credibility score, top 20. A county with no registered sources returns an empty list.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
   /v1/events:
     get:
       tags: [intelligence]

@@ -254,6 +254,26 @@ Every `POST /v1/query` 200 carries, alongside the answer:
   the documents, never generated. Unknown event id is 404; missing
   `event` is 400.
 
+## Trust & Intelligence Engine, Phase 4 endpoints
+
+- `GET /v1/sources/scores` — credibility scores for all 12
+  registered sources, computed on demand from the last 30 days of
+  documents + events. Each score: `source_id`, `source_name`,
+  `total` (0..1 weighted), `rating` (1–5, null when provisional),
+  `provisional` + `provisional_reason` (fewer than 5 documents in
+  the window), `docs_in_window`, and the 7 `components` (name,
+  weight, value, basis). Weights: accuracy 0.30, corroboration
+  0.20, evidence 0.15, original reporting 0.10, timeliness 0.10,
+  corrections 0.10, local knowledge 0.05. Computing a score notes
+  it in the registry history (`score_changed`) when it changed —
+  visible on `GET /v1/sources/profiles?id=<id>`.
+- `GET /v1/rankings?county=<name>` — the county's registered
+  sources ranked by total, highest first, top 20. Returns `county`,
+  `capital`, `candidates` (registered sources based there),
+  `rankings` (rank, source, total, rating, provisional) and a plain
+  note. A known county with no sources returns an empty list with
+  the honest note; an unknown county or a missing `county` is 400.
+
 ## Popular searches and freshness (Roadmap 6.4)
 
 - `GET /v1/popular?limit=N` returns the most-asked queries,

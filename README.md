@@ -76,6 +76,8 @@ published**. The API container runs migrations on boot.
 | GET | `/v1/monitor` | no | Live account monitoring (Trust & Intelligence Engine, Phase 2): per-source last check / success / new item, freshness, change detection; `?source=`, `?channel=` |
 | GET | `/v1/evidence` | no | Claim evidence assessment (Trust & Intelligence Engine, Phase 3): `?event=<id>` assesses the event's own claim, `?claim=<text>` searches the store for the claim; status is an assessment, never a verdict |
 | GET | `/v1/claims` | no | Claims extracted from one event's documents (Trust & Intelligence Engine, Phase 3): `?event=<id>` |
+| GET | `/v1/sources/scores` | no | Credibility scores for all 12 sources, 30-day window (Trust & Intelligence Engine, Phase 4): weighted total, rating 1–5 (null when provisional), 7 components with basis |
+| GET | `/v1/rankings` | no | Per-county source ranking, top 20 of up to 50 registered candidates (Trust & Intelligence Engine, Phase 4): `?county=` required |
 | GET | `/v1/trends` | no | Geez + geo trends; carries `computed_at` + `stale` (Roadmap 6.4) |
 | GET | `/v1/briefing` | no | Precomputed briefing; carries `cached` + `stale` (Roadmap 6.4) |
 | GET | `/v1/popular` | no | Most-asked queries with counts (Roadmap 6.4) |
@@ -218,6 +220,7 @@ Live account monitoring (spec: `~/workspace/sando-pulse-trust-intelligence-engin
 
 - **Monitor** (`GET /v1/monitor`, `?source=`, `?channel=rss|facebook`): one status per registry source — last check, last success, last new item (`last_new_at`, migration 014; moves only when a run inserts a document, never on a fetch that returns nothing new), consecutive failures, documents total, last error, newest document (title + URL + fetch time), and `freshness` (`fresh` = last success within twice the ingest interval, `stale` = older, `unknown` = never succeeded). Change detection is labelled per channel: RSS is `new_items_only` (a feed cannot report edits or deletions); Facebook is `webhook_events` (Meta webhooks + poll reconciliation); disabled sources are `none`. The response also carries the Facebook connector state (available/reason, registered pages, pending pages, polls, pending webhook notifications) — honestly unavailable until a token + pages are configured.
 - **Evidence** (`GET /v1/evidence?event=<id>` or `?claim=<text>`, `GET /v1/claims?event=<id>` — Phase 3): claim extraction (title + lead sentence, copied from the document, never generated) and an evidence assessment per claim — `verified` (4+ independent sources agree, no flags), `corroborated` (2–3 sources), `partially_confirmed` (publisher corrected part of the story), `unconfirmed` (one source or none), `disputed` (contradiction flags among the supporting documents, or the publisher retracted the report), `outdated` (a newer report on the same topic exists and this one is over 30 days old). Each record cites its supporting documents and flags with a plain-words explanation and a documented confidence formula — and there is deliberately NO `false` status: calling a claim false is a verdict, and Pulse never issues verdicts (see STATUS.md).
+- **Scores + rankings** (`GET /v1/sources/scores`, `GET /v1/rankings?county=` — Phase 4): credibility scores computed on demand from the last 30 days of documents + events. Weights: accuracy 30%, corroboration 20%, evidence 15%, original reporting 10%, timeliness 10%, corrections 10%, local knowledge 5%. Rating 1–5 from the weighted total; a source with fewer than 5 documents in the window is provisional (rating null, reason stated). Score changes are written to the registry history log (`score_changed`), so a source can see why its score moved. Rankings cover registered sources only, top 20 per county — a county with no registered sources ranks nothing, honestly.
 - **Storage**: migration 014 (`source_health.last_new_at`); the pipeline's `recordHealth` stamps it on inserting runs and preserves it otherwise.
 - **Honest gaps**: county-source discovery was described in Phase 1 docs as "Phase 2" — it is not: Phase 2 monitors the 12 registered sources; no new county sources are registered here, and none are invented. Registration of county bloggers/pages is still an open step (Phase 4 ranks whatever is registered). `last_new_at` is null for every source until a worker run inserts a document after migration 014.
 
@@ -276,7 +279,7 @@ docs/INTERFACES.md      internal module interfaces
 
 ## Tests
 
-`zig build test` — 302 tests (planner, ranking, index, RSS parsing, fetcher
+`zig build test` — 307 tests (planner, ranking, index, RSS parsing, fetcher
 parsing, auth, rate limiting, metrics, JSON, Postgres wire protocol, Redis
-RESP2, S3 signing, Trust & Intelligence Engine Phases 1–3). The Postgres and Redis live tests are gated on
+RESP2, S3 signing, Trust & Intelligence Engine Phases 1–4). The Postgres and Redis live tests are gated on
 `PULSE_TEST_POSTGRES_URL` / `PULSE_TEST_REDIS_URL` and skip without servers.

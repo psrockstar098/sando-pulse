@@ -137,6 +137,13 @@ fn profileFromSource(s: sources.Source) SourceProfile {
     };
 }
 
+/// The last score noted for one source, so noteScore can tell a
+/// real change from a recompute of the same score.
+pub const LastRating = struct {
+    rating: ?u8,
+    total: f64,
+};
+
 /// The Phase 1 registry: the 12 profiles derived from the ingestion
 /// registry, plus the history log. The log is seeded at init with one
 /// `profile_created` entry per source — the registry really was
@@ -144,11 +151,17 @@ fn profileFromSource(s: sources.Source) SourceProfile {
 pub const Registry = struct {
     alloc: std.mem.Allocator,
     history: history_mod.SourceHistory,
+    /// Last noted score per registry source (registry order). Null
+    /// until a score is first computed.
+    last_ratings: [sources.sources.len]?LastRating,
 
     pub fn init(alloc: std.mem.Allocator, now: i64) !Registry {
+        var last_ratings: [sources.sources.len]?LastRating = undefined;
+        for (&last_ratings) |*r| r.* = null;
         var reg = Registry{
             .alloc = alloc,
             .history = history_mod.SourceHistory.init(alloc),
+            .last_ratings = last_ratings,
         };
         errdefer reg.history.deinit();
         for (sources.sources) |s| {
@@ -174,6 +187,27 @@ pub const Registry = struct {
         _ = self;
         const s = sources.find(id) orelse return null;
         return profileFromSource(s);
+    }
+
+    /// Record a computed score in the history log — but only when it
+    /// CHANGED. A recompute of the same rating and total (within 0.01)
+    /// writes nothing, so the log stays an audit trail of real
+    /// changes, not a row per page view. The first score for a source
+    /// is always recorded. `rating` is null for a provisional score.
+    pub fn noteScore(self: *Registry, source_id: []const u8, rating: ?u8, total: f64, at: i64) !void {
+        for (sources.sources, 0..) |s, i| {
+            if (!std.mem.eql(u8, s.id, source_id)) continue;
+            if (self.last_ratings[i]) |last| {
+                if (last.rating == rating and @abs(last.total - total) < 0.01) return;
+            }
+            self.last_ratings[i] = .{ .rating = rating, .total = total };
+            var rating_buf: [16]u8 = undefined;
+            const rating_str = if (rating) |r| std.fmt.bufPrint(&rating_buf, "{d}/5", .{r}) catch "?" else "provisional";
+            const detail = try std.fmt.allocPrint(self.alloc, "Credibility score {d:.2} (rating {s})", .{ total, rating_str });
+            defer self.alloc.free(detail);
+            try self.history.record(source_id, "score_changed", detail, at);
+            return;
+        }
     }
 
     /// Is `name` one of Liberia's 15 counties? Case-insensitive.

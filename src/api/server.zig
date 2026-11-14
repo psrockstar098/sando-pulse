@@ -8,6 +8,8 @@
 //!   GET  /v1/monitor public — live account monitoring (Trust & Intelligence Engine, Phase 2)
 //!   GET  /v1/evidence public — claim evidence assessment (Phase 3)
 //!   GET  /v1/claims public — claims extracted from one event (Phase 3)
+//!   GET  /v1/sources/scores public — credibility scores, all sources (Phase 4)
+//!   GET  /v1/rankings public — per-county source ranking (Phase 4)
 //!   GET  /v1/events   public — persisted event clusters (Roadmap 3.4)
 //!   GET  /v1/trends   public — Geez + trending engine (Roadmap 4.2)
 //!   GET  /v1/forecast public — predictive trends (Roadmap 7.1)
@@ -47,6 +49,8 @@ const trending = @import("../intelligence/trending.zig");
 const trust_registry = @import("../intelligence/trust/source_registry.zig");
 const trust_evidence = @import("../intelligence/trust/evidence_tracker.zig");
 const trust_corroboration = @import("../intelligence/trust/corroboration.zig");
+const trust_score = @import("../intelligence/trust/credibility_score.zig");
+const events_intel = @import("../intelligence/events.zig");
 const monitor_mod = @import("../intelligence/monitor/account_monitor.zig");
 const fuzzy = @import("../engine/fuzzy.zig");
 const forecast_mod = @import("../intelligence/forecast.zig");
@@ -684,6 +688,47 @@ pub const Server = struct {
             }
         }
         return out.toOwnedSlice(alloc);
+    }
+
+    /// Trust & Intelligence Engine, Phase 4: compute all sources'
+    /// credibility scores from the last 30 days of documents and
+    /// events. The window scan is newest-first and capped
+    /// (max_docs_scored); events are capped too, so the on-demand
+    /// computation stays bounded.
+    fn computeScores(self: *Server, alloc: std.mem.Allocator, now: i64) ![]trust_score.Score {
+        const window_start = now - trust_score.window_days * 86400;
+        const scanned = self.repo.scanDocuments(alloc, null, 500) catch &.{};
+        var docs: std.ArrayList(types.Document) = .empty;
+        for (scanned) |d| {
+            if (docs.items.len >= trust_score.max_docs_scored) break;
+            if (knowledge.docTs(d) < window_start) continue;
+            try docs.append(alloc, d);
+        }
+        var evts: std.ArrayList(trust_score.ScoredEvent) = .empty;
+        if (self.knowledge) |k| {
+            const all = k.listEvents(alloc, trust_score.max_events_scored) catch &.{};
+            for (all) |e| {
+                const edocs = k.eventDocs(alloc, e.id) catch continue;
+                const flags = events_intel.detectContradictionFlags(alloc, edocs) catch &.{};
+                try evts.append(alloc, .{
+                    .id = e.id,
+                    .status = e.status,
+                    .distinct_sources = e.distinct_sources,
+                    .docs = edocs,
+                    .has_flag = flags.len > 0,
+                });
+            }
+        }
+        return trust_score.scoreAll(alloc, docs.items, evts.items, now);
+    }
+
+    /// Record each computed score in the registry history when it
+    /// changed (noteScore dedupes). A failure to log never fails the
+    /// request — the scores are still served.
+    fn noteScores(self: *Server, scores: []const trust_score.Score, now: i64) void {
+        for (scores) |s| {
+            self.trust_registry.noteScore(s.source_id, s.rating, s.total, now) catch {};
+        }
     }
 
     /// Result of running the full query pipeline (Roadmap 6.4 warming).
@@ -1377,6 +1422,68 @@ pub const Server = struct {
                 return;
             }
             self.respondError(req, alloc, req_id, .bad_request, "missing_param", "Pass ?event=<id>");
+            return;
+        }
+
+        if (method == .GET and std.mem.eql(u8, path, "/v1/sources/scores")) {
+            // Trust & Intelligence Engine, Phase 4: credibility scores
+            // for all 12 registered sources, computed on demand from
+            // the last 30 days of documents + events. Each score is
+            // noted in the registry history when it changes (the
+            // audit trail). Public.
+            const now = timex.nowSeconds(self.io);
+            const scores = self.computeScores(alloc, now) catch {
+                self.respondError(req, alloc, req_id, .internal_server_error, "scores_failed", "Failed to compute scores");
+                return;
+            };
+            self.noteScores(scores, now);
+            const body = try query_json.buildScoresResponse(alloc, req_id, scores, trust_score.window_days);
+            self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+            try respondJson(req, .ok, body, req_id);
+            return;
+        }
+
+        if (method == .GET and std.mem.eql(u8, path, "/v1/rankings")) {
+            // Trust & Intelligence Engine, Phase 4: per-county
+            // ranking of REGISTERED sources only (top 20 of up to 50
+            // candidates). `?county=` is required; an unknown county
+            // is 400; a known county with no sources ranks nothing.
+            // Public.
+            const county = queryParam(head.query, "county") orelse {
+                self.respondError(req, alloc, req_id, .bad_request, "missing_param", "Pass ?county=<name>");
+                return;
+            };
+            if (!trust_registry.Registry.isKnownCounty(county)) {
+                self.respondError(req, alloc, req_id, .bad_request, "unknown_county", "No such county");
+                return;
+            }
+            const profiles = self.trust_registry.profilesForCounty(alloc, county) catch {
+                self.respondError(req, alloc, req_id, .internal_server_error, "rankings_failed", "Failed to list county sources");
+                return;
+            };
+            var ids: std.ArrayList([]const u8) = .empty;
+            for (profiles) |p| try ids.append(alloc, p.id);
+            var capital: []const u8 = "";
+            for (geo.county_capitals) |cc| {
+                if (std.ascii.eqlIgnoreCase(cc.county, county)) capital = cc.capital;
+            }
+            const now = timex.nowSeconds(self.io);
+            const scores = self.computeScores(alloc, now) catch {
+                self.respondError(req, alloc, req_id, .internal_server_error, "scores_failed", "Failed to compute scores");
+                return;
+            };
+            self.noteScores(scores, now);
+            const ranked = trust_score.rankScores(alloc, scores, ids.items, 20) catch {
+                self.respondError(req, alloc, req_id, .internal_server_error, "rankings_failed", "Failed to rank sources");
+                return;
+            };
+            const note = if (ranked.len == 0)
+                "No sources registered for this county yet — rankings only cover registered sources, none are invented."
+            else
+                "Ranked by credibility score, highest first. Provisional entries have fewer than 5 documents in the window.";
+            const body = try query_json.buildRankingsResponse(alloc, req_id, county, capital, ids.items.len, ranked, note);
+            self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+            try respondJson(req, .ok, body, req_id);
             return;
         }
 
@@ -2248,6 +2355,7 @@ pub const Server = struct {
                 std.mem.eql(u8, path, "/v1/sources/profiles") or std.mem.eql(u8, path, "/v1/counties") or
                 std.mem.eql(u8, path, "/v1/monitor") or
                 std.mem.eql(u8, path, "/v1/evidence") or std.mem.eql(u8, path, "/v1/claims") or
+                std.mem.eql(u8, path, "/v1/sources/scores") or std.mem.eql(u8, path, "/v1/rankings") or
                 std.mem.eql(u8, path, "/v1/events") or std.mem.eql(u8, path, "/v1/trends") or
                 std.mem.eql(u8, path, "/v1/forecast") or std.mem.eql(u8, path, "/v1/alerts") or
                 std.mem.eql(u8, path, "/v1/social") or

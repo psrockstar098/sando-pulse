@@ -15,6 +15,7 @@ const trust_registry = @import("../intelligence/trust/source_registry.zig");
 const trust_history = @import("../intelligence/trust/source_history.zig");
 const trust_evidence = @import("../intelligence/trust/evidence_tracker.zig");
 const trust_corroboration = @import("../intelligence/trust/corroboration.zig");
+const trust_score = @import("../intelligence/trust/credibility_score.zig");
 const monitor = @import("../intelligence/monitor/account_monitor.zig");
 
 pub const QueryRequest = struct {
@@ -1466,4 +1467,99 @@ test "buildEvidenceResponse renders status, confidence, supporting and flags" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"status\":\"corroborated\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "not a verdict") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "New Dawn") != null);
+}
+
+/// Trust & Intelligence Engine, Phase 4: one source's credibility
+/// score as JSON (components with weights, values and the basis for
+/// each; rating null when provisional).
+pub const ScoreComponentJson = struct {
+    name: []const u8,
+    weight: f64,
+    value: f64,
+    basis: []const u8,
+};
+
+pub const ScoreJson = struct {
+    source_id: []const u8,
+    source_name: []const u8,
+    total: f64,
+    rating: ?u8,
+    provisional: bool,
+    provisional_reason: ?[]const u8,
+    docs_in_window: usize,
+    components: [7]ScoreComponentJson,
+};
+
+fn scoreJson(s: trust_score.Score) ScoreJson {
+    var comps: [7]ScoreComponentJson = undefined;
+    for (s.components, 0..) |c, i| {
+        comps[i] = .{ .name = c.name, .weight = c.weight, .value = c.value, .basis = c.basis };
+    }
+    return .{
+        .source_id = s.source_id,
+        .source_name = s.source_name,
+        .total = s.total,
+        .rating = s.rating,
+        .provisional = s.provisional,
+        .provisional_reason = s.provisional_reason,
+        .docs_in_window = s.docs_in_window,
+        .components = comps,
+    };
+}
+
+/// Trust & Intelligence Engine, Phase 4: all sources' scores.
+pub fn buildScoresResponse(
+    alloc: std.mem.Allocator,
+    req_id: []const u8,
+    scores: []const trust_score.Score,
+    window_days: i64,
+) ![]u8 {
+    var list: std.ArrayList(ScoreJson) = .empty;
+    for (scores) |s| try list.append(alloc, scoreJson(s));
+    return stringifyAlloc(alloc, .{
+        .window_days = window_days,
+        .total = list.items.len,
+        .scores = list.items,
+        .weights_note = "accuracy 30%, corroboration 20%, evidence 15%, original reporting 10%, timeliness 10%, corrections 10%, local knowledge 5%. Rating 1-5; null when provisional (fewer than 5 documents in the window).",
+        .request_id = req_id,
+    });
+}
+
+/// Trust & Intelligence Engine, Phase 4: one county's ranking.
+pub fn buildRankingsResponse(
+    alloc: std.mem.Allocator,
+    req_id: []const u8,
+    county: []const u8,
+    capital: []const u8,
+    candidates: usize,
+    ranked: []const trust_score.RankedEntry,
+    note: []const u8,
+) ![]u8 {
+    var list: std.ArrayList(struct {
+        rank: usize,
+        source_id: []const u8,
+        source_name: []const u8,
+        total: f64,
+        rating: ?u8,
+        provisional: bool,
+    }) = .empty;
+    for (ranked) |r| {
+        try list.append(alloc, .{
+            .rank = r.rank,
+            .source_id = r.score.source_id,
+            .source_name = r.score.source_name,
+            .total = r.score.total,
+            .rating = r.score.rating,
+            .provisional = r.score.provisional,
+        });
+    }
+    return stringifyAlloc(alloc, .{
+        .county = county,
+        .capital = capital,
+        .candidates = candidates,
+        .total = list.items.len,
+        .rankings = list.items,
+        .note = note,
+        .request_id = req_id,
+    });
 }

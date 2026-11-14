@@ -83,6 +83,7 @@ pub const intelligence_trust_registry = @import("intelligence/trust/source_regis
 pub const intelligence_trust_history = @import("intelligence/trust/source_history.zig");
 pub const intelligence_trust_evidence = @import("intelligence/trust/evidence_tracker.zig");
 pub const intelligence_trust_corroboration = @import("intelligence/trust/corroboration.zig");
+pub const intelligence_trust_score = @import("intelligence/trust/credibility_score.zig");
 pub const intelligence_monitor = @import("intelligence/monitor/account_monitor.zig");
 pub const cli_loadtest = @import("cli/loadtest.zig");
 pub const cli_audit = @import("cli/audit.zig");

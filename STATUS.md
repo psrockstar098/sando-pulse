@@ -1,15 +1,17 @@
 # Sando Pulse — Roadmap 1 STATUS
 
-Last verified: **2026-11-14 ~20:15 GMT**. Zig 0.17.1 (`~/.local/bin/zig`).
+Last verified: **2026-11-14 ~20:45 GMT**. Zig 0.17.1 (`~/.local/bin/zig`).
 
-⚠ Environment note (2026-11-14 ~20:10): the VM was REPLACED — uptime
-3 min, PostgreSQL and Redis packages are gone entirely (not just
-stopped), and the `pulse_test` DB is gone with them. Phase 3 was
-verified on the memory store (see below); the Postgres restore is
-an apt reinstall (`postgresql-16`, `redis-server`, postgis, pgvector)
-in progress. The 10 live Postgres/Redis tests fail with
-ConnectionRefused until the packages are back — that is
-environmental, not a code failure.
+⚠ Environment note (2026-11-14 ~20:10–20:35): the VM was REPLACED —
+PostgreSQL and Redis packages were gone entirely and the `pulse_test`
+DB with them. Restored 2026-11-14 ~20:35 by apt reinstall
+(`postgresql-16`, `redis-server`, `postgresql-16-postgis-3`,
+`postgresql-16-pgvector` — the exact versions Pulse needs), services
+started, `pulse_test` recreated with extensions, migrations 001–014
+applied, worker run 3 → 133 docs, 50 events. Phase 3 was verified
+on the memory store before the restore; Phase 4 is verified on the
+restored Postgres. The 10 live-test failures during the outage were
+environmental, not code.
 Project: `~/workspace/pulse`. Local git only — no remote, nothing pushed.
 
 ## Verdict
@@ -1438,3 +1440,85 @@ system. No migration: everything is computed live from the store.
 - Claim extraction is extractive only: a claim buried mid-article
   (not in the title or first sentence) is not extracted. Full
   claim-mining over article text is a later phase's work.
+
+## Trust & Intelligence Engine — Phase 4 — COMPLETE 2026-11-14 ~20:45 GMT
+
+Spec: `~/workspace/sando-pulse-trust-intelligence-engine.md` — Phase 4
+("scoring + rankings", spec section 3), computed from the store, on
+demand. No migration.
+
+### What was built
+
+- `src/intelligence/trust/credibility_score.zig`: the scorer. Weights
+  per spec (accuracy 30%, corroboration 20%, evidence 15%, original
+  reporting 10%, timeliness 10%, corrections 10%, local knowledge
+  5%). Every component is computed from the store and carries its
+  basis string: accuracy = share of the source's event documents in
+  events with no contradiction flag (neutral 0.5 with no event data);
+  corroboration = share in multi-source events; evidence = share with
+  substantive text (>= 200 chars) + URL; original reporting = share
+  whose title is not a near-duplicate (>= 0.9) of another source's
+  story within 2 days; timeliness = average ingest lag (<= 1h is 1.0,
+  >= 24h is 0.0); corrections = 1.0 when a retraction/correction
+  marker appears in the source's documents, else 0.5 neutral (a clean
+  record and a never-corrected record look the same, so absence is
+  not scored as failure); local knowledge = share mentioning a county
+  beyond Montserrado or a Liberian city. Rating 1–5 from the total
+  (>= 0.85 → 5, >= 0.70 → 4, >= 0.55 → 3, >= 0.40 → 2, else 1);
+  fewer than 5 documents in the window is provisional (rating null,
+  reason stated). `rankScores` ranks one county's sources by total,
+  top 20, ties by source id.
+- `Registry.noteScore` + `last_ratings` (`source_registry.zig`): a
+  computed score is written to the history log as `score_changed`
+  only when the rating or total (within 0.01) actually changed, so
+  the log stays an audit trail of real changes.
+- API (public, REST only): `GET /v1/sources/scores` (all 12, 30-day
+  window) and `GET /v1/rankings?county=<name>` (top 20 of the
+  county's registered sources; unknown county or missing county 400).
+- Docs: README (API table + Phase 4 section + test count), STATUS.md
+  (this section), docs/API.md, docs/openapi.yaml.
+
+### Verified 2026-11-14 ~20:40–20:45
+
+- `zig build` passes; `zig build test` **307/307 pass** (302 baseline
+  + 5 new: 1 rating thresholds, 4 scoring; the live tests pass again
+  now that Postgres/Redis are restored).
+- Smoke test on the restored Postgres (port 19099; worker run 3 →
+  133 docs, 50 events, `had_error: false`): `/v1/sources/scores`
+  returns all 12 sources — totals 0.43–0.56, ratings 2–3 for the 8
+  sources with documents in the window, the 3 disabled sources
+  provisional (0 docs, rating null); `/v1/rankings?county=Montserrado`
+  ranks 12 (the-analyst 0.56 first); `?county=Nimba` returns an empty
+  list with the honest note; unknown county 400, missing county 400;
+  `GET /v1/sources/profiles?id=new-dawn` history shows
+  `profile_created` + `score_changed` — the audit trail works.
+- Two real bugs caught by tests and fixed in this commit: (1) the
+  originality check compared a source only against its OWN documents
+  (scoreOne received just `mine`), so a cross-source copy could never
+  be detected — the full window is now passed in; (2) `published_at`
+  is optional on `types.Document` — the scorer uses `docTs`
+  (published, else fetched) for the duplicate window and unwraps
+  `published_at` for the lag average.
+
+### Phase 4 honest gaps
+
+- The scoring window is keyed on PUBLICATION time (`docTs`), not
+  fetch time: a source whose feed serves older items scores fewer
+  documents. Observed live: Local Voices has 10 documents in the
+  store but 0 in the window (all published over 30 days ago), so it
+  reads provisional; new-dawn 13 in store, 11 in window; kmtv 10 in
+  store, 8 in window. That is the design (a source republishing
+  month-old stories should not look current), but it means the
+  window is only as fresh as the feeds' dates.
+- On real data the totals cluster 0.43–0.56 (ratings 2–3): the
+  components are honest but undifferentiated after one worker run —
+  accuracy and corroboration are thin (few multi-source events in a
+  single day's ingest), and corrections is neutral 0.5 for every
+  source (no markers found). Scores will spread as the store grows.
+- The on-demand computation caps at 200 documents / 50 events
+  (newest first). On a store much larger than that, older window
+  documents are silently excluded from scoring.
+- Rankings are per base county (headquarters), not coverage: all 12
+  sources are Montserrado-based, so 14 counties rank empty until
+  county sources are registered. Phase 4 ranks what is registered;
+  it does not invent candidates.
