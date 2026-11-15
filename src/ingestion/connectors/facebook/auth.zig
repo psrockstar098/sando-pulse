@@ -13,14 +13,14 @@
 //!   PULSE_FACEBOOK_APP_ID       — Meta app id (webhook config)
 //!   PULSE_FACEBOOK_APP_SECRET   — Meta app secret (webhook signatures)
 //!   PULSE_FACEBOOK_VERIFY_TOKEN — webhook verification token
-//!   PULSE_FACEBOOK_API_VERSION  — Graph API version, default "v26.0"
+//!   PULSE_FACEBOOK_API_VERSION  — Graph API version, default "v27.0"
 //!   PULSE_FACEBOOK_REGISTRY_PATH — page registry JSON file
 //!   PULSE_FACEBOOK_POLL_INTERVAL_S — polling fallback interval,
 //!     default 900, minimum 60.
 
 const std = @import("std");
 
-pub const default_api_version = "v26.0";
+pub const default_api_version = "v27.0";
 pub const default_poll_interval_s: u64 = 900;
 pub const min_poll_interval_s: u64 = 60;
 
