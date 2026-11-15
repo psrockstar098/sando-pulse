@@ -305,7 +305,7 @@ test "connector validates unconfigured; collect returns empty without contacting
     try std.testing.expectEqual(@as(usize, 0), outcome.pages_polled);
     const c = fb.connector();
     try std.testing.expect(c.check(alloc, &env) == .unavailable);
-    try std.testing.expectError(error.Unavailable, c.fetch(alloc, io, "https://graph.facebook.com/v21.0/1/posts", &env));
+    try std.testing.expectError(error.Unavailable, c.fetch(alloc, io, "https://graph.facebook.com/v26.0/1/posts", &env));
     // Status JSON never leaks a token (there is none) and reports why.
     const status = try fb.statusJson(alloc);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"available\":false") != null);

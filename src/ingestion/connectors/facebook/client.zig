@@ -201,9 +201,9 @@ test "client builds the posts URL with version, fields, token" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    const cfg = auth.AuthConfig{ .access_token = "tok|123", .api_version = "v21.0" };
+    const cfg = auth.AuthConfig{ .access_token = "tok|123", .api_version = "v26.0" };
     const url = try buildPostsUrl(alloc, cfg, "456", 25, null);
-    try std.testing.expect(std.mem.startsWith(u8, url, "https://graph.facebook.com/v21.0/456/posts?fields=id,message,created_time,permalink_url"));
+    try std.testing.expect(std.mem.startsWith(u8, url, "https://graph.facebook.com/v26.0/456/posts?fields=id,message,created_time,permalink_url"));
     try std.testing.expect(std.mem.indexOf(u8, url, "limit=25") != null);
     try std.testing.expect(std.mem.indexOf(u8, url, "access_token=tok%7C123") != null);
     const paged = try buildPostsUrl(alloc, cfg, "456", 25, "cur sor");
@@ -216,7 +216,7 @@ test "client parses a posts page; absent engagement is null, present is a count"
     defer arena.deinit();
     const alloc = arena.allocator();
     const body =
-        \\{"data":[{"id":"123_456","message":"Fuel prices rise in Monrovia","created_time":"2026-11-12T10:00:00+0000","permalink_url":"https://www.facebook.com/123/posts/456","reactions":{"summary":{"total_count":12}},"comments":{"summary":{"total_count":3}}},{"id":"123_789","message":"Market day in Red Light","created_time":"2026-11-12T11:00:00+0000","permalink_url":"https://www.facebook.com/123/posts/789"}],"paging":{"cursors":{"after":"abc"},"next":"https://graph.facebook.com/v21.0/123/posts?after=abc"}}
+        \\{"data":[{"id":"123_456","message":"Fuel prices rise in Monrovia","created_time":"2026-11-12T10:00:00+0000","permalink_url":"https://www.facebook.com/123/posts/456","reactions":{"summary":{"total_count":12}},"comments":{"summary":{"total_count":3}}},{"id":"123_789","message":"Market day in Red Light","created_time":"2026-11-12T11:00:00+0000","permalink_url":"https://www.facebook.com/123/posts/789"}],"paging":{"cursors":{"after":"abc"},"next":"https://graph.facebook.com/v26.0/123/posts?after=abc"}}
     ;
     const page = try parsePostsPage(alloc, body);
     try std.testing.expectEqual(@as(usize, 2), page.posts.len);

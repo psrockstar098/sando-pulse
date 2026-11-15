@@ -51,7 +51,7 @@ test "pagination: next + cursors parsed; absent paging is null" {
     defer arena.deinit();
     const alloc = arena.allocator();
     const with_paging =
-        \\{"data":[],"paging":{"cursors":{"after":"abc123","before":"zzz"},"next":"https://graph.facebook.com/v21.0/123/posts?after=abc123"}}
+        \\{"data":[],"paging":{"cursors":{"after":"abc123","before":"zzz"},"next":"https://graph.facebook.com/v26.0/123/posts?after=abc123"}}
     ;
     const p = (try parsePaging(alloc, with_paging)).?;
     try std.testing.expect(p.hasMore());
