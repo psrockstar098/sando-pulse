@@ -135,7 +135,7 @@ ON CONFLICT (id) DO NOTHING;
 INSERT INTO sources (id, name, home_url, feed_url, reliability, enabled, disabled_reason) VALUES
     ('frontpage-africa', 'FrontPage Africa', 'https://frontpageafricaonline.com/', 'https://frontpageafricaonline.com/feed/', 0.70, FALSE, 'Cloudflare bot challenge blocks non-browser HTTP clients (verified 2026-11-12)'),
     ('daily-observer', 'Daily Observer', 'https://www.liberianobserver.com/', 'http://www.liberianobserver.com/search/?f=rss&t=article&l=50&s=start_time&sd=desc', 0.70, TRUE, NULL),
-    ('new-dawn', 'New Dawn', 'https://thenewdawnliberia.com/', 'https://thenewdawnliberia.com/feed/', 0.70, TRUE, NULL),
+    ('new-dawn', 'New Dawn', 'https://thenewdawnliberia.com/', 'https://www.thenewdawnliberia.com/feed/', 0.70, TRUE, NULL),
     ('liberian-investigator', 'Liberian Investigator', 'https://liberianinvestigator.com/', 'https://liberianinvestigator.com/feed/', 0.70, TRUE, NULL),
     ('gnn-liberia', 'GNN Liberia', 'https://gnnliberia.com/', 'https://gnnliberia.com/feed/', 0.70, TRUE, NULL),
     ('kmtv', 'KMTV', 'https://kmtvliberia.com/', 'https://kmtvliberia.com/feed/', 0.70, FALSE, 'Homepage loads but no RSS feed or sitemap exists (verified 2026-11-12)'),
