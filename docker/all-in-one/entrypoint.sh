@@ -72,6 +72,15 @@ for _ in $(seq 1 30); do
 done
 redis-cli -h 127.0.0.1 -p "$REDISPORT" ping
 
+# --- Pulse worker: ingest feeds in the background ---------------------------
+# A hosted deploy has no separate worker service (Render free has no free
+# background workers), so the worker loop runs here alongside serve.
+# It re-fetches the feeds every PULSE_INGEST_INTERVAL_S (default 300s).
+# Delayed 45s so serve has finished its boot migrations first; if the
+# worker ever dies, serve keeps answering from what's already stored.
+( sleep 45; /usr/local/bin/pulse worker >>/var/log/pulse-worker.log 2>&1 ) &
+echo "[entrypoint] worker starting in background (pid $!)"
+
 # --- Pulse: migrates on boot, then serves ----------------------------------
 cd /app
 echo "[entrypoint] starting pulse on $PULSE_HOST:$PULSE_PORT (db $PGDATABASE on $PGPORT, redis on $REDISPORT)"

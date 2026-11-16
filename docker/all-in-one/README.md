@@ -59,6 +59,10 @@ docker run -d --name pulse -p 19090:19090 \
   cache rebuilds; the database is the source of truth).
 - Pulse on 0.0.0.0:9000, working dir `/app`, migrations in
   `/app/migrations`. `pulse serve` migrates on boot.
+- Pulse worker runs in the background inside the same container
+  (started by the entrypoint, 45 s after boot), re-fetching the feeds
+  every `PULSE_INGEST_INTERVAL_S` (default 300 s) — no separate worker
+  service needed on a hosted deploy. Log: `/var/log/pulse-worker.log`.
 - Healthcheck: `curl http://127.0.0.1:9000/v1/health` every 30 s.
 
 Other Pulse commands work the same way, e.g. ingest worker:
