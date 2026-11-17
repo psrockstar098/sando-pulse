@@ -14,9 +14,12 @@ pub const Repository = struct {
         search: *const fn (ptr: *anyopaque, alloc: Allocator, q: types.SearchQuery) anyerror![]types.Document,
         countDocuments: *const fn (ptr: *anyopaque) usize,
         countBySource: *const fn (ptr: *anyopaque, alloc: Allocator) anyerror![]types.SourceCount,
+        scanDocuments: *const fn (ptr: *anyopaque, alloc: Allocator, before_ts: ?i64, limit: usize) anyerror![]types.Document,
+        deleteDocuments: *const fn (ptr: *anyopaque, ids: []const []const u8) anyerror!usize,
         deinit: *const fn (ptr: *anyopaque) void,
     };
-    // wrappers: insertDocument / search / countDocuments / countBySource / deinit
+    // wrappers: insertDocument / search / countDocuments / countBySource /
+    // scanDocuments / deleteDocuments / deinit
 };
 ```
 

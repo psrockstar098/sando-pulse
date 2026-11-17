@@ -20,7 +20,43 @@ it) up to that point.
   and after it; an optimization that does not move a measured number
   is recorded as no win, not claimed as one.
 
-## Architecture (Roadmap 6)
+## Live on Render (2026-11-17)
+
+The all-in-one image is live at https://sando-pulse.onrender.com
+(Render free, 512 MB). Measured there, not on the dev VM:
+
+- **Container RSS: 341–401 MB** (whole container, sum of process
+  RSS — Pulse ~21 MB, Postgres ~254 MB, SearXNG ~119 MB, Redis
+  ~6 MB). It fits the 512 MB free limit with ~110 MB headroom.
+  RSS sums count shared pages more than once, so true unique
+  memory is lower; Postgres backends grow with connections, so
+  the margin is real but not huge.
+- **Unified query latency: p50 86 ms, p95 95 ms** (11 fresh
+  distinct queries, client-measured from the dev VM to Render),
+  min 82 ms, max 1623 ms — the max was one web-leg timeout at
+  the 1500 ms deadline. Local-only baseline on the same container:
+  p50 88 ms, p95 97 ms. The parallel web leg costs nothing in the
+  common case; the only cost is the occasional deadline wait when
+  SearXNG is slow.
+- **First live proof of real web engine results:** a unified
+  `"Liberia news"` query returned real web results via the Brave
+  engine (BBC News Liberia, Al Jazeera Liberia) alongside 10 real
+  local articles. The dev VM could never show this (its egress
+  proxy times the engines out) — the live host proves the
+  integration end to end.
+- **Ingest on first boot:** the worker started 45 s after boot
+  and had ingested 80 documents within ~6 minutes (FrontPage
+  Africa 10). Health answered 200 throughout after the first
+  deploy, except one container restart right after going live
+  that returned 502 for ~5 minutes before recovering on its own.
+
+The ~42 ms per-request floor documented below is a property of
+the dev VM's `std.Io.Threaded` dispatch latency — it does not
+apply to the Render numbers above, which are client-measured over
+the network and already include it (there is no such floor
+visible in them). Do not mix the two sets of numbers: VM numbers
+prove correctness and shape; Render numbers are the live
+production reality.
 
 ### Cache layers
 

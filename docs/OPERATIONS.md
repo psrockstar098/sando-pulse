@@ -1,6 +1,41 @@
 # Pulse operations runbook (Roadmap 5.4)
 
-## Deploy
+## Live deployment (Render)
+
+The production deployment is one Render Web Service, `sando-pulse`
+(Frankfurt, Free plan), running the all-in-one image
+`dominic908/sando-pulse:all-in-one-0.1.0` (digest
+`sha256:e6e946bf…`, published 2026-11-17). Live since 2026-11-17:
+https://sando-pulse.onrender.com.
+
+- Environment: `PULSE_PORT=10000`, `PULSE_BEHIND_TLS_PROXY=1`,
+  `PULSE_API_KEY` set (the key itself lives only in Render and with
+  the operator — never in git, never in a file). Health check path
+  `/v1/health`.
+- First boot: the entrypoint initialises Postgres, starts Redis and
+  the bundled SearXNG, serves Pulse, and starts the ingest worker
+  in the background 45 s after boot. The worker ingested 80
+  documents within ~6 minutes of the first boot.
+- Free-tier facts: the service sleeps after 15 minutes idle — a
+  keep-alive ping hits `/v1/health` every 10 minutes to keep it
+  awake. A restart wipes the stored articles (no persistent disk);
+  the worker re-fetches them from the feeds, so nothing is lost
+  for good. Right after the first deploy the container restarted
+  once and health answered 502 for ~5 minutes, then recovered on
+  its own. Whole-container RSS is 341–401 MB, inside the 512 MB
+  free limit with ~110 MB headroom.
+- To redeploy: push to `origin main` (CI publishes a new
+  `all-in-one-0.1.0` image), then redeploy the Render service from
+  the dashboard (Manual Deploy), which pulls the new image. Verify
+  after: `/v1/health` returns 200, `/v1/sources` lists the sources,
+  and a unified query returns local + web results.
+- Backups on Render free: there is no persistent disk, so a dump
+  written inside the container does not survive a restart. The
+  stored articles are re-fetchable from the feeds (nothing is lost
+  for good), but there is no off-host backup on this plan — moving
+  to a host with a real disk is the fix.
+
+## Deploy (compose, full stack)
 
 ```sh
 cp .env.example .env   # fill in POSTGRES_PASSWORD, PULSE_API_KEY, keys
@@ -71,9 +106,10 @@ curl -fsS http://127.0.0.1:9000/v1/health
 
 Rollback of a bad deploy: the database is the only state that matters.
 `git checkout <previous commit>`, rebuild, `docker compose up -d
---build`. Migrations are additive (new tables/columns only, no drops
-in 001–011), so an older binary runs against a newer schema; if a
-future migration ever drops something, restore from the pre-deploy
+--build`. Migrations are additive (new tables/columns only — the only
+DROP statements in the history are an index/constraint cleanup in
+007–009, never data), so an older binary runs against a newer schema;
+if a future migration ever drops something, restore from the pre-deploy
 backup instead.
 
 ## Disaster recovery
@@ -176,8 +212,11 @@ run here at all: no container-to-container networking, no image pulls
 from the registry in practice. Everything in this section is authored
 for a real Docker host and validated only as far as this VM allows:
 YAML parses, the binary builds, `zig build test` passes, and the API
-itself was smoke-tested live on the host (see STATUS.md). The first
-real `docker compose up` must happen on Dominic's machine or a
+itself was smoke-tested live on the host (see STATUS.md). The
+all-in-one image is the exception: it now runs live on Render
+(verified 2026-11-17 — see "Live deployment" above), so the
+single-image path is proven on a real host. The first real
+`docker compose up` still has to happen on Dominic's machine or a
 production host, with the checklist in `pulse audit` as the gate.
 
 ## Web search (SearXNG)

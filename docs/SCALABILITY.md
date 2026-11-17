@@ -3,8 +3,11 @@
 Architecture preparation for growth — interfaces, abstractions and
 documented extension points. **Nothing here is a live multi-region
 deployment.** Pulse today is one API process + one worker + one
-Postgres + one Redis on one host. This document records what to change,
-in what order, when each limit is actually hit.
+Postgres + one Redis on one host — and the same four processes run
+live inside one all-in-one container on Render
+(https://sando-pulse.onrender.com, free plan, 512 MB; whole-container
+RSS 341–401 MB, see `docs/PERFORMANCE.md`). This document records
+what to change, in what order, when each limit is actually hit.
 
 ## Where the limits are today
 
@@ -16,6 +19,7 @@ in what order, when each limit is actually hit.
 | Redis | 1 instance, 256 MB maxmemory, allkeys-lru | Cache + stream volume |
 | Search | Sequential scan over documents (no vector index) | ~10k+ documents |
 | Object storage | MinIO (or none) on the same host | Raw archive volume |
+| Live host (Render free) | 1 all-in-one container, 512 MB, no persistent disk | Container RSS 341–401 MB today (~110 MB headroom); a restart wipes stored documents (the worker re-fetches them) — the first scaling step off free is a host with a real disk, not more containers |
 
 ## Statelessness contract (Roadmap 6.9)
 

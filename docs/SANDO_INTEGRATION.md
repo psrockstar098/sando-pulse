@@ -19,7 +19,8 @@ Accept: application/json
 ```
 
 `PULSE_URL` defaults to `http://127.0.0.1:9000` on a local install. In
-production it is the public Pulse URL behind the TLS proxy.
+production it is the public Pulse URL: https://sando-pulse.onrender.com
+(live on Render since 2026-11-17).
 
 ## Request
 
@@ -79,7 +80,15 @@ Unknown top-level fields are ignored, so sending `context` is safe.
   derived from it — never inflate it.
 - `results` are the citations. Sando renders each with its title,
   source name and URL. The answer text is built only from these
-  documents; nothing in it comes from anywhere else.
+  documents; nothing in it comes from anywhere else. Each result
+  carries `kind` (`"local"` for RSS documents, `"social"` for
+  Facebook posts), and the response adds a top-level `unified`
+  object: `unified.web` (the web results, in SearXNG's order),
+  `unified.web_complete`, and `unified.sources` (one entry per leg
+  — `local`, `web`, `facebook` — with `status`, `results` and
+  `detail`). Sando may show web citations the same way as local
+  ones; when `facebook` is `not_configured` there are no social
+  results to show. See `docs/WEBSEARCH.md` for the full shape.
 
 ## Errors
 
@@ -135,6 +144,13 @@ Expected live behaviour (verified 2026-11-13): the first call returns
 the second returns `sufficient: false` with
 `insufficient_reason: no_documents_matched`. On an empty store both
 return `false` — that is the correct refusal, not a failure.
+
+Re-verified live on Render 2026-11-17: a unified `"Liberia news"`
+query against https://sando-pulse.onrender.com returned 10 results
+— real local articles plus real web results via the Brave engine
+(BBC News Liberia, Al Jazeera Liberia) — with the `unified` object
+citing each leg. The Facebook leg reported `not_configured` (no
+Page token set yet) and no social results were invented.
 
 ## Versioning
 

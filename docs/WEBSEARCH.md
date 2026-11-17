@@ -118,8 +118,15 @@ come from the wheelhouse.
 ## Render
 
 One service. The all-in-one image is the whole deployment — no
-second SearXNG service, no Valkey service. The 512 MB Render free
-tier is the open question: see the memory measurement below.
+second SearXNG service, no Valkey service. It is live on Render
+since 2026-11-17 (https://sando-pulse.onrender.com, Web Service
+`sando-pulse`, Frankfurt, Free plan). The 512 MB free tier fits:
+the whole container measures **341–401 MB RSS** (Pulse ~21 MB,
+Postgres ~254 MB, SearXNG ~119 MB, Redis ~6 MB), leaving ~110 MB
+headroom (see `docs/PERFORMANCE.md`). Free-tier facts: the service
+sleeps after 15 minutes idle (a keep-alive ping hits `/v1/health`
+every 10 minutes); a restart wipes the stored articles (no
+persistent disk) but the worker re-fetches them from the feeds.
 
 ## Compose (dev alternative)
 
@@ -182,11 +189,19 @@ configured, the worker ingests the page's posts and they appear in
   client in `src/sando/client.zig`). The web leg is bounded by the
   fan-out wait (`PULSE_WEB_TIMEOUT_MS`), not by the HTTP client — a
   stuck web thread delays connection cleanup, never the response.
-- The client does one attempt only (no retry — the deadline bounds
-  the wait); a 403 is reported immediately as a bad response (it is
+- The client makes up to **two attempts** (1 initial + 1 retry) on
+  transport errors and 5xx only, with a 250 ms backoff between
+  attempts; a 403 is reported immediately as a bad response (it is
   a configuration problem, not a transient one).
-- **Verification note (2026-11-17, this VM):** SearXNG itself ran
-  live — first from the pinned image (`/healthz` 200,
+- **Verification note — real engine results, proven live on
+  Render (2026-11-17):** a unified `"Liberia news"` query against
+  https://sando-pulse.onrender.com returned real web results via
+  the Brave engine (BBC News Liberia, Al Jazeera Liberia) alongside
+  real local articles. That is the first time real engine results
+  have been seen end to end — the integration works on a normal
+  host with no proxy settings at all.
+- **Verification note — this dev VM (2026-11-17):** SearXNG itself
+  ran live — first from the pinned image (`/healthz` 200,
   `/search?format=json` 200 with valid SearXNG JSON, so the `json`
   format requirement is proven, not assumed), then from the
   all-in-one packaging (venv + offline wheelhouse install + the
@@ -198,7 +213,7 @@ configured, the worker ingests the page's posts and they appear in
   identical direct curl_cffi calls from the same image completed in
   ~1.5 s. That is a limitation of this VM's egress, not of the
   integration — on a normal host the engines work with no proxy
-  settings at all. The Pulse client + unified query were verified
-  end-to-end against a local stub returning real SearXNG-shaped
-  JSON (results > 0, dedupe, count, 400s, 503). Re-verify with real
-  engine results on the first real host.
+  settings at all (proven on Render, above). The Pulse client +
+  unified query were verified end-to-end against a local stub
+  returning real SearXNG-shaped JSON (results > 0, dedupe, count,
+  400s, 503) before the Render proof existed.

@@ -15,8 +15,8 @@ info:
 servers:
   - url: http://127.0.0.1:9000
     description: Local development server
-  - url: https://pulse.example.invalid
-    description: Production (behind a TLS-terminating reverse proxy)
+  - url: https://sando-pulse.onrender.com
+    description: Live production (Render, single all-in-one service, since 2026-11-17)
 tags:
   - name: query
     description: Ask questions and ingest documents
@@ -151,6 +151,10 @@ components:
         url:
           type: string
           format: uri
+        kind:
+          type: string
+          enum: [local, social]
+          description: "local = RSS document from the registered feeds; social = Facebook post collected by the worker (source_id starting facebook:)."
         source:
           type: object
           properties:
@@ -189,6 +193,63 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/Citation"
+        unified:
+          type: object
+          nullable: true
+          description: |
+            The unified fan-out (one query, three legs). Null for stat
+            answers, which do not fan out. `web` holds the web results
+            in SearXNG's order, deduplicated against the local results
+            by normalized URL. `web_complete` says whether the web leg
+            finished before the answer was sent. `sources` cites each
+            leg: local (ok), web (ok / unavailable / timeout / error),
+            facebook (configured / not_configured). The web leg waits
+            at most PULSE_WEB_TIMEOUT_MS (default 1500 ms).
+          properties:
+            web:
+              type: array
+              items:
+                type: object
+                properties:
+                  title:
+                    type: string
+                  summary:
+                    type: string
+                  url:
+                    type: string
+                    format: uri
+                  engine:
+                    type: string
+                    example: brave
+                  source:
+                    type: object
+                    properties:
+                      name:
+                        type: string
+                      url:
+                        type: string
+                        format: uri
+            web_complete:
+              type: boolean
+            sources:
+              type: array
+              items:
+                type: object
+                properties:
+                  name:
+                    type: string
+                    enum: [local, web, facebook]
+                  status:
+                    type: string
+                    example: ok
+                  results:
+                    type: integer
+                  detail:
+                    type: string
+                    nullable: true
+        fanout_complete:
+          type: boolean
+          description: False when a backend was still running when the answer was sent.
         events:
           type: array
           items:
@@ -364,7 +425,7 @@ paths:
   /v1/query:
     post:
       tags: [query]
-      summary: Ask a question (auth + rate limit + quota, scope `query`)
+      summary: Ask a question (auth + rate limit + quota, scope `query`) — the one public search surface; fans out in parallel to the local index, the web (SearXNG, bundled) and Facebook/social when configured, and returns one ranked list with a top-level `unified` object citing each leg
       parameters:
         - $ref: "#/components/parameters/ConsumerHeader"
       requestBody:
@@ -875,14 +936,14 @@ paths:
       parameters:
         - name: scope
           in: query
-          description: `daily` (default, worker-cached) or `weekly` (computed live).
+          description: "`daily` (default, worker-cached) or `weekly` (computed live)."
           schema:
             type: string
             enum: ["daily", "weekly"]
             default: daily
         - name: kind
           in: query
-          description: `general` (default), `political` or `economic` (computed live; Geez sections stay empty for political/economic).
+          description: "`general` (default), `political` or `economic` (computed live; Geez sections stay empty for political/economic)."
           schema:
             type: string
             enum: ["general", "political", "economic"]

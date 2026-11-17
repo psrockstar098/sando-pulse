@@ -106,9 +106,11 @@ is http-only).
 
 `pulse audit` reports the linked Zig version and libzstd version and
 fails when libzstd is older than 1.5.0. There are no other runtime
-dependencies: the server is a single static Zig binary plus Postgres,
-Redis and (optionally) MinIO. Upgrade Zig by rebuilding; upgrade
-libzstd on the host and re-run `pulse audit`.
+dependencies for the API itself: the server is a single static Zig
+binary plus Postgres, Redis and (optionally) MinIO — and, in the
+all-in-one image, the bundled SearXNG (granian + a Python venv with
+the pinned SearXNG source; see `docs/WEBSEARCH.md`). Upgrade Zig by
+rebuilding; upgrade libzstd on the host and re-run `pulse audit`.
 
 ## Input validation
 

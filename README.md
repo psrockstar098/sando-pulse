@@ -1,10 +1,64 @@
-# Sando Pulse — Roadmap 1: Foundation & Infrastructure
+# Sando Pulse — Liberia-first intelligence & search engine
 
 A Liberia-first intelligence / search engine backend. Zig 0.17.1 only,
 REST only (`std.http` — no external HTTP framework, no GraphQL, no gRPC,
 no WebSockets), real data only. Ask a question, get a cited answer about
 Liberia in seconds — or an honest "insufficient evidence" when the indexed
 documents do not support an answer.
+
+**Live:** https://sando-pulse.onrender.com — one smart `POST /v1/query`
+fans out to the local Liberia index, live web search (SearXNG, bundled
+in the image), and Facebook/social posts when configured, and returns
+one ranked, cited answer. See "Live API (Render)" below and
+`docs/WEBSEARCH.md`. Tests: **341/341 passing** (`zig build test`),
+CI green on `50947a4`.
+
+## Live API (Render)
+
+The production deployment is a single Render Web Service
+(`sando-pulse`, Frankfurt, Free plan) running the all-in-one image
+`dominic908/sando-pulse:all-in-one-0.1.0` (digest
+`sha256:e6e946bf…`, published 2026-11-17). Environment:
+`PULSE_PORT=10000`, `PULSE_BEHIND_TLS_PROXY=1`, `PULSE_API_KEY` set;
+health check `/v1/health`. Live since 2026-11-17, verified the same
+day: health 200 with 9 sources enabled, the worker ingested 80
+documents within ~6 minutes of first boot, and a unified
+`"Liberia news"` query returned 10 results — real local articles
+plus real web results via Brave (BBC Liberia, Al Jazeera Liberia).
+
+```sh
+curl https://sando-pulse.onrender.com/v1/health
+curl -X POST https://sando-pulse.onrender.com/v1/query \
+  -H "Authorization: Bearer <PULSE_API_KEY>" \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "Liberia news"}'
+```
+
+Free-tier facts, honestly: the service sleeps after 15 minutes idle
+(a keep-alive ping hits `/v1/health` every 10 minutes to keep it
+awake); a restart wipes the stored articles (no persistent disk),
+but the worker re-fetches them from the feeds, so nothing is lost
+for good. Right after the first deploy the container restarted once
+and health answered 502 for ~5 minutes, then recovered on its own.
+The whole container measures 341–401 MB RSS, inside the 512 MB
+free limit with ~110 MB headroom (see `docs/PERFORMANCE.md`).
+
+## All-in-one Docker image (local run)
+
+```sh
+docker run -d --name pulse -p 9000:9000 \
+  -v pulse-data:/var/lib/postgresql/data \
+  dominic908/sando-pulse:all-in-one-0.1.0
+```
+
+One image, everything inside: Pulse + Postgres 16 + Redis 7 +
+SearXNG (web search, out of the box — no second service). The
+entrypoint initialises Postgres, starts Redis and SearXNG (granian,
+6 engines), then serves Pulse on port 9000 and starts the ingest
+worker in the background 45 s after boot. The `pulse-data` volume
+keeps documents across restarts on your own machine (on Render
+free there is no volume — see the live section above). Set
+`PULSE_API_KEY` before exposing the port.
 
 ## Quick start (local dev)
 
@@ -40,7 +94,11 @@ docker compose up --build
 The compose stack (see `docker-compose.yml`) runs: api, worker, postgres:16,
 redis:8, minio, prometheus, grafana, postgres-exporter, redis-exporter — on
 one network (`pulse-net`), named volumes for all data, and **only port 9000
-published**. The API container runs migrations on boot.
+published**. The API container runs migrations on boot. This is the
+full-stack route for a real Docker host; the single-image deploy route
+is the all-in-one image above, and the live deployment on Render uses
+it. SearXNG + Valkey run behind the `websearch` compose profile as
+the dev alternative to the bundled SearXNG (`docs/WEBSEARCH.md`).
 
 ## Configuration (env vars at runtime only — never in files)
 
@@ -53,7 +111,10 @@ published**. The API container runs migrations on boot.
 | `REDIS_URL` | — (no event bus) | `redis://host:port`; enables the Redis Streams event bus |
 | `MINIO_ENDPOINT` / `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` / `MINIO_BUCKET` | `pulse-raw` bucket | S3-compatible raw store (MinIO) |
 | `PULSE_INGEST_INTERVAL_S` | `300` | Worker ingest interval |
-| `PULSE_SEARXNG_URL` | `http://127.0.0.1:8080` (all-in-one) | SearXNG base URL, e.g. `http://searxng:8080`; unset → the web leg of `/v1/query` reports `unavailable` (docs/WEBSEARCH.md) |
+| `PULSE_SEARXNG_URL` | — (unset → web leg `unavailable`) | SearXNG base URL, e.g. `http://searxng:8080`; the all-in-one entrypoint exports `http://127.0.0.1:8080` when its bundled SearXNG starts (docs/WEBSEARCH.md) |
+| `PULSE_WEB_TIMEOUT_MS` | `1500` (min 50) | How long the unified query waits for the web (SearXNG) leg before answering with what it has |
+| `PULSE_FACEBOOK_ACCESS_TOKEN` | — (unset → social leg `not_configured`) | Facebook Page token (from a long-lived user token via `GET /me/accounts`); without it the worker collects no posts and the social leg reports `not_configured` |
+| `PULSE_BEHIND_TLS_PROXY` | `0` | Set to `1` in production behind a TLS-terminating proxy (Render, or a reverse proxy); `pulse audit` warns while it is unset |
 | `SEARXNG_SECRET` | generated per boot (all-in-one) | SearXNG secret key (`server.secret_key`); set it yourself with the `websearch` compose profile |
 | `PULSE_RATE_LIMIT_PER_MINUTE` / `PULSE_RATE_LIMIT_PER_DAY` | `100` / `10000` | Per-key rate limits |
 | `PULSE_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
@@ -95,12 +156,20 @@ published**. The API container runs migrations on boot.
 | GET | `/v1/popular` | no | Most-asked queries with counts (Roadmap 6.4) |
 | GET | `/v1/forecast` | no | Next-month topic predictions with confidence + basis (Roadmap 7.1) |
 | GET | `/v1/alerts` | no | Breaking alerts, typed incidents, Redis stream status (Roadmap 7.3) |
-| GET | `/v1/social` | no | Social ingestion status — honestly empty until a connector is authorized (Roadmap 7.7) |
+| GET | `/v1/events` | no | Latest clustered events, or one event's detail (`?id=`) with documents, corroboration, conflicts and contradiction flags |
+| GET | `/v1/locations` | no | Seeded Liberian locations with coordinates and provenance |
+| GET | `/v1/statistics` | no | Seeded Liberian statistics with provenance |
+| GET | `/v1/quality` | no | Intelligence quality report: coverage, freshness, conflict metrics |
+| GET | `/v1/usage` | Bearer key | Per-consumer daily usage and quotas (admin scope); `?consumer=` |
+| GET | `/v1/connectors/facebook` | no | Facebook connector status — honestly unavailable until a Page token is configured |
+| GET | `/v1/webhooks/facebook` | no | Meta subscription handshake (verify token, not API key) |
+| POST | `/v1/webhooks/facebook` | no | Facebook webhook receiver (HMAC signature is the auth) |
+| GET | `/v1/social` | no | Social ingestion status — honestly empty until a connector is authorized (Roadmap 7.7); when `PULSE_FACEBOOK_ACCESS_TOKEN` is set, the worker's collected posts also surface in the unified query with `kind: "social"` |
 | GET | `/v1/autotune` | no | Auto-tuning state: enabled, live knob values, adjustments, last adjustment (Roadmap 6.10) |
 | POST | `/v1/admin/autotune/reset` | Bearer <redacted> | Restore the configured tuning defaults (Roadmap 6.10) |
 | POST | `/v1/admin/config` | Bearer <redacted> | Hot-reload safe settings: `l1_ttl_s`, `fanout_timeout_ms`, `reindex_interval_s` (Roadmap 6.11) |
 | GET | `/metrics` | no | Prometheus text metrics |
-| POST | `/v1/query` | Bearer key | `{"query": "..."}` → cited answer or insufficient-evidence; the unified answer fans out to local sources + web (SearXNG, bundled in the all-in-one image) + Facebook when configured, deduplicated, with `unified.sources` citing each leg (docs/WEBSEARCH.md) |
+| POST | `/v1/query` | Bearer key | `{"query": "..."}` → cited answer or insufficient-evidence; the ONE public search surface — it fans out in parallel to the local index + web (SearXNG, bundled in the all-in-one image) + Facebook/social when configured, deduplicates by URL (local first, then web), and each result carries `kind` (`local` / `social`) with a top-level `unified` object citing each leg's status (docs/WEBSEARCH.md). `GET /v1/websearch` was removed 2026-11-17; the debug path is the `pulse websearch` CLI. |
 | POST | `/v1/ingest` | Bearer key | Manual document ingest `{"title","url","source_id","text"}` |
 
 Every response carries a `request_id` (`req-{hex nanos}`). Rate limits:
@@ -119,7 +188,17 @@ Every response carries a `request_id` (`req-{hex nanos}`). Rate limits:
   "path": "fast",
   "latency_ms": 85.17,
   "routing_reason": "default_fast",
-  "results": [{ "title": "...", "url": "...", "source": {"name": "New Dawn"}, "score": 0.69 }],
+  "results": [{ "title": "...", "url": "...", "kind": "local", "source": {"name": "New Dawn"}, "score": 0.69 }],
+  "unified": {
+    "web": [{ "title": "...", "summary": "...", "url": "https://…", "engine": "brave",
+              "source": {"name": "brave", "url": "https://…"} }],
+    "web_complete": true,
+    "sources": [
+      { "name": "local",    "status": "ok",             "results": 3, "detail": null },
+      { "name": "web",      "status": "ok",             "results": 2, "detail": null },
+      { "name": "facebook", "status": "not_configured", "results": 0, "detail": "Facebook is not configured — set PULSE_FACEBOOK_ACCESS_TOKEN" }
+    ]
+  },
   "query_plan": { "intent": "search", "topics": ["health","politics"], "counties": [], "organizations": [], "sources": ["daily-observer","new-dawn","liberian-investigator","gnn-liberia","the-news"] },
   "meta": { "request_id": "...", "results_count": 1, "sources_checked": 5 }
 }
@@ -128,7 +207,17 @@ Every response carries a `request_id` (`req-{hex nanos}`). Rate limits:
 `path` is the execution path (`instant` / `fast` / `deep`),
 `latency_ms` the measured server-side latency, `routing_reason`
 why the router chose it. `options.limit` (1–20, default 10)
-controls how many results come back.
+controls how many results come back. `kind` on each result is
+`"local"` for RSS documents and `"social"` for Facebook posts
+(source_id starting `facebook:`). `unified.web` holds the web
+results (SearXNG's order, deduplicated against local results by
+normalized URL); `unified.sources` is honest about each leg —
+`web` is `ok` / `unavailable` / `timeout` / `error`, `facebook`
+is `configured` / `not_configured` — and `web_complete` says
+whether the web leg finished before the answer was sent. The
+web leg waits at most `PULSE_WEB_TIMEOUT_MS` (default 1500 ms);
+a slow web leg never delays the answer. Stat answers do not fan
+out to the web. Full detail: `docs/WEBSEARCH.md`.
 
 **Hard rule:** no answer is better than a wrong answer. When no indexed
 document clears the evidence threshold, the API returns
@@ -214,7 +303,7 @@ for concurrency, the threaded accept loop recorded as a gap in
 - **Report variants** (`GET /v1/briefing?scope=weekly&kind=political&county=Lofa`, `pulse briefing --scope weekly --kind political --county Lofa`): weekly scope, political/economic kinds, and county filters (a Monrovia story counts for Montserrado — cities resolve to their county). Variants are computed live, never cached; unknown scope/kind/county is a 400. The briefing carries a `social_note` that is honestly empty until an authorized social source connects.
 - **Contradiction flags** (`GET /v1/events?id=<id>`): every pair of reports in one event whose titles disagree (similarity < 0.30) is flagged with both sources cited and the warning "titles disagree: the reports may describe different facts — check both sources". A flag is a warning for a human to check, never a verdict about which report is right.
 - **Knowledge coverage** (`pulse seed`, 166 locations / 47 facilities / 5 statistics): Grand Kru's 2008 district populations filled from the Wikipedia Grand Kru County district table (18 of 19; Penicess has no published 2008 population and stays null), plus the Lott Carey School Clinic from OpenStreetMap Nominatim. Still missing — recorded, never invented: Starz University, United Methodist University, F. J. Grant Hospital, Rally Time Market, 4 schools, 7 highways, 4 media orgs, 2 ministries.
-- **Social ingestion — gated** (`GET /v1/social`, `social` section in `/v1/trends`): the registry is fed only by authorized connector data. Today no social connector is configured (no Meta app/token, X and Reddit are stubs), so the endpoint reports `social_available: false` with every connector's unavailable reason. No scrapers, no faked posts.
+- **Social ingestion — gated** (`GET /v1/social`, `social` section in `/v1/trends`): the registry is fed only by authorized connector data. The Facebook connector is built (Graph API + webhooks, authorized pages only, never scraped or faked) and activates when `PULSE_FACEBOOK_ACCESS_TOKEN` is set — a Page token from a long-lived user token via `GET /me/accounts`. Until then the endpoint reports `social_available: false` with every connector's unavailable reason, and the unified query's `facebook` leg reports `not_configured`. No scrapers, no faked posts.
 - **Semantic search — blocked**: the external embedding provider exists but has no API key and is never called live. Deep queries use the lexical local embedding and say so. Real semantic search needs Dominic's API-key step.
 
 ## Trust & Intelligence Engine — Phase 1
@@ -265,16 +354,22 @@ Verified live 2026-11-13 (see STATUS.md for the full evidence):
 src/main.zig            CLI: serve | worker [--once] | migrate | status | keygen
 src/api/                server.zig (std.http), auth.zig, ratelimit.zig, metrics.zig, query.zig
 src/engine/             planner.zig, entities.zig, ranking.zig, search.zig
+src/search/             searxng.zig (SearXNG client, std.http only), unified.zig (one-query fan-out)
 src/ingestion/          fetchers.zig (manual CONNECT+TLS fetcher), rss.zig,
-                        normalizer.zig, pipeline.zig, sources.zig
+                        normalizer.zig, pipeline.zig, sources.zig, connectors/ (facebook)
+src/sando/client.zig    PulseClient pattern for Sando (std.http only)
 src/storage/            repository.zig (vtable), memory.zig, postgres.zig,
                         redis.zig (RESP2 + Streams), object_store.zig (S3/MinIO SigV4)
 src/workers/worker.zig  ingest loop
 src/common/             types.zig, errors.zig, logging.zig, time.zig, format.zig
 src/config/config.zig   env-based config
-migrations/             001_initial.sql, 002_search_indexes.sql
-docker/                 Dockerfile, prometheus/, grafana/ (datasource + dashboard)
+migrations/             001–015 (initial schema, search indexes, audit log, source
+                        profiles, monitor freshness, New Dawn feed fix)
+docker/                 Dockerfile, all-in-one/ (single-image deploy incl. SearXNG),
+                        prometheus/, grafana/ (datasource + dashboard), searxng/
 docker-compose.yml      api, worker, postgres, redis, minio, prometheus, grafana, exporters
+                        (+ lb + worker-2 under the `scale` profile, searxng +
+                        searxng-valkey under the `websearch` profile)
 docs/INTERFACES.md      internal module interfaces
 ```
 
@@ -295,7 +390,9 @@ docs/INTERFACES.md      internal module interfaces
 
 ## Tests
 
-`zig build test` — 327 tests (planner, ranking, index, RSS parsing, fetcher
+`zig build test` — 341 tests (planner, ranking, index, RSS parsing, fetcher
 parsing, auth, rate limiting, metrics, JSON, Postgres wire protocol, Redis
-RESP2, S3 signing, Trust & Intelligence Engine Phases 1–8). The Postgres and Redis live tests are gated on
+RESP2, S3 signing, SearXNG client + unified fan-out, Trust & Intelligence
+Engine Phases 1–8). CI (`ci` + `docker-publish`) is green on `50947a4`.
+The Postgres and Redis live tests are gated on
 `PULSE_TEST_POSTGRES_URL` / `PULSE_TEST_REDIS_URL` and skip without servers.

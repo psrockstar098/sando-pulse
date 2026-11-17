@@ -1,7 +1,8 @@
 # Pulse API guide (Roadmap 5.3)
 
-Base URL: `http://127.0.0.1:9000` locally, or the public URL behind the
-TLS proxy in production. The full machine-readable contract is
+Base URL: `https://sando-pulse.onrender.com` live (Render, since
+2026-11-17), or `http://127.0.0.1:9000` locally, or the public URL
+behind the TLS proxy in production. The full machine-readable contract is
 `docs/openapi.yaml`; the Sando-specific contract is
 `docs/SANDO_INTEGRATION.md`.
 
@@ -133,6 +134,37 @@ Every `POST /v1/query` 200 carries, alongside the answer:
   top-level `"limit"` field is ignored: send it under
   `"options"` (`{"query": "...", "options": {"limit": 20}}`).
   Outside 1–20 the request is a 400.
+
+## The unified answer (one query, three legs)
+
+`POST /v1/query` is the one public search surface. It fans out in
+parallel to the local index, the web (SearXNG, bundled in the
+all-in-one image), and the Facebook/social leg (posts the worker
+already collected — Meta has no general post search, so nothing is
+fetched live per query). Results are deduplicated by normalized URL,
+local first then web, and every result carries `kind` (`"local"` for
+RSS documents, `"social"` for Facebook posts). The response adds
+one top-level `unified` object:
+
+- `unified.web` — the web results (title, summary, URL, engine),
+  in SearXNG's order, deduplicated against the local results and
+  each other.
+- `unified.web_complete` — whether the web leg finished before
+  the answer was sent.
+- `unified.sources` — one entry per leg (`local`, `web`,
+  `facebook`) with `status`, `results` and `detail`. `web` is
+  `ok` / `unavailable` (SearXNG not configured) / `timeout` /
+  `error`; `facebook` is `configured` / `not_configured`.
+- `fanout_complete` — false when a backend was still running when
+  the answer was sent.
+
+The web leg waits at most `PULSE_WEB_TIMEOUT_MS` (default 1500 ms,
+minimum 50); a stuck web leg never delays the answer. Stat answers
+do not fan out to the web. Existing response fields are untouched
+by the fan-out. `GET /v1/websearch` was removed 2026-11-17 — one
+query does the job; the debug path is the `pulse websearch` CLI.
+Full detail, including the all-in-one bundling and the honest
+limits: `docs/WEBSEARCH.md`.
 
 ## Roadmap 7 endpoints
 
