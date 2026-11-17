@@ -26,7 +26,7 @@ const prediction_trends = @import("../intelligence/prediction/trend_analyzer.zig
 const prediction_anomalies = @import("../intelligence/prediction/anomaly_detector.zig");
 const prediction_risk = @import("../intelligence/prediction/risk_assessor.zig");
 const monitor = @import("../intelligence/monitor/account_monitor.zig");
-const searxng = @import("../search/searxng.zig");
+const unified = @import("../search/unified.zig");
 
 pub const QueryRequest = struct {
     query: []const u8,
@@ -156,6 +156,9 @@ const ResultJson = struct {
         name: []const u8,
         url: []const u8,
     },
+    /// "local" for RSS documents, "social" for Facebook posts
+    /// (source_id "facebook:<page_id>") — one list, labelled.
+    kind: []const u8,
     published_at: ?[]const u8,
     score: f64,
     /// Fused score (what the ranking actually used) + the keyword base
@@ -234,15 +237,24 @@ pub fn buildQueryResponse(
     /// options.limit. Was a hardcoded 10, which made options.limit
     /// a no-op — every response carried 10 results regardless.
     limit: usize,
+    /// Unified search (web + social fan-out): the web results
+    /// (already deduplicated against the local results by the
+    /// server) and the per-source statuses. Empty when the query
+    /// did not fan out (stat answers, cache warming of a
+    /// local-only path) — the section still renders, honestly.
+    unified_in: unified.Unified,
 ) ![]u8 {
     var results: std.ArrayList(ResultJson) = .empty;
     const shown = @min(outcome.results.len, limit);
+    var social_count: usize = 0;
     for (outcome.results[0..shown]) |r| {
+        if (unified.isSocialSource(r.doc.source_id)) social_count += 1;
         try results.append(alloc, .{
             .title = r.doc.title,
             .summary = try truncateSummary(alloc, r.doc.text, 280),
             .url = r.doc.url,
             .source = .{ .name = r.doc.source_name, .url = r.doc.source_url },
+            .kind = if (unified.isSocialSource(r.doc.source_id)) "social" else "local",
             .published_at = if (r.doc.published_at) |ts| try formatIso(alloc, ts) else null,
             .score = r.fused,
             .score_parts = .{
@@ -276,6 +288,28 @@ pub fn buildQueryResponse(
             .event_titles = d.event_titles,
         });
     }
+    // Unified web section: SearXNG results in SearXNG's order,
+    // already deduplicated against the local results by the server.
+    // Each cites its engine as the source — no score is invented.
+    var web_items: std.ArrayList(struct {
+        title: []const u8,
+        summary: []const u8,
+        url: []const u8,
+        engine: []const u8,
+        source: struct {
+            name: []const u8,
+            url: []const u8,
+        },
+    }) = .empty;
+    for (unified_in.web) |w| {
+        try web_items.append(alloc, .{
+            .title = w.title,
+            .summary = try truncateSummary(alloc, w.content, 280),
+            .url = w.url,
+            .engine = w.engine,
+            .source = .{ .name = w.engine, .url = w.url },
+        });
+    }
     const resp = .{
         .query = query,
         .answer = outcome.answer,
@@ -290,6 +324,20 @@ pub fn buildQueryResponse(
         .fanout_complete = enrich.fanout_complete,
         .stat_answer = enrich.stat_answer,
         .results = results.items,
+        .unified = .{
+            .web = web_items.items,
+            .web_complete = unified_in.web_complete,
+            .sources = [_]struct {
+                name: []const u8,
+                status: []const u8,
+                results: usize,
+                detail: ?[]const u8,
+            }{
+                .{ .name = "local", .status = "ok", .results = shown, .detail = null },
+                .{ .name = "web", .status = unified.webStatusName(unified_in.web_status), .results = unified_in.web.len, .detail = unified_in.web_detail },
+                .{ .name = "facebook", .status = if (unified_in.facebook_configured) "configured" else "not_configured", .results = social_count, .detail = if (unified_in.facebook_configured) null else "Facebook is not configured — set PULSE_FACEBOOK_ACCESS_TOKEN" },
+            },
+        },
         .events = events.items,
         .timeline = timeline.items,
         .query_plan = PlanJson{
@@ -318,24 +366,6 @@ pub fn buildErrorResponse(alloc: std.mem.Allocator, req_id: []const u8, code: []
     return stringifyAlloc(alloc, .{
         .@"error" = .{ .code = code, .message = message },
         .request_id = req_id,
-    });
-}
-
-/// GET /v1/websearch response: SearXNG results exactly as reported —
-/// title, url, content, engine per result — plus the engines that did
-/// not answer. No ranking and no verdict: the caller decides what the
-/// results mean. `took_ms` is the measured SearXNG round trip.
-pub fn buildWebSearchResponse(
-    alloc: std.mem.Allocator,
-    req_id: []const u8,
-    res: searxng.WebSearchResponse,
-) ![]u8 {
-    return stringifyAlloc(alloc, .{
-        .request_id = req_id,
-        .query = res.query,
-        .results = res.results,
-        .unresponsive_engines = res.unresponsive_engines,
-        .took_ms = res.took_ms,
     });
 }
 
@@ -1278,12 +1308,12 @@ test "buildQueryResponse carries path, latency_ms and routing_reason" {
         .timeline = &.{},
     };
     // The live shape: real path + measured latency.
-    const live = try buildQueryResponse(alloc, "req-1", "fuel", p, outcome, 5, 1794477600, "fast", 12.345678, "simple_indexed", .{}, 10);
+    const live = try buildQueryResponse(alloc, "req-1", "fuel", p, outcome, 5, 1794477600, "fast", 12.345678, "simple_indexed", .{}, 10, .{});
     try std.testing.expect(std.mem.indexOf(u8, live, "\"path\":\"fast\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, live, "\"latency_ms\":12.345678") != null);
     try std.testing.expect(std.mem.indexOf(u8, live, "\"routing_reason\":\"simple_indexed\"") != null);
     // The storable shape: empty markers stampServed expects.
-    const stored = try buildQueryResponse(alloc, "", "fuel", p, outcome, 5, 1794477600, "", 0, "", .{}, 10);
+    const stored = try buildQueryResponse(alloc, "", "fuel", p, outcome, 5, 1794477600, "", 0, "", .{}, 10, .{});
     try std.testing.expect(std.mem.indexOf(u8, stored, "\"path\":\"\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, stored, "\"latency_ms\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, stored, "\"routing_reason\":\"\"") != null);
@@ -1342,26 +1372,6 @@ test "buildErrorResponse shape" {
     try std.testing.expect(std.mem.indexOf(u8, s, "\"request_id\":\"req-1\"") != null);
 }
 
-test "buildWebSearchResponse renders results verbatim" {
-    const alloc = std.testing.allocator;
-    const results = [_]searxng.WebResult{
-        .{ .title = "Liberia elects", .url = "https://example.com/a", .content = "Monrovia votes.", .engine = "bing" },
-    };
-    const engines = [_][]const u8{"google"};
-    const s = try buildWebSearchResponse(alloc, "req-9", .{
-        .query = "Liberia news",
-        .results = @constCast(&results),
-        .unresponsive_engines = @constCast(&engines),
-        .took_ms = 123,
-    });
-    defer alloc.free(s);
-    try std.testing.expect(std.mem.indexOf(u8, s, "\"request_id\":\"req-9\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, s, "\"query\":\"Liberia news\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, s, "\"engine\":\"bing\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, s, "\"unresponsive_engines\":[\"google\"]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, s, "\"took_ms\":123") != null);
-}
-
 test "buildQueryResponse renders exactly options.limit results" {
     // Regression test (Roadmap 6.12): the limit was validated and
     // hashed into the cache key but the response always rendered 10.
@@ -1410,11 +1420,96 @@ test "buildQueryResponse renders exactly options.limit results" {
         .events = &.{},
         .timeline = &.{},
     };
-    const two = try buildQueryResponse(alloc, "req-1", "fuel", p, outcome, 5, 1794477600, "fast", 1.0, "simple_indexed", .{}, 2);
+    const two = try buildQueryResponse(alloc, "req-1", "fuel", p, outcome, 5, 1794477600, "fast", 1.0, "simple_indexed", .{}, 2, .{});
     // Two result objects: count the "title" fields in the results array.
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, two, "\"title\":"));
-    const all = try buildQueryResponse(alloc, "req-1", "fuel", p, outcome, 5, 1794477600, "fast", 1.0, "simple_indexed", .{}, 20);
+    const all = try buildQueryResponse(alloc, "req-1", "fuel", p, outcome, 5, 1794477600, "fast", 1.0, "simple_indexed", .{}, 20, .{});
     try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, all, "\"title\":"));
+}
+
+test "buildQueryResponse renders the unified web + social sections" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const p: planner.Plan = .{
+        .intent = "local",
+        .terms = &.{"fuel"},
+        .counties = &.{},
+        .cities = &.{},
+        .organizations = &.{},
+        .people = &.{},
+        .topics = &.{},
+        .time_range = null,
+        .sources = &.{},
+    };
+    var ranked: [2]search.RankedDoc = undefined;
+    ranked[0] = .{
+        .doc = .{
+            .id = "d1",
+            .source_id = "new-dawn",
+            .source_name = "New Dawn",
+            .source_url = "https://thenewdawnliberia.com/",
+            .title = "Fuel shortage hits Monrovia",
+            .url = "https://thenewdawnliberia.com/fuel",
+            .text = "Fuel stations report long queues.",
+            .published_at = null,
+            .fetched_at = 1000,
+            .reliability = 0.7,
+            .topics = &.{},
+            .content_hash = "h1",
+            .lang = "en",
+        },
+        .score = .{ .relevance = 0.9, .reliability = 0.7, .recency = 0.5, .context = 0.5, .coverage = 0.5, .total = 0.8 },
+        .fused = 0.8,
+    };
+    ranked[1] = .{
+        .doc = .{
+            .id = "d2",
+            .source_id = "facebook:106003915444667",
+            .source_name = "Chronic circle",
+            .source_url = "https://www.facebook.com/chroniccircle",
+            .title = "Fuel queue at Broad Street",
+            .url = "https://www.facebook.com/chroniccircle/posts/1",
+            .text = "Long queue at the Broad Street station today.",
+            .published_at = null,
+            .fetched_at = 1000,
+            .reliability = 0.5,
+            .topics = &.{},
+            .content_hash = "h2",
+            .lang = "en",
+        },
+        .score = .{ .relevance = 0.8, .reliability = 0.5, .recency = 0.6, .context = 0.5, .coverage = 0.5, .total = 0.7 },
+        .fused = 0.7,
+    };
+    const outcome: search.Outcome = .{
+        .answer = null,
+        .results = &ranked,
+        .confidence = 0.8,
+        .sufficient = true,
+        .insufficient_reason = null,
+        .events = &.{},
+        .timeline = &.{},
+    };
+    var web = [_]unified.WebResult{
+        .{ .title = "Liberia fuel imports rise", .url = "https://example.com/fuel-imports", .content = "Imports rose in October.", .engine = "bing" },
+    };
+    const s = try buildQueryResponse(alloc, "req-1", "fuel", p, outcome, 5, 1794477600, "fast", 1.0, "simple_indexed", .{}, 10, .{
+        .web = &web,
+        .web_complete = true,
+        .web_status = .ok,
+        .facebook_configured = false,
+    });
+    // One list, labelled kinds: the RSS doc and the Facebook post.
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"kind\":\"local\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"kind\":\"social\"") != null);
+    // Web result cited with its engine, in SearXNG's order.
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"title\":\"Liberia fuel imports rise\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"engine\":\"bing\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"web_complete\":true") != null);
+    // Source statuses: local ok, web ok, facebook honestly unconfigured.
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"name\":\"local\",\"status\":\"ok\",\"results\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"name\":\"web\",\"status\":\"ok\",\"results\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"name\":\"facebook\",\"status\":\"not_configured\",\"results\":1") != null);
 }
 
 /// Trust & Intelligence Engine, Phase 3: one claim's evidence

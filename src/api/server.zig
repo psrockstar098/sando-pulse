@@ -35,9 +35,9 @@
 //!   POST /v1/webhooks/facebook public — Meta webhook receiver, HMAC-verified (3.2)
 //!   GET  /metrics     public — Prometheus exposition (Roadmap 1.5)
 //!   POST /v1/query    auth + rate limit — planned search with citations
+//!          + the unified answer: local index, web (SearXNG) and
+//!          Facebook/social in one response (docs/WEBSEARCH.md)
 //!   POST /v1/ingest   auth + rate limit — manual document ingest
-//!   GET  /v1/websearch auth + rate limit — real web search via SearXNG
-//!          (PULSE_SEARXNG_URL unset -> 503 websearch_unavailable)
 //! Auth: Bearer API key when PULSE_API_KEY is set; open dev mode otherwise.
 //! Rate limits: 100/min + 10,000/day per key (configurable).
 
@@ -96,6 +96,7 @@ const autotune = @import("../engine/autotune.zig");
 const breaker = @import("../engine/breaker.zig");
 const usage = @import("usage.zig");
 const searxng = @import("../search/searxng.zig");
+const unified = @import("../search/unified.zig");
 
 /// Fan-out task: knowledge-store locations matching the query's
 /// counties/cities (Roadmap 6.6). Runs in a worker thread when the
@@ -155,6 +156,37 @@ const StatisticsTask = struct {
             }
         }
         t.out = try filtered.toOwnedSlice(alloc);
+    }
+};
+
+/// Unified web leg: one SearXNG search, run as a fan-out task
+/// alongside the local search. One attempt only — the unified
+/// deadline bounds the wait, and a retry would double the worst case
+/// for a dead upstream. The server's Threaded io is shared with the
+/// main thread; each call builds its own std.http.Client, so no
+/// connection state is shared across threads. `resp` is null when
+/// SearXNG errored (the fan-out records the error on the task);
+/// its strings live in the task arena — render before joinAll
+/// frees it, exactly like the enrichment sections.
+const WebTask = struct {
+    base_url: []const u8,
+    query: []const u8,
+    limit: usize,
+    io: std.Io,
+    resp: ?searxng.WebSearchResponse = null,
+
+    fn run(ctx: *anyopaque, alloc: std.mem.Allocator) anyerror!void {
+        const t: *WebTask = @ptrCast(@alignCast(ctx));
+        var client = searxng.Client{ .alloc = alloc, .io = t.io, .base_url = t.base_url, .max_attempts = 1 };
+        t.resp = client.search(alloc, t.query, t.limit) catch |e| {
+            // Log the cause: without this the unified answer only says
+            // "SearXNG did not answer" and the reason is invisible.
+            // (The client already logs transport failures and bad
+            // statuses; this covers the silent paths — 5xx after
+            // retries, and a 200 body that does not parse.)
+            logging.warn("unified web leg failed", &.{.{ .key = "error", .value = @errorName(e) }});
+            return e;
+        };
     }
 };
 const auditlog = @import("auditlog.zig");
@@ -1009,6 +1041,9 @@ pub const Server = struct {
         var enrich = query_json.Enrichment{};
         var outcome: search.Outcome = undefined;
         var stat_answered = false;
+        // Unified answer data: filled by the web merge below (or left
+        // at its honest defaults when the query never fans out).
+        var unified_in = unified.Unified{ .facebook_configured = if (self.facebook) |fb| fb.auth_cfg.hasToken() else false };
         if (statanswer.detectStatQuestion(alloc, query_text) catch null) |sq| {
             if (self.knowledge) |k| {
                 if (statanswer.answerStat(alloc, k, sq, query_text) catch null) |ans| {
@@ -1024,6 +1059,7 @@ pub const Server = struct {
                     };
                     decision = .{ .path = .fast, .reason = "stat_answer" };
                     stat_answered = true;
+                    unified_in.web_detail = "not attempted for stat answers";
                 }
             }
         }
@@ -1053,29 +1089,47 @@ pub const Server = struct {
                 }
             }
         }
-        // Parallel fan-out (Roadmap 6.6): locations + statistics from
-        // the knowledge store run concurrently with the news search
-        // below. Parallel only when the store is Postgres (its
-        // knowledge store is mutex-guarded); the memory store runs
-        // the same tasks inline. When PULSE_PARALLEL_QUERY=0 the
-        // tasks run inline too. No entities in the plan = nothing
-        // to enrich, so no fan-out at all. The task contexts and the
-        // task list live in the caller's arena, NOT on this stack:
-        // the threads may still be running when computeQuery returns,
-        // and the caller joins them after the response is sent.
+        // Unified fan-out (Roadmap 6.6 + unified search): the
+        // knowledge enrichment tasks AND the web leg run concurrently
+        // with the local search below. The web task is added
+        // whenever SearXNG is configured; it touches no store, so a
+        // web-only fan-out is parallel even on the memory store
+        // (parallel is gated on Postgres only when knowledge tasks
+        // are present). The task contexts and the task list live in
+        // the caller's arena, NOT on this stack: the threads may
+        // still be running when computeQuery returns, and the caller
+        // joins them after the response is sent.
         var loc_task: ?*LocationsTask = null;
         var stat_task: ?*StatisticsTask = null;
-        if ((p.counties.len > 0 or p.cities.len > 0 or p.topics.len > 0) and self.knowledge != null) {
-            const lt = try alloc.create(LocationsTask);
-            lt.* = .{ .ks = self.knowledge.?, .counties = p.counties, .cities = p.cities };
-            loc_task = lt;
-            const st = try alloc.create(StatisticsTask);
-            st.* = .{ .ks = self.knowledge.?, .topics = p.topics };
-            stat_task = st;
-            const tasks = try alloc.alloc(fanout.Task, 2);
-            tasks[0] = .{ .name = "locations", .run = LocationsTask.run, .ctx = loc_task.? };
-            tasks[1] = .{ .name = "statistics", .run = StatisticsTask.run, .ctx = stat_task.? };
-            const parallel = self.cfg.parallel_query and std.mem.eql(u8, self.store_name, "postgres");
+        var web_task: ?*WebTask = null;
+        const want_enrich = (p.counties.len > 0 or p.cities.len > 0 or p.topics.len > 0) and self.knowledge != null;
+        const want_web = self.cfg.searxng_url != null;
+        if (want_enrich or want_web) {
+            var n_tasks: usize = 0;
+            if (want_enrich) n_tasks += 2;
+            if (want_web) n_tasks += 1;
+            const tasks = try alloc.alloc(fanout.Task, n_tasks);
+            var ti: usize = 0;
+            if (want_enrich) {
+                const lt = try alloc.create(LocationsTask);
+                lt.* = .{ .ks = self.knowledge.?, .counties = p.counties, .cities = p.cities };
+                loc_task = lt;
+                const st = try alloc.create(StatisticsTask);
+                st.* = .{ .ks = self.knowledge.?, .topics = p.topics };
+                stat_task = st;
+                tasks[ti] = .{ .name = "locations", .run = LocationsTask.run, .ctx = loc_task.? };
+                ti += 1;
+                tasks[ti] = .{ .name = "statistics", .run = StatisticsTask.run, .ctx = stat_task.? };
+                ti += 1;
+            }
+            if (want_web) {
+                const wt = try alloc.create(WebTask);
+                wt.* = .{ .base_url = self.cfg.searxng_url.?, .query = query_text, .limit = limit, .io = self.io };
+                web_task = wt;
+                tasks[ti] = .{ .name = "web", .run = WebTask.run, .ctx = web_task.? };
+                ti += 1;
+            }
+            const parallel = self.cfg.parallel_query and (std.mem.eql(u8, self.store_name, "postgres") or !want_enrich);
             fo = fanout.Fanout.start(alloc, tasks, parallel) catch null;
             if (fo == null) fanout.runSequential(alloc, tasks);
         }
@@ -1092,17 +1146,58 @@ pub const Server = struct {
         // until the deadline, then take whatever completed. A task
         // still running leaves its section empty and
         // fanout_complete false (partial results, labelled).
+        // fanout_complete counts the ENRICHMENT tasks only — the web
+        // leg has its own, much longer deadline below, and must not
+        // mark the enrichment incomplete just by being slower.
         if (fo) |*f| {
             f.wait(self.fanout_timeout_ms);
-            enrich.fanout_complete = f.allDone();
+            if (want_enrich) {
+                enrich.fanout_complete = f.completed("locations") and f.completed("statistics");
+            } else {
+                enrich.fanout_complete = true;
+            }
             self.metrics.observeFanout(enrich.fanout_complete);
             if (f.completed("locations")) enrich.locations = loc_task.?.out;
             if (f.completed("statistics")) enrich.statistics = stat_task.?.out;
         }
+        // Unified web merge: the web leg gets its own deadline (a
+        // web round trip is ~100x the enrichment deadline). Local
+        // results never wait on the web — on timeout the web section
+        // is empty and labelled "timeout", and the leg is joined
+        // after the response like any other straggler.
+        if (want_web) {
+            if (fo) |*f| {
+                f.wait(self.cfg.web_timeout_ms);
+                if (f.completed("web")) {
+                    const wt = web_task.?;
+                    if (wt.resp) |res| {
+                        // Dedupe against the local results: a story
+                        // found locally and on the web appears once,
+                        // locally. URLs are borrowed from the local
+                        // results (caller arena).
+                        var local_urls: std.ArrayList([]const u8) = .empty;
+                        for (outcome.results[0..@min(outcome.results.len, limit)]) |r| {
+                            local_urls.append(alloc, r.doc.url) catch {};
+                        }
+                        unified_in.web = unified.dedupeWeb(alloc, alloc, local_urls.items, res.results) catch &.{};
+                        unified_in.web_status = .ok;
+                        unified_in.web_complete = true;
+                    } else {
+                        unified_in.web_status = .err;
+                        unified_in.web_detail = "SearXNG did not answer";
+                        unified_in.web_complete = true;
+                    }
+                } else {
+                    unified_in.web_status = .timeout;
+                    unified_in.web_detail = "web search was still running when the deadline passed";
+                    unified_in.web_complete = false;
+                }
+            }
+        }
         }
         self.metrics.observeQuery(outcome.sufficient);
         const latency_ms = timex.latencyMsF64(query_start_ns, timex.nowNanos(self.io));
-        const resp = query_json.buildQueryResponse(alloc, req_id, query_text, p, outcome, enabled.len, timex.nowSeconds(self.io), decision.path.name(), latency_ms, decision.reason, enrich, limit) catch {
+        const resp = query_json.buildQueryResponse(alloc, req_id, query_text, p, outcome, enabled.len, timex.nowSeconds(self.io), decision.path.name(), latency_ms, decision.reason, enrich, limit, unified_in) catch {
             if (fo) |*f| f.joinAll();
             return error.ResponseFailed;
         };
@@ -1110,7 +1205,7 @@ pub const Server = struct {
         self.maybeAutotune();
         // Store a copy rendered with empty markers so a later hit
         // can splice in its own id, serving path, and latency.
-        const storable = query_json.buildQueryResponse(alloc, "", query_text, p, outcome, enabled.len, timex.nowSeconds(self.io), "", 0, "", enrich, limit) catch null;
+        const storable = query_json.buildQueryResponse(alloc, "", query_text, p, outcome, enabled.len, timex.nowSeconds(self.io), "", 0, "", enrich, limit, unified_in) catch null;
         var tags: std.ArrayList([]const u8) = .empty;
         for (p.topics) |t| tags.append(alloc, t) catch {};
         for (p.counties) |t| tags.append(alloc, t) catch {};
@@ -2757,62 +2852,6 @@ pub const Server = struct {
             return;
         }
 
-        if (method == .GET and std.mem.eql(u8, path, "/v1/websearch")) {
-            // Real web search via SearXNG (docs/WEBSEARCH.md). Same auth
-            // + rate-limit + quota gate as /v1/query (kind .query), so a
-            // websearch call spends the caller's query quota. Results are
-            // returned exactly as SearXNG reported them — no ranking, no
-            // verdict. `?q=` is required (max 1000 chars, same bound as
-            // /v1/query); `?count=` defaults to 10, range 1..20.
-            if (!self.checkAuthAndRate(req, head, alloc, req_id, .query)) return;
-            const base_url = self.cfg.searxng_url orelse {
-                self.respondError(req, alloc, req_id, .service_unavailable, "websearch_unavailable", "Web search is not configured (PULSE_SEARXNG_URL unset)");
-                return;
-            };
-            const raw_q = queryParam(head.query, "q") orelse {
-                self.respondError(req, alloc, req_id, .bad_request, "invalid_request", "Missing ?q= query parameter");
-                return;
-            };
-            const q_text = urlDecode(alloc, raw_q) catch raw_q;
-            const trimmed = std.mem.trim(u8, q_text, " \t\n\r");
-            if (trimmed.len == 0 or trimmed.len > 1000) {
-                self.respondError(req, alloc, req_id, .bad_request, "invalid_request", "Query must be 1-1000 chars");
-                return;
-            }
-            var count: usize = searxng.default_count;
-            if (queryParam(head.query, "count")) |cs| {
-                const n = std.fmt.parseInt(usize, cs, 10) catch {
-                    self.respondError(req, alloc, req_id, .bad_request, "invalid_request", "count must be 1-20");
-                    return;
-                };
-                if (n < 1 or n > searxng.max_count) {
-                    self.respondError(req, alloc, req_id, .bad_request, "invalid_request", "count must be 1-20");
-                    return;
-                }
-                count = n;
-            }
-            var client = searxng.Client{ .alloc = self.alloc, .io = self.io, .base_url = base_url };
-            const res = client.search(alloc, trimmed, count) catch |e| {
-                switch (e) {
-                    error.InvalidQuery => self.respondError(req, alloc, req_id, .bad_request, "invalid_request", "Query must be 1-1000 chars"),
-                    error.Unavailable => self.respondError(req, alloc, req_id, .bad_gateway, "websearch_upstream_unavailable", "SearXNG did not answer"),
-                    error.BadResponse => self.respondError(req, alloc, req_id, .bad_gateway, "websearch_bad_response", "SearXNG answered with an unusable response"),
-                    error.OutOfMemory => self.respondError(req, alloc, req_id, .internal_server_error, "internal", "Out of memory"),
-                }
-                return;
-            };
-            defer searxng.freeResponse(alloc, res);
-            const body = query_json.buildWebSearchResponse(alloc, req_id, res) catch {
-                self.respondError(req, alloc, req_id, .internal_server_error, "internal", "Failed to render response");
-                return;
-            };
-            self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
-            self.recordUsage(head, .query);
-            self.auditCall(head, alloc, req_id, 200);
-            try respondJson(req, .ok, body, req_id);
-            return;
-        }
-
         if (method == .POST and std.mem.eql(u8, path, "/v1/ingest")) {
             if (!self.checkAuthAndRate(req, head, alloc, req_id, .ingest)) return;
             const body = readBody(req, alloc) catch {
@@ -3079,7 +3118,6 @@ pub const Server = struct {
                 std.mem.eql(u8, path, "/v1/connectors/facebook") or
                 std.mem.eql(u8, path, "/v1/webhooks/facebook") or
                 std.mem.eql(u8, path, "/metrics") or std.mem.eql(u8, path, "/v1/query") or
-                std.mem.eql(u8, path, "/v1/websearch") or
                 std.mem.eql(u8, path, "/v1/usage") or
                 std.mem.eql(u8, path, "/v1/autotune") or std.mem.eql(u8, path, "/v1/admin/autotune/reset") or
                 std.mem.eql(u8, path, "/v1/admin/config") or

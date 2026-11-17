@@ -1,8 +1,9 @@
 # Sando Pulse — all-in-one image.
 #
 # ONE image: Pulse server + Postgres 16 (vector 0.6.0, PostGIS 3.4.2,
-# pg_trgm 1.6) + Redis 7. Dominic runs a single `docker run` with no
-# separate DB setup. Built from the verified Roadmap 6 head.
+# pg_trgm 1.6) + Redis 7.0 + SearXNG (bundled web search, six engines,
+# limiter on the same Redis db 1). Dominic runs a single `docker run`
+# with no separate DB setup — web search works out of the box.
 #
 # OFFLINE BUILD: the Pulse binary is built on the host (Zig 0.17.1) and
 # the Ubuntu 24.04 .debs are vendored in debs/ — no network is needed
@@ -21,7 +22,18 @@ ENV DEBIAN_FRONTEND=noninteractive
 # pgvector 0.6.0 + Redis 7.0 + curl (healthcheck). One dpkg invocation
 # so configuration order is resolved by dpkg itself.
 COPY docker/all-in-one/debs/*.deb /tmp/debs/
-RUN dpkg -i /tmp/debs/*.deb \
+# dpkg -i in three passes: python3 has a pre-dependency chain
+# (python3.12-minimal -> python3-minimal -> python3) and dpkg only
+# configures a package after ALL unpacking in a pass, so a
+# pre-dependency must be CONFIGURED in an earlier pass than the
+# package that pre-depends on it — a chain of length N needs N
+# passes. Pass 1 installs everything except python3-minimal and
+# python3; pass 2 adds python3-minimal; pass 3 adds python3.
+# (apt-get install cannot do this: it fails local-.deb upgrades
+# with "Pathname to install is not absolute" — verified live.)
+RUN dpkg -i /tmp/debs/*.deb || true; \
+    dpkg -i /tmp/debs/*.deb || true; \
+    dpkg -i /tmp/debs/*.deb \
     && rm -rf /tmp/debs \
     # Drop the cluster the postgresql-16 postinst created at install
     # time: the entrypoint creates its own data dir under /var/lib/postgresql/data.
@@ -30,6 +42,36 @@ RUN dpkg -i /tmp/debs/*.deb \
         /var/lib/redis /var/log/redis /var/run/postgresql \
     && chown -R postgres:postgres /var/lib/postgresql /var/log/postgresql /var/run/postgresql \
     && chown -R redis:redis /var/lib/redis /var/log/redis
+
+# SearXNG (bundled web search): source + wheels are staged by build.sh
+# step 2.5 and installed offline — no network inside the image build.
+# The PyPI package named `searxng` is an unrelated MCP wrapper; the
+# engine comes from its GitHub repo at the pinned commit. Only six
+# engines are enabled (docker/searxng/settings-aio.yml); the limiter
+# reuses this image's Redis (db 1) — no Valkey process is started.
+COPY docker/all-in-one/searxng-src /tmp/searxng-src
+COPY docker/all-in-one/wheelhouse /tmp/wheelhouse
+COPY docker/searxng/settings-aio.yml /etc/searxng/settings.yml
+# limiter.toml lives next to the settings: SearXNG reads it from the
+# settings directory. Without it the bundled defaults apply, whose
+# pass_ip list is EMPTY — localhost is rate-limited and the Pulse
+# API's own searches get 429. The shipped file passlists 127.0.0.0/8
+# (the API calls from localhost) + the compose network.
+COPY docker/searxng/limiter.toml /etc/searxng/limiter.toml
+# SearXNG runs in its own venv (/opt/searxng-venv): Ubuntu disables
+# ensurepip for the SYSTEM python entirely ("ensurepip is disabled
+# in Debian/Ubuntu for the system python"), so pip can only be
+# bootstrapped inside a venv. The venv creation needs the
+# python3-venv + python3-pip-whl + python3-setuptools-whl debs
+# (vendored in step 2). Same two-step install as the smoke test:
+# requirements first, then the package with --no-build-isolation
+# (setup.py imports searx, which needs msgspec already installed).
+RUN python3 -m venv /opt/searxng-venv \
+    && /opt/searxng-venv/bin/python -m pip install --no-index --no-cache-dir --find-links /tmp/wheelhouse setuptools wheel -r /tmp/searxng-src/requirements.txt -r /tmp/searxng-src/requirements-server.txt \
+    && /opt/searxng-venv/bin/python -m pip install --no-index --no-cache-dir --no-build-isolation --find-links /tmp/wheelhouse /tmp/searxng-src \
+    && rm -rf /tmp/searxng-src /tmp/wheelhouse /root/.cache \
+    && mkdir -p /var/log/searxng \
+    && /opt/searxng-venv/bin/python -c "import searx; print('searxng installed')"
 
 # Pulse binary (built on the host by build.sh) + migrations + entrypoint.
 COPY docker/all-in-one/pulse /usr/local/bin/pulse

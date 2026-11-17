@@ -19,11 +19,18 @@ pub const Config = struct {
     /// Base URL of this Pulse instance, used by the mock-sando client
     /// (Roadmap 5.2). Defaults to the local server.
     pulse_url: []const u8 = "http://127.0.0.1:9000",
-    /// SearXNG base URL for real web search (GET /v1/websearch and
-    /// `pulse websearch`). Null = web search unavailable: the endpoint
-    /// answers 503 `websearch_unavailable` and the CLI refuses to run.
-    /// Example: "http://searxng:8080" on the compose network.
+    /// SearXNG base URL for real web search: the unified /v1/query
+    /// fans out to it, and `pulse websearch` calls it directly. Null
+    /// = web search unavailable: the query answers with web status
+    /// "unavailable" and the CLI refuses to run. In the all-in-one
+    /// image the entrypoint sets this to http://127.0.0.1:8080;
+    /// on the compose network it is "http://searxng:8080".
     searxng_url: ?[]const u8 = null,
+    /// Unified-query web deadline in milliseconds: how long /v1/query
+    /// waits for the SearXNG leg before answering with web status
+    /// "timeout" (the leg keeps running and is joined after the
+    /// response). Local results never wait on the web.
+    web_timeout_ms: u64 = 1500,
     /// Registered API consumers (Roadmap 5.3). Empty = a single implicit
     /// "default" consumer with all scopes and the global daily limit.
     consumers: []const usage.Consumer = &.{},
@@ -263,6 +270,10 @@ pub fn load(alloc: std.mem.Allocator, env_map: *std.process.Environ.Map) !Config
     if (envOwned(alloc, env_map, "PULSE_FANOUT_TIMEOUT_MS")) |v| {
         cfg.fanout_timeout_ms = @max(10, parseU64(v) orelse 100);
     }
+    if (envOwned(alloc, env_map, "PULSE_WEB_TIMEOUT_MS")) |v| {
+        defer alloc.free(v);
+        cfg.web_timeout_ms = @max(50, parseU64(v) orelse 1500);
+    }
     if (envOwned(alloc, env_map, "PULSE_MEMINDEX_MAX_TERMS")) |v| {
         cfg.memindex_max_terms = @intCast(@max(100, parseU64(v) orelse 50000));
     }
@@ -392,8 +403,11 @@ test "load reads searxng URL from env, null by default" {
     defer map.deinit();
     const empty_cfg = try load(alloc, &map);
     try std.testing.expect(empty_cfg.searxng_url == null);
+    try std.testing.expectEqual(@as(u64, 1500), empty_cfg.web_timeout_ms);
     try map.put("PULSE_SEARXNG_URL", "http://searxng:8080");
+    try map.put("PULSE_WEB_TIMEOUT_MS", "2500");
     const cfg = try load(alloc, &map);
     defer alloc.free(cfg.searxng_url.?);
     try std.testing.expectEqualStrings("http://searxng:8080", cfg.searxng_url.?);
+    try std.testing.expectEqual(@as(u64, 2500), cfg.web_timeout_ms);
 }

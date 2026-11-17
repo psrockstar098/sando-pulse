@@ -158,15 +158,22 @@ pub fn urlEncode(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
 }
 
 const RawResult = struct {
-    title: []const u8 = "",
-    url: []const u8 = "",
-    content: []const u8 = "",
-    engine: []const u8 = "",
+    // Optional: real SearXNG answers can carry null for a missing
+    // snippet/title (a present null is a parse error for a plain
+    // []const u8 field, so these must be optional).
+    title: ?[]const u8 = null,
+    url: ?[]const u8 = null,
+    content: ?[]const u8 = null,
+    engine: ?[]const u8 = null,
 };
 
 const RawResponse = struct {
     results: []RawResult = &.{},
-    unresponsive_engines: [][]const u8 = &.{},
+    // Real SearXNG shape: PAIRS [engine, reason], e.g.
+    // [["brave","proxy error"],["duckduckgo","timeout"]]. A flat
+    // []const u8 list fails to parse the moment any engine is down
+    // — which is exactly when this field is non-empty.
+    unresponsive_engines: [][]const []const u8 = &.{},
 };
 
 /// Parse one SearXNG JSON page into owned results, truncated to
@@ -192,12 +199,13 @@ fn parseResponse(alloc: std.mem.Allocator, body: []const u8, query: []const u8, 
     }
     for (doc.results) |r| {
         if (out.items.len >= count) break;
-        if (r.url.len == 0) continue;
+        const url = r.url orelse continue;
+        if (url.len == 0) continue;
         try out.append(alloc, .{
-            .title = try alloc.dupe(u8, r.title),
-            .url = try alloc.dupe(u8, r.url),
-            .content = try alloc.dupe(u8, r.content),
-            .engine = try alloc.dupe(u8, r.engine),
+            .title = try alloc.dupe(u8, r.title orelse ""),
+            .url = try alloc.dupe(u8, url),
+            .content = try alloc.dupe(u8, r.content orelse ""),
+            .engine = try alloc.dupe(u8, r.engine orelse ""),
         });
     }
     var engines: std.ArrayList([]const u8) = .empty;
@@ -206,7 +214,8 @@ fn parseResponse(alloc: std.mem.Allocator, body: []const u8, query: []const u8, 
         engines.deinit(alloc);
     }
     for (doc.unresponsive_engines) |e| {
-        try engines.append(alloc, try alloc.dupe(u8, e));
+        if (e.len == 0) continue;
+        try engines.append(alloc, try alloc.dupe(u8, e[0]));
     }
     const owned_query = try alloc.dupe(u8, query);
     errdefer alloc.free(owned_query);
@@ -248,7 +257,7 @@ test "searxng: urlEncode leaves unreserved chars and escapes the rest" {
 test "searxng: parseResponse keeps results verbatim and reports dead engines" {
     const alloc = std.testing.allocator;
     const body =
-        \\{"query":"Liberia news","number_of_results":2,"results":[{"url":"https://example.com/a","title":"Liberia elects","content":"Monrovia votes.","engine":"bing","score":1.0},{"url":"https://example.com/b","title":"Fuel queues","content":"","engine":"duckduckgo"}],"unresponsive_engines":["google"],"answers":{}}
+        \\{"query":"Liberia news","number_of_results":2,"results":[{"url":"https://example.com/a","title":"Liberia elects","content":"Monrovia votes.","engine":"bing","score":1.0},{"url":"https://example.com/b","title":"Fuel queues","content":"","engine":"duckduckgo"}],"unresponsive_engines":[["google","timeout"]],"answers":{}}
     ;
     const res = try parseResponse(alloc, body, "Liberia news", 10, 42);
     defer freeResponse(alloc, res);
@@ -274,6 +283,41 @@ test "searxng: parseResponse truncates to count and drops URL-less entries" {
     try std.testing.expectEqual(@as(usize, 2), res.results.len);
     try std.testing.expectEqualStrings("https://a.example", res.results[0].url);
     try std.testing.expectEqualStrings("https://b.example", res.results[1].url);
+}
+
+test "searxng: parseResponse handles real SearXNG shape — empty results, paired unresponsive_engines" {
+    // Regression: real SearXNG answers carry unresponsive_engines as
+    // [engine, reason] PAIRS, and the empty-results shape carries the
+    // answers/corrections/infoboxes/suggestions fields. The old
+    // [][]const u8 type failed to parse this the moment any engine
+    // was down (live 2026-11-17: every proxied query), so the web
+    // leg reported "SearXNG did not answer" on a healthy 200.
+    const alloc = std.testing.allocator;
+    const body =
+        \\{"query":"Liberia news","results":[],"answers":[],"corrections":[],"infoboxes":[],"suggestions":[],"unresponsive_engines":[["brave","proxy error"],["duckduckgo","timeout"],["google cse","proxy error"],["wikipedia","SSL error: certificate validation has failed"]]}
+    ;
+    const res = try parseResponse(alloc, body, "Liberia news", 10, 42);
+    defer freeResponse(alloc, res);
+    try std.testing.expectEqual(@as(usize, 0), res.results.len);
+    try std.testing.expectEqual(@as(usize, 4), res.unresponsive_engines.len);
+    try std.testing.expectEqualStrings("brave", res.unresponsive_engines[0]);
+    try std.testing.expectEqualStrings("duckduckgo", res.unresponsive_engines[1]);
+    try std.testing.expectEqualStrings("google cse", res.unresponsive_engines[2]);
+    try std.testing.expectEqualStrings("wikipedia", res.unresponsive_engines[3]);
+}
+
+test "searxng: parseResponse tolerates null title/content/url in results" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{"query":"x","results":[{"url":"https://a.example","title":null,"content":null,"engine":"e1"},{"url":null,"title":"no link","content":"x","engine":"e2"}],"unresponsive_engines":[]}
+    ;
+    const res = try parseResponse(alloc, body, "x", 10, 7);
+    defer freeResponse(alloc, res);
+    try std.testing.expectEqual(@as(usize, 1), res.results.len);
+    try std.testing.expectEqualStrings("https://a.example", res.results[0].url);
+    try std.testing.expectEqualStrings("", res.results[0].title);
+    try std.testing.expectEqualStrings("", res.results[0].content);
+    try std.testing.expectEqualStrings("e1", res.results[0].engine);
 }
 
 test "searxng: parseResponse accepts an empty result list" {

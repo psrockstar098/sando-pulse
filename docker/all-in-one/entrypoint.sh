@@ -1,5 +1,5 @@
 #!/bin/bash
-# pulse-entrypoint.sh — all-in-one startup: Postgres + Redis + Pulse.
+# pulse-entrypoint.sh — all-in-one startup: Postgres + Redis + SearXNG + Pulse.
 #
 # First run: initdb a fresh Postgres data dir, create the pulse database.
 # Every run: start Postgres and Redis if not already running, then exec
@@ -71,6 +71,34 @@ for _ in $(seq 1 30); do
     sleep 1
 done
 redis-cli -h 127.0.0.1 -p "$REDISPORT" ping
+
+# --- SearXNG: bundled web search (granian serves the Flask app) -----------
+# Internal only (127.0.0.1:8080, not exposed). The limiter uses the
+# Redis already running in this image (db 1, see settings-aio.yml).
+# A random secret is generated per boot when SEARXNG_SECRET is unset
+# (sessions only — nothing persists). If SearXNG fails to start,
+# Pulse keeps serving local results and the unified query reports
+# the web leg as "error"/"timeout" — the web leg must never take
+# the API down. PULSE_SEARXNG_URL is set only when granian exists,
+# so a missing install reports "unavailable" instead of "error".
+export SEARXNG_SETTINGS_PATH="${SEARXNG_SETTINGS_PATH:-/etc/searxng/settings.yml}"
+export SEARXNG_SECRET="${SEARXNG_SECRET:-$(cat /proc/sys/kernel/random/uuid)}"
+if [ -x /opt/searxng-venv/bin/granian ]; then
+    export PULSE_SEARXNG_URL="${PULSE_SEARXNG_URL:-http://127.0.0.1:8080}"
+    echo "[entrypoint] starting searxng on 127.0.0.1:8080"
+    ( /opt/searxng-venv/bin/granian --interface wsgi --host 127.0.0.1 --port 8080 --workers 1 "searx.webapp:app" >>/var/log/searxng.log 2>&1 ) &
+    echo "[entrypoint] searxng starting in background (pid $!)"
+    for _ in $(seq 1 60); do
+        if curl -fsS "http://127.0.0.1:8080/healthz" >/dev/null 2>&1; then
+            echo "[entrypoint] searxng is up"
+            break
+        fi
+        sleep 1
+    done
+    curl -fsS "http://127.0.0.1:8080/healthz" >/dev/null 2>&1 || echo "[entrypoint] WARNING: searxng did not answer /healthz — web search will report unavailable until it does"
+else
+    echo "[entrypoint] WARNING: granian not found — web search unavailable"
+fi
 
 # --- Pulse worker: ingest feeds in the background ---------------------------
 # A hosted deploy has no separate worker service (Render free has no free

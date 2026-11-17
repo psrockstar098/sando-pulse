@@ -1,8 +1,8 @@
 //! Web search CLI: `pulse websearch "<query>"`.
 //!
 //! Asks the configured SearXNG instance for real web search and prints
-//! the results (title, url, engine) — the same shape the GET
-//! /v1/websearch endpoint returns. Results are printed exactly as
+//! the results (title, url, engine) — the debug path for the web leg
+//! of the unified /v1/query answer. Results are printed exactly as
 //! SearXNG reported them: no ranking, no verdict.
 //!
 //! Exit codes: 0 = results found; 2 = no results (a valid empty
@@ -47,7 +47,7 @@ pub fn run(alloc: std.mem.Allocator, io: std.Io, cfg: config.Config, args: []con
     }
 
     const url = base_url orelse {
-        logging.err("websearch: PULSE_SEARXNG_URL is not set — start SearXNG (docker compose --profile websearch up -d) and set it", &.{});
+        logging.err("websearch: PULSE_SEARXNG_URL is not set — the all-in-one image sets it to its bundled SearXNG; otherwise start SearXNG (docker compose --profile websearch up -d) and set it", &.{});
         return 1;
     };
 

@@ -182,14 +182,17 @@ production host, with the checklist in `pulse audit` as the gate.
 
 ## Web search (SearXNG)
 
-Full detail: `docs/WEBSEARCH.md`. SearXNG + Valkey run behind the
-`websearch` compose profile only (`docker compose --profile websearch
-up -d`); the default stack is unchanged. The API needs
-`PULSE_SEARXNG_URL` (e.g. `http://searxng:8080`) and SearXNG needs
-`SEARXNG_SECRET` from `.env`. Without the URL, `GET /v1/websearch`
-answers 503 `websearch_unavailable` and `pulse websearch` refuses to
-run. The all-in-one image does NOT bundle SearXNG (Render free is
-512 MB RAM) — on Render it would be a second free service later.
+Full detail: `docs/WEBSEARCH.md`. The all-in-one image bundles
+SearXNG — one `docker run` answers web searches with no extra
+setup; on Render it is a single service, no second service needed.
+SearXNG + Valkey also run behind the `websearch` compose profile
+(`docker compose --profile websearch up -d`) as the dev alternative.
+The API needs `PULSE_SEARXNG_URL` (e.g. `http://searxng:8080`) and
+SearXNG needs `SEARXNG_SECRET` from `.env`. Without the URL, the
+web leg of the unified `/v1/query` reports `unavailable` and `pulse
+websearch` refuses to run. There is no separate public websearch
+route: `GET /v1/websearch` was removed when the unified query
+landed (2026-11-17) — one query does the job.
 
 ## Roadmap 7 operations
 

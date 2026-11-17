@@ -5,8 +5,12 @@ zig-out/
 archive/
 popular.json
 
-# All-in-one image build staging (binary + vendored .debs, ~230 MB).
-# Rebuilt by docker/all-in-one/build.sh; never committed.
+# All-in-one image build staging (binary + vendored .debs + SearXNG
+# source/wheels, ~300 MB). Rebuilt by docker/all-in-one/build.sh;
+# never committed.
 docker/all-in-one/pulse
 docker/all-in-one/debs/
 docker/all-in-one/download-specs.txt
+docker/all-in-one/wheelhouse/
+docker/all-in-one/searxng-src/
+docker/all-in-one/searxng-src.tar.gz

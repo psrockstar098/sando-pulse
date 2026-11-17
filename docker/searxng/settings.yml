@@ -16,6 +16,9 @@ use_default_settings: true
 
 general:
   instance_name: "Sando Pulse web search"
+  # Required by the wikipedia (and wikidata / openstreetmap) engines:
+  # without a contact URL they refuse to register at all.
+  contact_url: "https://github.com/psrockstar098/sando-pulse"
 
 search:
   safe_search: 1

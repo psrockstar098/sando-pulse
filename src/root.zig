@@ -71,6 +71,7 @@ pub const sando_client = @import("sando/client.zig");
 pub const cli_mock_sando = @import("cli/mock_sando.zig");
 pub const cli_websearch = @import("cli/websearch.zig");
 pub const search_searxng = @import("search/searxng.zig");
+pub const search_unified = @import("search/unified.zig");
 pub const ai_providers = @import("ai/providers.zig");
 pub const seed_liberia = @import("seed/liberia.zig");
 pub const intelligence_events = @import("intelligence/events.zig");
