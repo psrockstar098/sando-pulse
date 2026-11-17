@@ -180,6 +180,17 @@ itself was smoke-tested live on the host (see STATUS.md). The first
 real `docker compose up` must happen on Dominic's machine or a
 production host, with the checklist in `pulse audit` as the gate.
 
+## Web search (SearXNG)
+
+Full detail: `docs/WEBSEARCH.md`. SearXNG + Valkey run behind the
+`websearch` compose profile only (`docker compose --profile websearch
+up -d`); the default stack is unchanged. The API needs
+`PULSE_SEARXNG_URL` (e.g. `http://searxng:8080`) and SearXNG needs
+`SEARXNG_SECRET` from `.env`. Without the URL, `GET /v1/websearch`
+answers 503 `websearch_unavailable` and `pulse websearch` refuses to
+run. The all-in-one image does NOT bundle SearXNG (Render free is
+512 MB RAM) — on Render it would be a second free service later.
+
 ## Roadmap 7 operations
 
 - **No new config vars.** Roadmap 7 adds no environment knobs:

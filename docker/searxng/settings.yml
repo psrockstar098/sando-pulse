@@ -1,0 +1,30 @@
+# SearXNG settings for Sando Pulse (docs/WEBSEARCH.md).
+#
+# Starts from the image defaults (`use_default_settings: true`) and
+# overrides only what Pulse needs:
+# - `json` in search.formats: without it, /search?format=json answers
+#   403 and Pulse's web search fails outright.
+# - limiter on, backed by the searxng-valkey service in compose.
+# - moderate safe search: Pulse serves a general audience.
+# - instance name, so the web UI (if the port is ever published for
+#   local dev) says whose instance this is.
+#
+# The secret key comes from the SEARXNG_SECRET env var (compose) — the
+# image maps it onto server.secret_key automatically. It is never
+# written in this file.
+use_default_settings: true
+
+general:
+  instance_name: "Sando Pulse web search"
+
+search:
+  safe_search: 1
+  formats:
+    - html
+    - json
+
+server:
+  limiter: true
+
+valkey:
+  url: valkey://searxng-valkey:6379/0

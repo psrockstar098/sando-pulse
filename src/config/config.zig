@@ -19,6 +19,11 @@ pub const Config = struct {
     /// Base URL of this Pulse instance, used by the mock-sando client
     /// (Roadmap 5.2). Defaults to the local server.
     pulse_url: []const u8 = "http://127.0.0.1:9000",
+    /// SearXNG base URL for real web search (GET /v1/websearch and
+    /// `pulse websearch`). Null = web search unavailable: the endpoint
+    /// answers 503 `websearch_unavailable` and the CLI refuses to run.
+    /// Example: "http://searxng:8080" on the compose network.
+    searxng_url: ?[]const u8 = null,
     /// Registered API consumers (Roadmap 5.3). Empty = a single implicit
     /// "default" consumer with all scopes and the global daily limit.
     consumers: []const usage.Consumer = &.{},
@@ -171,6 +176,9 @@ pub fn load(alloc: std.mem.Allocator, env_map: *std.process.Environ.Map) !Config
     }
     if (envOwned(alloc, env_map, "PULSE_URL")) |v| {
         if (v.len > 0) cfg.pulse_url = v;
+    }
+    if (envOwned(alloc, env_map, "PULSE_SEARXNG_URL")) |v| {
+        if (v.len > 0) cfg.searxng_url = v;
     }
     if (envOwned(alloc, env_map, "PULSE_CONSUMERS")) |v| {
         if (v.len > 0) {
@@ -376,4 +384,16 @@ test "load reads replica URL and country from env" {
     defer alloc.free(cfg.country);
     try std.testing.expectEqualStrings("postgres://replica:5432/pulse", cfg.database_replica_url.?);
     try std.testing.expectEqualStrings("sl", cfg.country);
+}
+
+test "load reads searxng URL from env, null by default" {
+    const alloc = std.testing.allocator;
+    var map = std.process.Environ.Map.init(alloc);
+    defer map.deinit();
+    const empty_cfg = try load(alloc, &map);
+    try std.testing.expect(empty_cfg.searxng_url == null);
+    try map.put("PULSE_SEARXNG_URL", "http://searxng:8080");
+    const cfg = try load(alloc, &map);
+    defer alloc.free(cfg.searxng_url.?);
+    try std.testing.expectEqualStrings("http://searxng:8080", cfg.searxng_url.?);
 }

@@ -53,6 +53,8 @@ published**. The API container runs migrations on boot.
 | `REDIS_URL` | — (no event bus) | `redis://host:port`; enables the Redis Streams event bus |
 | `MINIO_ENDPOINT` / `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` / `MINIO_BUCKET` | `pulse-raw` bucket | S3-compatible raw store (MinIO) |
 | `PULSE_INGEST_INTERVAL_S` | `300` | Worker ingest interval |
+| `PULSE_SEARXNG_URL` | — (web search off) | SearXNG base URL, e.g. `http://searxng:8080`; unset → `GET /v1/websearch` answers 503 `websearch_unavailable` (docs/WEBSEARCH.md) |
+| `SEARXNG_SECRET` | — | SearXNG secret key (`server.secret_key`); required only with the `websearch` compose profile |
 | `PULSE_RATE_LIMIT_PER_MINUTE` / `PULSE_RATE_LIMIT_PER_DAY` | `100` / `10000` | Per-key rate limits |
 | `PULSE_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `PULSE_POPULAR_MAX_TRACKED` | `1000` | Distinct queries tracked for `GET /v1/popular` (Roadmap 6.4) |
@@ -99,6 +101,7 @@ published**. The API container runs migrations on boot.
 | POST | `/v1/admin/config` | Bearer <redacted> | Hot-reload safe settings: `l1_ttl_s`, `fanout_timeout_ms`, `reindex_interval_s` (Roadmap 6.11) |
 | GET | `/metrics` | no | Prometheus text metrics |
 | POST | `/v1/query` | Bearer key | `{"query": "..."}` → cited answer or insufficient-evidence |
+| GET | `/v1/websearch` | Bearer key | Real web search via SearXNG: `?q=…&count=…` → results + `took_ms` (docs/WEBSEARCH.md) |
 | POST | `/v1/ingest` | Bearer key | Manual document ingest `{"title","url","source_id","text"}` |
 
 Every response carries a `request_id` (`req-{hex nanos}`). Rate limits:

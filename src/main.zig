@@ -25,6 +25,7 @@ const loadtest = @import("cli/loadtest.zig");
 const audit = @import("cli/audit.zig");
 const backup_cli = @import("cli/backup.zig");
 const mock_sando = @import("cli/mock_sando.zig");
+const websearch = @import("cli/websearch.zig");
 const repository = @import("storage/repository.zig");
 const knowledge = @import("storage/knowledge.zig");
 const seed = @import("seed/liberia.zig");
@@ -172,6 +173,17 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(mock_sando.run(alloc, io, cfg, flag_args.items));
     }
 
+    if (std.mem.eql(u8, cmd, "websearch")) {
+        const query = cmd_arg orelse {
+            logging.err("websearch needs a query (websearch \"<query>\" [--count N] [--searxng-url <url>])", &.{});
+            std.process.exit(2);
+        };
+        var flag_args: std.ArrayList([]const u8) = .empty;
+        try flag_args.append(alloc, query);
+        while (args_it.next()) |a| try flag_args.append(alloc, a);
+        std.process.exit(websearch.run(alloc, io, cfg, flag_args.items));
+    }
+
     if (std.mem.eql(u8, cmd, "status")) {
         printStatus(cfg);
         return;
@@ -189,8 +201,8 @@ pub fn main(init: std.process.Init) !void {
 
     const is_worker = std.mem.eql(u8, cmd, "worker");
     const once = is_worker and (cmd_arg != null and std.mem.eql(u8, cmd_arg.?, "--once"));
-    if (!std.mem.eql(u8, cmd, "serve") and !is_worker and !std.mem.eql(u8, cmd, "maintenance") and !std.mem.eql(u8, cmd, "seed") and !std.mem.eql(u8, cmd, "briefing") and !std.mem.eql(u8, cmd, "alerts") and !std.mem.eql(u8, cmd, "loadtest") and !std.mem.eql(u8, cmd, "audit") and !std.mem.eql(u8, cmd, "backup") and !std.mem.eql(u8, cmd, "restore") and !std.mem.eql(u8, cmd, "mock-sando") and !std.mem.eql(u8, cmd, "reindex")) {
-        logging.err("unknown command (serve | worker [--once] | migrate | status | keygen | maintenance | seed | briefing | alerts | loadtest | audit | backup | restore | mock-sando | reindex)", &.{});
+    if (!std.mem.eql(u8, cmd, "serve") and !is_worker and !std.mem.eql(u8, cmd, "maintenance") and !std.mem.eql(u8, cmd, "seed") and !std.mem.eql(u8, cmd, "briefing") and !std.mem.eql(u8, cmd, "alerts") and !std.mem.eql(u8, cmd, "loadtest") and !std.mem.eql(u8, cmd, "audit") and !std.mem.eql(u8, cmd, "backup") and !std.mem.eql(u8, cmd, "restore") and !std.mem.eql(u8, cmd, "mock-sando") and !std.mem.eql(u8, cmd, "websearch") and !std.mem.eql(u8, cmd, "reindex")) {
+        logging.err("unknown command (serve | worker [--once] | migrate | status | keygen | maintenance | seed | briefing | alerts | loadtest | audit | backup | restore | mock-sando | websearch | reindex)", &.{});
         std.process.exit(2);
     }
 

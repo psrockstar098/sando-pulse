@@ -36,6 +36,8 @@
 //!   GET  /metrics     public — Prometheus exposition (Roadmap 1.5)
 //!   POST /v1/query    auth + rate limit — planned search with citations
 //!   POST /v1/ingest   auth + rate limit — manual document ingest
+//!   GET  /v1/websearch auth + rate limit — real web search via SearXNG
+//!          (PULSE_SEARXNG_URL unset -> 503 websearch_unavailable)
 //! Auth: Bearer API key when PULSE_API_KEY is set; open dev mode otherwise.
 //! Rate limits: 100/min + 10,000/day per key (configurable).
 
@@ -93,6 +95,7 @@ const fanout = @import("../engine/fanout.zig");
 const autotune = @import("../engine/autotune.zig");
 const breaker = @import("../engine/breaker.zig");
 const usage = @import("usage.zig");
+const searxng = @import("../search/searxng.zig");
 
 /// Fan-out task: knowledge-store locations matching the query's
 /// counties/cities (Roadmap 6.6). Runs in a worker thread when the
@@ -2754,6 +2757,62 @@ pub const Server = struct {
             return;
         }
 
+        if (method == .GET and std.mem.eql(u8, path, "/v1/websearch")) {
+            // Real web search via SearXNG (docs/WEBSEARCH.md). Same auth
+            // + rate-limit + quota gate as /v1/query (kind .query), so a
+            // websearch call spends the caller's query quota. Results are
+            // returned exactly as SearXNG reported them — no ranking, no
+            // verdict. `?q=` is required (max 1000 chars, same bound as
+            // /v1/query); `?count=` defaults to 10, range 1..20.
+            if (!self.checkAuthAndRate(req, head, alloc, req_id, .query)) return;
+            const base_url = self.cfg.searxng_url orelse {
+                self.respondError(req, alloc, req_id, .service_unavailable, "websearch_unavailable", "Web search is not configured (PULSE_SEARXNG_URL unset)");
+                return;
+            };
+            const raw_q = queryParam(head.query, "q") orelse {
+                self.respondError(req, alloc, req_id, .bad_request, "invalid_request", "Missing ?q= query parameter");
+                return;
+            };
+            const q_text = urlDecode(alloc, raw_q) catch raw_q;
+            const trimmed = std.mem.trim(u8, q_text, " \t\n\r");
+            if (trimmed.len == 0 or trimmed.len > 1000) {
+                self.respondError(req, alloc, req_id, .bad_request, "invalid_request", "Query must be 1-1000 chars");
+                return;
+            }
+            var count: usize = searxng.default_count;
+            if (queryParam(head.query, "count")) |cs| {
+                const n = std.fmt.parseInt(usize, cs, 10) catch {
+                    self.respondError(req, alloc, req_id, .bad_request, "invalid_request", "count must be 1-20");
+                    return;
+                };
+                if (n < 1 or n > searxng.max_count) {
+                    self.respondError(req, alloc, req_id, .bad_request, "invalid_request", "count must be 1-20");
+                    return;
+                }
+                count = n;
+            }
+            var client = searxng.Client{ .alloc = self.alloc, .io = self.io, .base_url = base_url };
+            const res = client.search(alloc, trimmed, count) catch |e| {
+                switch (e) {
+                    error.InvalidQuery => self.respondError(req, alloc, req_id, .bad_request, "invalid_request", "Query must be 1-1000 chars"),
+                    error.Unavailable => self.respondError(req, alloc, req_id, .bad_gateway, "websearch_upstream_unavailable", "SearXNG did not answer"),
+                    error.BadResponse => self.respondError(req, alloc, req_id, .bad_gateway, "websearch_bad_response", "SearXNG answered with an unusable response"),
+                    error.OutOfMemory => self.respondError(req, alloc, req_id, .internal_server_error, "internal", "Out of memory"),
+                }
+                return;
+            };
+            defer searxng.freeResponse(alloc, res);
+            const body = query_json.buildWebSearchResponse(alloc, req_id, res) catch {
+                self.respondError(req, alloc, req_id, .internal_server_error, "internal", "Failed to render response");
+                return;
+            };
+            self.metrics.observeRequest(200, @intCast(@max(0, timex.nowMillis(self.io) - start_ms)));
+            self.recordUsage(head, .query);
+            self.auditCall(head, alloc, req_id, 200);
+            try respondJson(req, .ok, body, req_id);
+            return;
+        }
+
         if (method == .POST and std.mem.eql(u8, path, "/v1/ingest")) {
             if (!self.checkAuthAndRate(req, head, alloc, req_id, .ingest)) return;
             const body = readBody(req, alloc) catch {
@@ -3020,6 +3079,7 @@ pub const Server = struct {
                 std.mem.eql(u8, path, "/v1/connectors/facebook") or
                 std.mem.eql(u8, path, "/v1/webhooks/facebook") or
                 std.mem.eql(u8, path, "/metrics") or std.mem.eql(u8, path, "/v1/query") or
+                std.mem.eql(u8, path, "/v1/websearch") or
                 std.mem.eql(u8, path, "/v1/usage") or
                 std.mem.eql(u8, path, "/v1/autotune") or std.mem.eql(u8, path, "/v1/admin/autotune/reset") or
                 std.mem.eql(u8, path, "/v1/admin/config") or

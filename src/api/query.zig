@@ -26,6 +26,7 @@ const prediction_trends = @import("../intelligence/prediction/trend_analyzer.zig
 const prediction_anomalies = @import("../intelligence/prediction/anomaly_detector.zig");
 const prediction_risk = @import("../intelligence/prediction/risk_assessor.zig");
 const monitor = @import("../intelligence/monitor/account_monitor.zig");
+const searxng = @import("../search/searxng.zig");
 
 pub const QueryRequest = struct {
     query: []const u8,
@@ -317,6 +318,24 @@ pub fn buildErrorResponse(alloc: std.mem.Allocator, req_id: []const u8, code: []
     return stringifyAlloc(alloc, .{
         .@"error" = .{ .code = code, .message = message },
         .request_id = req_id,
+    });
+}
+
+/// GET /v1/websearch response: SearXNG results exactly as reported —
+/// title, url, content, engine per result — plus the engines that did
+/// not answer. No ranking and no verdict: the caller decides what the
+/// results mean. `took_ms` is the measured SearXNG round trip.
+pub fn buildWebSearchResponse(
+    alloc: std.mem.Allocator,
+    req_id: []const u8,
+    res: searxng.WebSearchResponse,
+) ![]u8 {
+    return stringifyAlloc(alloc, .{
+        .request_id = req_id,
+        .query = res.query,
+        .results = res.results,
+        .unresponsive_engines = res.unresponsive_engines,
+        .took_ms = res.took_ms,
     });
 }
 
@@ -1321,6 +1340,26 @@ test "buildErrorResponse shape" {
     defer std.testing.allocator.free(s);
     try std.testing.expect(std.mem.indexOf(u8, s, "\"code\":\"not_found\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "\"request_id\":\"req-1\"") != null);
+}
+
+test "buildWebSearchResponse renders results verbatim" {
+    const alloc = std.testing.allocator;
+    const results = [_]searxng.WebResult{
+        .{ .title = "Liberia elects", .url = "https://example.com/a", .content = "Monrovia votes.", .engine = "bing" },
+    };
+    const engines = [_][]const u8{"google"};
+    const s = try buildWebSearchResponse(alloc, "req-9", .{
+        .query = "Liberia news",
+        .results = @constCast(&results),
+        .unresponsive_engines = @constCast(&engines),
+        .took_ms = 123,
+    });
+    defer alloc.free(s);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"request_id\":\"req-9\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"query\":\"Liberia news\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"engine\":\"bing\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"unresponsive_engines\":[\"google\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"took_ms\":123") != null);
 }
 
 test "buildQueryResponse renders exactly options.limit results" {

@@ -37,6 +37,7 @@ services:
       MINIO_ACCESS_KEY: "${MINIO_ACCESS_KEY:?set MINIO_ACCESS_KEY in .env}"
       MINIO_SECRET_KEY: "${MINIO_SECRET_KEY:?set MINIO_SECRET_KEY in .env}"
       MINIO_BUCKET: "pulse-raw"
+      PULSE_SEARXNG_URL: "${PULSE_SEARXNG_URL:-}"
     ports:
       - "9000:9000"
     volumes:
@@ -84,6 +85,7 @@ services:
       MINIO_ACCESS_KEY: "${MINIO_ACCESS_KEY:?set MINIO_ACCESS_KEY in .env}"
       MINIO_SECRET_KEY: "${MINIO_SECRET_KEY:?set MINIO_SECRET_KEY in .env}"
       MINIO_BUCKET: "pulse-raw"
+      PULSE_SEARXNG_URL: "${PULSE_SEARXNG_URL:-}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -185,6 +187,49 @@ services:
     logging: *default-logging
     networks:
       - pulse-net
+
+  # SearXNG web search (docs/WEBSEARCH.md): only with the `websearch`
+  # profile — the default stack is unchanged. The API reaches it at
+  # http://searxng:8080 on pulse-net; set
+  # PULSE_SEARXNG_URL=http://searxng:8080 in .env. The secret comes
+  # from SEARXNG_SECRET in .env — never from this file. Start with:
+  #   docker compose --profile websearch up -d
+  # Image pinned to the dated tag 2026.11.15-2d500cb6b (verified on
+  # Docker Hub 2026-11-16); move it forward on purpose, never `latest`.
+  # The port is NOT published: only the Pulse API calls SearXNG.
+  # Uncomment the ports line for local dev.
+  searxng:
+    profiles: ["websearch"]
+    image: docker.io/searxng/searxng:2026.11.15-2d500cb6b
+    environment:
+      SEARXNG_BASE_URL: "${SEARXNG_BASE_URL:-http://localhost:8080/}"
+      SEARXNG_SECRET: "${SEARXNG_SECRET:?set SEARXNG_SECRET in .env for the websearch profile}"
+    volumes:
+      - ./docker/searxng/settings.yml:/etc/searxng/settings.yml:ro
+      - ./docker/searxng/limiter.toml:/etc/searxng/limiter.toml:ro
+      - pulse-searxngdata:/var/cache/searxng
+    # Dev only: uncomment to reach SearXNG directly.
+    # ports:
+    #   - "8080:8080"
+    depends_on:
+      - searxng-valkey
+    logging: *default-logging
+    networks:
+      - pulse-net
+    restart: unless-stopped
+
+  # Valkey for the SearXNG rate limiter (same profile). Only the
+  # limiter needs it; the counters are short-lived, so the volume
+  # holds no data worth backing up.
+  searxng-valkey:
+    profiles: ["websearch"]
+    image: docker.io/valkey/valkey:9-alpine
+    volumes:
+      - pulse-searxngvalkey:/data
+    logging: *default-logging
+    networks:
+      - pulse-net
+    restart: unless-stopped
 
   postgres:
     image: postgres:16-alpine
@@ -345,6 +390,8 @@ volumes:
   pulse-miniodata:
   pulse-promdata:
   pulse-grafanadata:
+  pulse-searxngdata:
+  pulse-searxngvalkey:
 
 networks:
   pulse-net:
