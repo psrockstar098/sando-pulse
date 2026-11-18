@@ -8,8 +8,8 @@ behind the TLS proxy in production. The full machine-readable contract is
 
 ## Authentication
 
-`POST /v1/query`, `POST /v1/ingest` and `GET /v1/usage` require an API
-key. Every other route is public (read-only intelligence endpoints).
+`POST /v1/query` requires an API key when one is configured.
+The other two routes are public.
 
 ```
 Authorization: Bearer <PULSE_API_KEY>
@@ -31,7 +31,7 @@ X-Pulse-Consumer: sando
 Register consumers in `PULSE_CONSUMERS` (semicolon-separated):
 
 ```
-PULSE_CONSUMERS=sando:query,admin:10000;ingest-bot:ingest:5000
+PULSE_CONSUMERS=sando:query:10000
 ```
 
 Format per entry: `name:scope,scope:quota_per_day`. Scopes:
@@ -39,18 +39,15 @@ Format per entry: `name:scope,scope:quota_per_day`. Scopes:
 | Scope | Endpoints |
 | ----- | --------- |
 | `query` | `POST /v1/query` |
-| `ingest` | `POST /v1/ingest` |
-| `admin` | `GET /v1/usage` |
-| `*` | all three |
+| `*` | `POST /v1/query` |
 
 - Names are 1–64 chars of `[a-z0-9_-]`; anything else is `400
   invalid_consumer`. Malformed entries are skipped with a warning.
 - A missing scope is `403 forbidden_scope`.
-- `quota_per_day` is the consumer's daily call budget across query +
-  ingest. `0` means "use the global `PULSE_RATE_LIMIT_PER_DAY`".
+- `quota_per_day` is the consumer's daily call budget for queries.
+  `0` means "use the global `PULSE_RATE_LIMIT_PER_DAY`".
   Spending the quota is `429 quota_exceeded`.
-- `GET /v1/usage` (admin scope) shows today's counts, quotas and
-  remaining budget per consumer; `?consumer=<name>` filters to one.
+
 
 ## Rate limits
 
@@ -161,22 +158,16 @@ one top-level `unified` object:
 The web leg waits at most `PULSE_WEB_TIMEOUT_MS` (default 1500 ms,
 minimum 50); a stuck web leg never delays the answer. Stat answers
 do not fan out to the web. Existing response fields are untouched
-by the fan-out. `GET /v1/websearch` was removed 2026-11-17 — one
-query does the job; the debug path is the `pulse websearch` CLI.
+by the fan-out. `GET /v1/websearch` was removed 2026-11-17 and the
+other `/v1/*` routes were removed 2026-11-18 — one query does the
+job; the debug path is the `pulse websearch` CLI.
 Full detail, including the all-in-one bundling and the honest
 limits: `docs/WEBSEARCH.md`.
 
-## Roadmap 7 endpoints
+## Roadmap 7 behaviour (no separate endpoints)
 
-- `GET /v1/forecast?topic=<t>&county=<c>&limit=N` — next-month
-  predictions per topic (`topic`, `horizon_month` as `YYYY-MM`,
-  `predicted_count`, `confidence`, `basis`, `method:
-  linear_extrapolation`, `same_month_last_year`), plus `anomalies`
-  (z-score spikes/drops) and `insufficient_history` (topics with
-  under 2 months of aggregates). Every prediction carries the
-  disclaimer that it is a statistical extrapolation, not a fact.
-  The same top-3 forecasts appear as the `forecast` section of
-  `GET /v1/trends`.
+Everything in Roadmap 7 rides on `POST /v1/query` or a CLI command:
+
 - Stat answers ride on `POST /v1/query`: a "how many schools are
   in Montserrado County?" or "what is the population of Liberia?"
   question is answered from the knowledge store and the response
@@ -185,233 +176,56 @@ limits: `docs/WEBSEARCH.md`.
   `source`, `verified_at`, `insufficient_reason`) with
   `routing_reason: "stat_answer"`. Unknown places/facilities
   answer `sufficient: false` — never a guessed number.
-- `GET /v1/alerts` — breaking alerts, each with `kind` (accident,
-  protest, road_closure, emergency, announcement, community_event,
-  unknown), `title`, `event_ids`, `sources`, `doc_count`,
-  `importance`, and `ts`, plus `stream` (`pulse:alerts`),
-  `stream_group` (`sando`) and `stream_available`. Empty is a real
-  answer. `pulse alerts` reads the stream back newest-first.
-- `GET /v1/briefing?scope=weekly&kind=political|economic&county=<name>`
-  — report variants. `scope` defaults to `daily`, `kind` to
-  `general`, `county` unset. Variants are computed live and never
-  cached; the default daily-general briefing still uses the
-  worker-cached payload. Unknown scope/kind/county is a 400.
-  The briefing carries `scope`, `kind`, `county`,
-  `social_available` and `social_note`. `pulse briefing` accepts
-  the same options as flags.
-- `GET /v1/events?id=<id>` — the event detail now carries a
-  `contradictions` array next to `conflicts`: every divergent
-  title pair (similarity < 0.30), most dissimilar first, both
-  sources cited, with the warning note. Empty when the reports
-  agree.
-- `GET /v1/social` — social ingestion status: `social_available`,
-  `post_count`, `posts_by_platform`, `top_hashtags` (from real
-  authorized posts only), and `connectors` (facebook, x, reddit,
-  youtube — each with `available` and an unavailable `reason`).
-  `GET /v1/trends` carries a `social` section with the same
-  hashtag trends (category `social`); empty until a social
-  connector feeds the registry.
+- Breaking alerts: `pulse alerts` reads the `pulse:alerts` Redis
+  stream newest-first. Each alert has `kind` (accident, protest,
+  road_closure, emergency, announcement, community_event, unknown),
+  `title`, `event_ids`, `sources`, `doc_count`, `importance`, and
+  `ts`. Empty is a real answer.
+- Report variants: `pulse briefing --scope weekly --kind political
+  --county Lofa`. `scope` defaults to `daily`, `kind` to `general`,
+  `county` unset. Variants are computed live and never cached; the
+  default daily-general briefing still uses the worker-cached
+  payload. Unknown scope/kind/county is a 400. The briefing carries
+  `scope`, `kind`, `county`, `social_available` and `social_note`.
+- Social ingestion is gated: the registry is fed only by authorized
+  connector data. The Facebook connector (Graph API + webhooks,
+  authorized pages only, never scraped or faked) activates when
+  `PULSE_FACEBOOK_ACCESS_TOKEN` is set. Until then the unified
+  query's `facebook` leg reports `not_configured`.
 - Semantic search stays lexical: the external embedding provider
   has no API key and is never called live. `POST /v1/query` with a
   semantic-only question routes `deep` with
   `routing_reason: "semantic_only"` and uses the local lexical
   embedding, labelled as such.
 
-## Trust & Intelligence Engine, Phase 1 endpoints
+## Trust & Intelligence Engine — removed
 
-- `GET /v1/sources/profiles` — the 12 source profiles (`id`, `name`,
-  `platform`, `home_url`, `feed_url`, `county`, `county_confidence`,
-  `county_note`, `district`, `community`, `scope`, `coverage`,
-  `reliability`, `status`, `disabled_reason`, `activity`
-  (`documents_total` live from the store, `posting_frequency` and
-  `last_update` null until the worker tracks per-source freshness),
-  `evidence` (`documents_indexed`), `performance` (null — not
-  measured until Phase 4). `reliability` is the registry's
-  design-doc grade, not a credibility score. Filters: `?county=`
-  (one of the 15 counties, else 400), `?status=` (active,
-  under_review, restricted, removed, else 400). `?id=` returns one
-  profile plus its `history` (profile_created at boot); unknown id
-  is 404.
-- `GET /v1/counties` — all 15 counties with `capital`, `sources`
-  (count of sources based there) and a `note`. Montserrado holds
-  the 12 national outlets; every other county is honestly zero
-  until county sources are registered. `county` is the outlet's
-  base county (headquarters), not its coverage.
+The Trust Engine's route surface (source profiles, monitor, evidence,
+scores, rankings, history, actions, decision core, predictions,
+anomalies, risk) was removed on 2026-11-18 when the API was cut to
+three routes. The code is gone; the history is in git. What remains:
+the 12-source registry, per-source health tracking (migration 014,
+`source_health.last_new_at`, stamped by the worker), and the seeded
+county/location data.
 
-## Trust & Intelligence Engine, Phase 2 endpoints
-
-- `GET /v1/monitor` — live account monitoring, one status per
-  registry source: `source_id`, `name`, `channel` (`rss` for the 12
-  registry outlets), `enabled`, `last_checked_at`,
-  `last_success_at`, `last_new_at` (moves only when a run inserts a
-  document), `consecutive_failures`, `documents_total`,
-  `last_error`, `freshness` (`fresh`/`stale`/`unknown` — fresh is a
-  last success within twice the ingest interval),
-  `change_detection` (`new_items_only` for RSS, `webhook_events`
-  for Facebook, `none` for disabled sources), `latest_doc`
-  (newest document: `title`, `url`, `fetched_at`) and a plain-words
-  `note`. A `facebook` object carries the connector state
-  (`available`, `reason`, `registered_pages`, `pending_pages`,
-  `pages_polled_total`, `pages_failed_total`,
-  `notifications_pending`) — honestly unavailable until a token and
-  registered pages exist. `summary` counts fresh/stale/unknown.
-  Filters: `?source=<id>` (unknown id is 404), `?channel=rss|facebook`
-  (else 400). Timestamps are ISO strings, null when the event has
-  never happened.
-
-## Trust & Intelligence Engine, Phase 3 endpoints
-
-- `GET /v1/evidence` — evidence assessment for one claim. Two forms:
-  `?event=<id>` assesses the event's own claim (its title) against
-  its documents; `?claim=<text>` searches the store for the claim
-  (planner terms, up to 20 documents) and assesses it against what
-  matched. Returns `claim`, `event_id` (null for a free-text claim),
-  `status` (`verified` / `corroborated` / `partially_confirmed` /
-  `unconfirmed` / `disputed` / `outdated`), `confidence` (0..1,
-  documented formula: 0.6 * min(distinct sources, 5)/5 + 0.3 *
-  agreement + 0.1 * recency, capped at 0.95), `explanation`
-  (plain words), `basis` (which rule produced the status),
-  `distinct_sources`, `supporting` (source, title, URL, published
-  time, title similarity to the claim), `contradicting` (the R7.5
-  contradiction flags among the supporting documents), and
-  `assessed_at`. A claim with no supporting document is `unconfirmed`;
-  a single source is never enough to corroborate. The response
-  carries a `status_note`: the status is an assessment, not a verdict
-  — there is no `false` status. Unknown event id is 404; neither
-  parameter is 400.
-- `GET /v1/claims?event=<id>` — the claims extracted from one
-  event's documents: the title (always) plus the lead sentence when
-  it adds something, deduped by text, each with `kind`, `source_id`,
-  `source_name`, `published_at`, `url`. Claim text is copied from
-  the documents, never generated. Unknown event id is 404; missing
-  `event` is 400.
-
-## Trust & Intelligence Engine, Phase 4 endpoints
-
-- `GET /v1/sources/scores` — credibility scores for all 12
-  registered sources, computed on demand from the last 30 days of
-  documents + events. Each score: `source_id`, `source_name`,
-  `total` (0..1 weighted), `rating` (1–5, null when provisional),
-  `provisional` + `provisional_reason` (fewer than 5 documents in
-  the window), `docs_in_window`, and the 7 `components` (name,
-  weight, value, basis). Weights: accuracy 0.30, corroboration
-  0.20, evidence 0.15, original reporting 0.10, timeliness 0.10,
-  corrections 0.10, local knowledge 0.05. Computing a score notes
-  it in the registry history (`score_changed`) when it changed —
-  visible on `GET /v1/sources/profiles?id=<id>`.
-- `GET /v1/rankings?county=<name>` — the county's registered
-  sources ranked by total, highest first, top 20. Returns `county`,
-  `capital`, `candidates` (registered sources based there),
-  `rankings` (rank, source, total, rating, provisional) and a plain
-  note. A known county with no sources returns an empty list with
-  the honest note; an unknown county or a missing `county` is 400.
-
-## Trust & Intelligence Engine, Phase 5 endpoints
-
-- `GET /v1/history` — historical search over the persisted events
-  (up to 100, newest first). Filters: `?query=` (case-insensitive
-  substring of title or topic), `?year=` (of first_seen, must be a
-  number), `?county=` (an event counts for a county when at least
-  one of its documents mentions it). Returns the matching events
-  (with their counties), a `timeline` of monthly buckets (oldest
-  first), and the `recurring` (topic, county) groups among the
-  matches (two or more distinct months). Unknown county or bad year
-  is 400.
-- `GET /v1/history/similar?event=<id>` — events similar to one
-  event: title similarity >= 0.5, or the same topic in a shared
-  county, most similar first, each with its `reason`. Missing
-  `event` is 400, unknown id is 404.
-
-## Trust & Intelligence Engine, Phase 6 endpoints
-
-- `POST /v1/actions` — run a plain-words request. Body
-  `{"request": "..."}`. The request is parsed into a typed action
-  (latest from a source, verify a claim, monitor an account, what
-  is happening, system status, a person's history, watch a story)
-  and run synchronously — the returned job (201) is already `done`
-  (or `failed`) with its `result` embedded. An unrecognized request
-  is never guessed: the job completes with a plain-words message and
-  example requests. Missing/empty `request` or invalid JSON is 400.
-- `GET /v1/actions/jobs?id=job-<n>` — poll a job: its kind, status,
-  result (embedded as an object when done) or error, created and
-  finished times. Unknown id is 404; missing `id` is 400. Jobs are
-  in-memory and forgotten on restart.
-- `GET /v1/actions/watches` — standing watches (id, keywords,
-  county, created_at) with the note that there is no push channel.
-  Watches are also listed on `GET /v1/alerts`.
-
-## Trust & Intelligence Engine, Phase 7 endpoints
-
-- `POST /v1/decisions` — Decision Core assessment. Body
-  `{"claim": "..."}`. Returns the claim's status (one of the six
-  Phase 3 assessment statuses, never a verdict), confidence,
-  distinct sources, supporting documents, contradiction flags,
-  official-source presence, and the full `reasoning` (one entry per
-  rule: rule, outcome, detail) plus a plain-words explanation. The
-  call is recorded in the audit log. Missing/empty `claim` or
-  invalid JSON is 400.
-- `GET /v1/graph` — knowledge-graph subgraphs, built live from the
-  store's events (up to 100). `?event=<id>` returns the event, its
-  entities, sources and claims (unknown id 404);
-  `?entity=<name>` with optional `?kind=` returns the entity and
-  its neighbours (an unknown entity is an empty graph, not an
-  error). One of the two parameters is required, otherwise 400; an
-  invalid `kind` is 400. The response carries the disambiguation
-  note: same-name persons in different counties are separate
-  nodes.
-
-## Trust & Intelligence Engine, Phase 8 endpoints
-
-- `GET /v1/predictions` — per-topic predictions. `?topic=` restricts
-  to one topic (any name is accepted; an unknown topic comes back
-  insufficient, never a 400); without it all 7 known topics are
-  analysed. `?county=` restricts to documents naming the county
-  (unknown county is 400). Each entry carries the monthly series,
-  the least-squares slope (docs/month), the direction (rising /
-  falling / flat), the R7.1 linear forecast for the next month
-  (predicted count, confidence, basis), the monthly anomalies, and
-  an `insufficient_reason` when the history is under 2 months. The
-  response carries the disclaimer that a prediction is a
-  statistical extrapolation from past volume, never a fact about
-  the future.
-- `GET /v1/anomalies` — daily + monthly anomalies. `?topic=`
-  restricts to one topic; without it the daily anomalies cover all
-  topics and the monthly ones cover every known topic. Daily is the
-  last 30 days bucketed by day, |z| >= 2 against the other days,
-  all 30 days counted including zero-volume days; nothing is
-  flagged on a near-empty store (under 10 documents in the
-  window). Monthly reuses the R7.1 rule (|z| >= 2, 4+ months). An
-  anomaly is a flag for a human to look at, never a verdict about
-  why.
-- `GET /v1/risk` — per-county risk assessment. `?county=` is
-  required (missing or unknown county is 400); `?topic=` restricts
-  the anomaly and trend signals to one topic. Level is low /
-  elevated / high (score >= 0.6 high, >= 0.35 elevated) from four
-  signals — anomalies 35%, rising trends 25%, contradiction
-  density (events carrying at least one flag / events) 20%,
-  breaking-alert frequency (store-wide, labelled as such) 20% —
-  with a plain-words reason for every signal that contributed. An
-  assessment of conditions, never a prediction of a specific
-  event.
 
 ## Popular searches and freshness (Roadmap 6.4)
 
-- `GET /v1/popular?limit=N` returns the most-asked queries,
-  most-asked first, with a count each plus `tracked` (how many
-  distinct queries are tracked). Only the query text and a count are
-  ever recorded or exposed — no consumer, no identity.
-- Every precomputed payload reports freshness: `/v1/trends` and
-  `/v1/briefing` carry `computed_at` (Unix seconds) and `stale`.
-  Trends are computed live from a store scan on every request, so
-  `stale` is always false there. The briefing is cached by the worker;
-  `stale` is evaluated at serve time against the precompute TTL
-  (`PULSE_PRECOMPUTE_TTL_S`, default 3600s), so a cached briefing
-  served hours after it was computed is honestly marked stale.
+- The server tracks the most-asked queries internally (query text
+  and a count only — no consumer, no identity) to warm the caches
+  at boot. There is no public endpoint for the list.
+- Every precomputed payload reports freshness: the `pulse briefing`
+  payload carries `computed_at` (Unix seconds) and `stale`. The
+  briefing is cached by the worker; `stale` is evaluated at serve
+  time against the precompute TTL (`PULSE_PRECOMPUTE_TTL_S`, default
+  3600s), so a cached briefing served hours after it was computed
+  is honestly marked stale.
 - At boot the server warms the L1 + L2 caches by running the most
   popular queries through the same pipeline a cache miss uses, so a
   warmed answer is byte-identical to a freshly computed one. The
   warmed queries are the top `PULSE_POPULAR_WARM_N` (default 10) from
   the persisted popular list. Warming never fails the boot.
+
 
 ## Auto-tuning (Roadmap 6.10)
 
@@ -431,18 +245,11 @@ limits: `docs/WEBSEARCH.md`.
 - The precompute interval (`PULSE_PRECOMPUTE_TTL_S`) is NOT
   auto-tuned: there is no in-process signal for briefing freshness
   cost, so it stays manual-only.
-- `GET /v1/autotune` (public) reports enabled, the live knob values,
-  `adjustments_total`, and the last adjustment with its reason.
-  `POST /v1/admin/autotune/reset` (API-key auth) restores the
-  configured defaults and applies them to the live knobs; it returns
-  the list of values that actually changed. Restarting also restores
-  the defaults.
-- `/metrics` carries `pulse_autotune_adjustments_total`, gauges for
-  the live knob values, `pulse_fanout_total` /
-  `pulse_fanout_incomplete_total`, and `pulse_process_rss_bytes`
-  (process RSS from /proc/self/statm; 0 when unreported).
+- There is no endpoint for the tuner state: restarting restores the
+  configured defaults.
 
-## Circuit breakers and hot config reload (Roadmap 6.11)
+
+## Circuit breakers (Roadmap 6.11)
 
 - Two circuit breakers stop the server hammering a dead dependency;
   both fall back to the degraded path that already exists, so an open
@@ -463,21 +270,9 @@ limits: `docs/WEBSEARCH.md`.
   the query path skips L2 entirely and computes fresh (the path a
   miss already takes); a clean answer — hit or miss — counts as a
   breaker success, only a Redis error counts as a failure.
-- `/metrics` carries `pulse_breaker_redis_state` /
-  `pulse_breaker_embedding_state` (0 closed, 1 half-open, 2 open),
-  `pulse_breaker_*_trips_total`, and
-  `pulse_breaker_*_skipped_total`.
-- `POST /v1/admin/config` (API-key auth) hot-reloads SAFE settings
-  only: `l1_ttl_s` (60–900), `fanout_timeout_ms` (50–500),
-  `reindex_interval_s` (60–86400). All values must be integers;
-  unknown keys and out-of-range values are rejected with 400.
-  Secrets, auth, rate limits, and retention are never accepted here
-  — they need a restart. A manual `l1_ttl_s` / `fanout_timeout_ms`
-  becomes the tuner's new baseline (the next auto-tuning adjustment
-  moves from it); to hold a manual value, disable autotune
-  (`PULSE_AUTOTUNE=0`). The reindex interval is not tuned, so it
-  holds until the next restart. `POST /v1/admin/autotune/reset`
-  restores only the tuner's knobs, not the reindex interval.
+- There is no hot config reload: settings come from the environment
+  at startup. A manual `l1_ttl_s` / `fanout_timeout_ms` change needs
+  a restart; the tuner's adjustments are the only runtime knob moves.
 - Index maintenance: `pulse maintenance` now runs a bare `ANALYZE`
   (all tables) after retention, so the planner sees the
   post-deletion shape; a failed ANALYZE warns but never fails

@@ -117,12 +117,12 @@ Register Sando as a consumer so its quota is separate from other
 callers:
 
 ```
-PULSE_CONSUMERS=sando:query,admin:10000
+PULSE_CONSUMERS=sando:query:10000
 ```
 
-That gives the `sando` consumer the `query` and `admin` scopes and a
+That gives the `sando` consumer the `query` scope and a
 10,000-calls-per-day quota (0 = the global `PULSE_RATE_LIMIT_PER_DAY`
-instead). Usage is visible at `GET /v1/usage` (admin scope) and every
+instead). Per-consumer usage is tracked internally, and every
 call is written to the audit log (`audit_log` table / JSONL file).
 
 ## Testing the integration

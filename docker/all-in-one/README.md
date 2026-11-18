@@ -38,8 +38,7 @@ docker run -d --name pulse -p 9000:9000 \
 ```
 
 Without `PULSE_API_KEY` the API runs in open dev mode (no auth on
-`/v1/query` and `/v1/ingest`) — fine on your own machine, not on a
-public server.
+`/v1/query`) — fine on your own machine, not on a public server.
 
 ### If ports are already taken
 

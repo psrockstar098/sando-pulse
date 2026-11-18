@@ -27,8 +27,8 @@ https://sando-pulse.onrender.com.
 - To redeploy: push to `origin main` (CI publishes a new
   `all-in-one-0.1.0` image), then redeploy the Render service from
   the dashboard (Manual Deploy), which pulls the new image. Verify
-  after: `/v1/health` returns 200, `/v1/sources` lists the sources,
-  and a unified query returns local + web results.
+  after: `/v1/health` returns 200 with the document count, and a unified
+  query returns local + web results.
 - Backups on Render free: there is no persistent disk, so a dump
   written inside the container does not survive a restart. The
   stored articles are re-fetchable from the feeds (nothing is lost
@@ -118,30 +118,31 @@ backup instead.
    copy of `.env` in the operator's password manager).
 2. `docker compose up -d` (creates an empty database).
 3. Restore the latest backup with the procedure above.
-4. Verify: `/v1/health` returns `status: ok`, `/v1/sources` lists the
-   sources, and a known query returns `sufficient: true`.
+4. Verify: `/v1/health` returns `status: ok` with the document
+   count, and a known query returns `sufficient: true`.
 5. Re-run `pulse audit` and confirm no FAIL.
 
 ## Health monitoring
 
 - `/v1/health` — up/down + document count + sources enabled.
-- `/metrics` — Prometheus text: request counts by class, latency
-  total, query counts, cache hits/misses, ingest runs/errors,
-  documents indexed, fan-out outcomes, auto-tuning adjustments +
-  live knob values, process RSS, circuit-breaker state/trips/skipped.
+- Internal counters (request counts by class, latency, query counts,
+  cache hits/misses, ingest runs/errors, documents indexed, fan-out
+  outcomes, auto-tuning adjustments + live knob values, process RSS,
+  circuit-breaker state/trips/skipped) are kept in memory. There is
+  no `/metrics` endpoint — watch the server log and `pulse audit`.
 - Auto-tuning (Roadmap 6.10): off by default (`PULSE_AUTOTUNE=1`
   enables). It moves only safe knobs within bounds (L1 TTL,
   fan-out timeout, worker concurrency) and logs every adjustment.
-  Check `GET /v1/autotune`; restore the configured defaults with
-  `POST /v1/admin/autotune/reset` (API key) or a restart.
+  The tuner logs every adjustment; restore the configured defaults
+  with a restart.
 - Circuit breakers (Roadmap 6.11): watch `pulse_breaker_redis_state`
   / `pulse_breaker_embedding_state` (0 closed, 1 half-open, 2 open)
   and the `*_trips_total` / `*_skipped_total` counters. A breaker
   stuck open means the dependency is down, not the breaker — fix
   the dependency (Redis, or the external embedding provider); the
   breaker closes itself on the next successful trial call after the
-  cooldown. Hot-reload safe settings with `POST /v1/admin/config`
-  (API key): `l1_ttl_s`, `fanout_timeout_ms`, `reindex_interval_s`.
+  cooldown. There is no hot config reload: settings come from the
+  environment at startup.
 - Index maintenance (Roadmap 6.11): `pulse maintenance` runs a bare
   `ANALYZE` after retention; `pulse audit` reports an `indexes`
   check (index counts, never-scanned indexes, `documents` last
@@ -179,9 +180,9 @@ backup instead.
 | Symptom | Likely cause | First step |
 | ------- | ------------ | ---------- |
 | `/v1/health` 502 / connection refused | API container down | `docker compose ps`, `docker compose logs api` |
-| Queries return `sufficient: false` on known topics | Worker not ingesting / feeds down | `docker compose logs worker`; check `/v1/sources` counts |
+| Queries return `sufficient: false` on known topics | Worker not ingesting / feeds down | `docker compose logs worker`; check `/v1/health` document count |
 | `429 rate_limited` everywhere | Rate limit too low for traffic | Raise `PULSE_RATE_LIMIT_PER_*`, restart api |
-| `429 quota_exceeded` for one consumer | That consumer's daily quota spent | `GET /v1/usage` to confirm; raise its quota in `PULSE_CONSUMERS` |
+| `429 quota_exceeded` for one consumer | That consumer's daily quota spent | Check the audit log to confirm; raise its quota in `PULSE_CONSUMERS` |
 | Redis memory alert | Cache keys accumulating | Expected behaviour until TTL — maxmemory 256mb + allkeys-lru evicts; raise the limit if evictions hurt hit rate |
 | `pulse audit` FAIL on `api_key` | No key configured (open dev mode) | Set `PULSE_API_KEY`, restart |
 | `pulse audit` FAIL on `db_password` | `DATABASE_URL` still uses the example password `pulse` | Change `POSTGRES_PASSWORD` and `DATABASE_URL` |
@@ -231,7 +232,8 @@ SearXNG needs `SEARXNG_SECRET` from `.env`. Without the URL, the
 web leg of the unified `/v1/query` reports `unavailable` and `pulse
 websearch` refuses to run. There is no separate public websearch
 route: `GET /v1/websearch` was removed when the unified query
-landed (2026-11-17) — one query does the job.
+landed (2026-11-17), and the other `/v1/*` routes were removed
+2026-11-18 — one query does the job.
 
 ## Roadmap 7 operations
 

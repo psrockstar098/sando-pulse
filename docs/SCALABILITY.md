@@ -32,7 +32,7 @@ does depends on landing on the same instance twice.
 | L1 in-process cache (6.2) | Per API instance | Instance restarts / new instance | Cold L1: the first asks miss and compute fresh; the shared Redis L2 still serves them. Bounded by `PULSE_L1_MAX_ENTRIES` / `PULSE_L1_MAX_BYTES`. |
 | In-memory index (6.3/6.5) | Per API instance | Instance restarts / new instance | Rebuilt from the store at boot (`memindex built` log line; 0 ms at 3 docs — re-measure at real scale) and on Redis epoch changes. Until the build finishes, queries fall back to the store search. |
 | Popular list (6.4) | Per API instance, local `popular.json` | Instance restarts without the file / new instance | A new instance starts with an empty tracker and no warming until it has seen queries. The file is NOT shared between instances — if warming matters on a scaled-out deploy, put `PULSE_POPULAR_PATH` on a shared volume. |
-| Auto-tuner values (6.10) | Per API instance | Instance restarts | Each instance tunes its own knobs from its own traffic; reset is per instance (`POST /v1/admin/autotune/reset`) or a restart. There is no shared tuning state. |
+| Auto-tuner values (6.10) | Per API instance | Instance restarts | Each instance tunes its own knobs from its own traffic; reset is per instance (a restart). There is no shared tuning state. |
 
 Shared state (the contract — every instance reads/writes the same):
 Postgres (documents, knowledge, audit, usage counters), Redis (L2
@@ -72,7 +72,7 @@ justifies it.
 
 - **Redis cluster:** when the single instance's 256 MB maxmemory
   is the binding constraint — watch the eviction rate and the L2
-  hit rate in `/metrics`: sustained evictions with a falling L2
+  hit rate in the server log: sustained evictions with a falling L2
   hit ratio while the working set keeps growing means the cache no
   longer fits one node. First step is raising `maxmemory` on a
   bigger host, not clustering; cluster only when one host's memory

@@ -133,7 +133,7 @@ pub fn dayOf(alloc: std.mem.Allocator, ts: i64) ![]u8 {
 
 pub const UsageKind = enum { query, ingest };
 
-/// One row of the GET /v1/usage response (Roadmap 5.3): today's
+/// One row of per-consumer daily usage (Roadmap 5.3): today's
 /// counts for one consumer plus the quota it is measured against.
 /// `remaining` is quota minus (queries + ingests), floored at 0.
 pub const UsageRow = struct {

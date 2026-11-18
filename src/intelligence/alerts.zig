@@ -182,8 +182,7 @@ pub const breaking_window_s: i64 = 6 * 3600;
 /// Build the breaking-alert list from the knowledge store's events:
 /// filter to breaking (importance >= 0.5, seen in the last 6 hours,
 /// not retracted), fetch each event's docs, merge by kind + title
-/// similarity. Used by GET /v1/alerts and by refreshBriefing
-/// publishing. Returns an empty list when the store has no breaking
+/// similarity. Used by refreshBriefing publishing. Returns an empty list when the store has no breaking
 /// events — an empty alert feed is a real answer, not an error.
 pub fn computeBreakingAlerts(
     alloc: std.mem.Allocator,

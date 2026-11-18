@@ -106,7 +106,7 @@ the dev alternative to the bundled SearXNG (`docs/WEBSEARCH.md`).
 |---|---|---|
 | `PULSE_HOST` | `0.0.0.0` | API listen address |
 | `PULSE_PORT` | `9000` | API listen port |
-| `PULSE_API_KEY` | — (open dev mode + boot warning) | Bearer API key for `/v1/query` and `/v1/ingest` |
+| `PULSE_API_KEY` | — (open dev mode + boot warning) | Bearer API key for `/v1/query` |
 | `DATABASE_URL` | — (memory store) | `postgres://user:pass@host:port/db`; enables PostgresStore |
 | `REDIS_URL` | — (no event bus) | `redis://host:port`; enables the Redis Streams event bus |
 | `MINIO_ENDPOINT` / `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` / `MINIO_BUCKET` | `pulse-raw` bucket | S3-compatible raw store (MinIO) |
@@ -118,7 +118,7 @@ the dev alternative to the bundled SearXNG (`docs/WEBSEARCH.md`).
 | `SEARXNG_SECRET` | generated per boot (all-in-one) | SearXNG secret key (`server.secret_key`); set it yourself with the `websearch` compose profile |
 | `PULSE_RATE_LIMIT_PER_MINUTE` / `PULSE_RATE_LIMIT_PER_DAY` | `100` / `10000` | Per-key rate limits |
 | `PULSE_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
-| `PULSE_POPULAR_MAX_TRACKED` | `1000` | Distinct queries tracked for `GET /v1/popular` (Roadmap 6.4) |
+| `PULSE_POPULAR_MAX_TRACKED` | `1000` | Distinct queries tracked internally for cache warming (Roadmap 6.4) |
 | `PULSE_POPULAR_PATH` | `popular.json` | Where the popular list is persisted (Roadmap 6.4) |
 | `PULSE_POPULAR_SAVE_EVERY` | `100` | Persist the popular list every N records (Roadmap 6.4) |
 | `PULSE_POPULAR_WARM_N` | `10` | Top popular queries warmed into L1/L2 at boot (Roadmap 6.4) |
@@ -130,47 +130,14 @@ the dev alternative to the bundled SearXNG (`docs/WEBSEARCH.md`).
 
 ## API
 
+Three routes. Nothing else.
+
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | GET | `/v1/health` | no | `{"status":"ok","version","documents","sources_enabled","store"}` |
-| GET | `/v1/sources` | no | All 12 sources with enabled flags and disabled reasons |
-| GET | `/v1/sources/profiles` | no | Source profiles (Trust & Intelligence Engine, Phase 1): identity, location, coverage, activity, reliability, status; `?id=`, `?county=`, `?status=` |
-| GET | `/v1/counties` | no | All 15 counties with source counts; every county except Montserrado is honestly zero until county sources are registered |
-| GET | `/v1/monitor` | no | Live account monitoring (Trust & Intelligence Engine, Phase 2): per-source last check / success / new item, freshness, change detection; `?source=`, `?channel=` |
-| GET | `/v1/evidence` | no | Claim evidence assessment (Trust & Intelligence Engine, Phase 3): `?event=<id>` assesses the event's own claim, `?claim=<text>` searches the store for the claim; status is an assessment, never a verdict |
-| GET | `/v1/claims` | no | Claims extracted from one event's documents (Trust & Intelligence Engine, Phase 3): `?event=<id>` |
-| GET | `/v1/sources/scores` | no | Credibility scores for all 12 sources, 30-day window (Trust & Intelligence Engine, Phase 4): weighted total, rating 1–5 (null when provisional), 7 components with basis |
-| GET | `/v1/rankings` | no | Per-county source ranking, top 20 of up to 50 registered candidates (Trust & Intelligence Engine, Phase 4): `?county=` required |
-| GET | `/v1/history` | no | Historical event search (Trust & Intelligence Engine, Phase 5): `?query=`, `?year=`, `?county=`; monthly timeline + recurring (topic, county) groups |
-| GET | `/v1/history/similar` | no | Events similar to one event (Trust & Intelligence Engine, Phase 5): `?event=<id>` |
-| POST | `/v1/actions` | no | Run a plain-words action, returns a finished job (Trust & Intelligence Engine, Phase 6): body `{"request": "..."}` |
-| GET | `/v1/actions/jobs` | no | Poll an action job (Trust & Intelligence Engine, Phase 6): `?id=job-<n>` |
-| GET | `/v1/actions/watches` | no | Standing watches (Trust & Intelligence Engine, Phase 6) |
-| POST | `/v1/decisions` | no | Decision Core assessment with full reasoning (Trust & Intelligence Engine, Phase 7): body `{"claim": "..."}` |
-| GET | `/v1/graph` | no | Knowledge-graph subgraphs (Trust & Intelligence Engine, Phase 7): `?event=<id>` or `?entity=<name>&kind=` |
-| GET | `/v1/predictions` | no | Per-topic predictions (Trust & Intelligence Engine, Phase 8): `?topic=` (one topic, or all 7 known topics) and `?county=`; monthly trend + linear forecast + monthly anomalies, with a disclaimer that a prediction is a statistical extrapolation, never a fact |
-| GET | `/v1/anomalies` | no | Daily + monthly anomalies (Trust & Intelligence Engine, Phase 8): `?topic=`; daily is the last 30 days, |z| >= 2; monthly reuses the R7.1 rule |
-| GET | `/v1/risk` | no | Per-county risk assessment (Trust & Intelligence Engine, Phase 8): `?county=` (required) and `?topic=`; low / elevated / high from anomalies + rising trends + contradiction density + breaking-alert frequency, with plain-words reasons — an assessment of conditions, never a prediction of a specific event |
-| GET | `/v1/trends` | no | Geez + geo trends; carries `computed_at` + `stale` (Roadmap 6.4) |
-| GET | `/v1/briefing` | no | Precomputed briefing; carries `cached` + `stale` (Roadmap 6.4) |
-| GET | `/v1/popular` | no | Most-asked queries with counts (Roadmap 6.4) |
-| GET | `/v1/forecast` | no | Next-month topic predictions with confidence + basis (Roadmap 7.1) |
-| GET | `/v1/alerts` | no | Breaking alerts, typed incidents, Redis stream status (Roadmap 7.3) |
-| GET | `/v1/events` | no | Latest clustered events, or one event's detail (`?id=`) with documents, corroboration, conflicts and contradiction flags |
-| GET | `/v1/locations` | no | Seeded Liberian locations with coordinates and provenance |
-| GET | `/v1/statistics` | no | Seeded Liberian statistics with provenance |
-| GET | `/v1/quality` | no | Intelligence quality report: coverage, freshness, conflict metrics |
-| GET | `/v1/usage` | Bearer key | Per-consumer daily usage and quotas (admin scope); `?consumer=` |
-| GET | `/v1/connectors/facebook` | no | Facebook connector status — honestly unavailable until a Page token is configured |
+| POST | `/v1/query` | Bearer <redacted> | `{"query": "..."}` → cited answer or insufficient-evidence; the ONE search surface — it fans out in parallel to the local index + web (SearXNG, bundled in the all-in-one image) + Facebook/social when configured, deduplicates by URL, and each result carries `kind` (`local` / `social`) with a top-level `unified` object citing each leg's status (docs/WEBSEARCH.md). The debug path is the `pulse websearch` CLI. |
 | GET | `/v1/webhooks/facebook` | no | Meta subscription handshake (verify token, not API key) |
 | POST | `/v1/webhooks/facebook` | no | Facebook webhook receiver (HMAC signature is the auth) |
-| GET | `/v1/social` | no | Social ingestion status — honestly empty until a connector is authorized (Roadmap 7.7); when `PULSE_FACEBOOK_ACCESS_TOKEN` is set, the worker's collected posts also surface in the unified query with `kind: "social"` |
-| GET | `/v1/autotune` | no | Auto-tuning state: enabled, live knob values, adjustments, last adjustment (Roadmap 6.10) |
-| POST | `/v1/admin/autotune/reset` | Bearer <redacted> | Restore the configured tuning defaults (Roadmap 6.10) |
-| POST | `/v1/admin/config` | Bearer <redacted> | Hot-reload safe settings: `l1_ttl_s`, `fanout_timeout_ms`, `reindex_interval_s` (Roadmap 6.11) |
-| GET | `/metrics` | no | Prometheus text metrics |
-| POST | `/v1/query` | Bearer key | `{"query": "..."}` → cited answer or insufficient-evidence; the ONE public search surface — it fans out in parallel to the local index + web (SearXNG, bundled in the all-in-one image) + Facebook/social when configured, deduplicates by URL (local first, then web), and each result carries `kind` (`local` / `social`) with a top-level `unified` object citing each leg's status (docs/WEBSEARCH.md). `GET /v1/websearch` was removed 2026-11-17; the debug path is the `pulse websearch` CLI. |
-| POST | `/v1/ingest` | Bearer key | Manual document ingest `{"title","url","source_id","text"}` |
 
 Every response carries a `request_id` (`req-{hex nanos}`). Rate limits:
 100/min + 10,000/day per key (429 when exceeded). Auth failures are 401
@@ -297,37 +264,17 @@ for concurrency, the threaded accept loop recorded as a gap in
 
 ## New in Roadmap 7
 
-- **Predictive trends** (`GET /v1/forecast`, also a section in `/v1/trends`): next-month topic predictions by least-squares linear extrapolation over monthly aggregates, each with `confidence` and a plain-words `basis`. Anomalies are z-score flags (|z| ≥ 2). Every prediction is labelled a statistical extrapolation, not a fact; topics with under 2 months of history are listed under `insufficient_history`, never predicted.
 - **Stat answers** (`POST /v1/query` with a "how many …" or "population of …" question): answered from the seeded knowledge store only — facility counts and census populations with source + verification date. A question about a place or facility Pulse doesn't know returns `sufficient: false` with an honest reason, never a guessed number.
-- **Breaking alerts** (`GET /v1/alerts`, `pulse alerts`): typed incidents (accident, protest, road closure, emergency, announcement, community event, unknown), merged by kind + title similarity, every source cited. Published to the `pulse:alerts` Redis stream (consumer group `sando`) for Sando to subscribe to; the endpoint computes live either way.
-- **Report variants** (`GET /v1/briefing?scope=weekly&kind=political&county=Lofa`, `pulse briefing --scope weekly --kind political --county Lofa`): weekly scope, political/economic kinds, and county filters (a Monrovia story counts for Montserrado — cities resolve to their county). Variants are computed live, never cached; unknown scope/kind/county is a 400. The briefing carries a `social_note` that is honestly empty until an authorized social source connects.
-- **Contradiction flags** (`GET /v1/events?id=<id>`): every pair of reports in one event whose titles disagree (similarity < 0.30) is flagged with both sources cited and the warning "titles disagree: the reports may describe different facts — check both sources". A flag is a warning for a human to check, never a verdict about which report is right.
-- **Knowledge coverage** (`pulse seed`, 166 locations / 47 facilities / 5 statistics): Grand Kru's 2008 district populations filled from the Wikipedia Grand Kru County district table (18 of 19; Penicess has no published 2008 population and stays null), plus the Lott Carey School Clinic from OpenStreetMap Nominatim. Still missing — recorded, never invented: Starz University, United Methodist University, F. J. Grant Hospital, Rally Time Market, 4 schools, 7 highways, 4 media orgs, 2 ministries.
-- **Social ingestion — gated** (`GET /v1/social`, `social` section in `/v1/trends`): the registry is fed only by authorized connector data. The Facebook connector is built (Graph API + webhooks, authorized pages only, never scraped or faked) and activates when `PULSE_FACEBOOK_ACCESS_TOKEN` is set — a Page token from a long-lived user token via `GET /me/accounts`. Until then the endpoint reports `social_available: false` with every connector's unavailable reason, and the unified query's `facebook` leg reports `not_configured`. No scrapers, no faked posts.
-- **Semantic search — blocked**: the external embedding provider exists but has no API key and is never called live. Deep queries use the lexical local embedding and say so. Real semantic search needs Dominic's API-key step.
+- **Breaking alerts** (`pulse alerts`): typed incidents (accident, protest, road closure, emergency, announcement, community event, unknown), merged by kind + title similarity, every source cited. Published to the `pulse:alerts` Redis stream (consumer group `sando`) for Sando to subscribe to.
+- **Report variants** (`pulse briefing --scope weekly --kind political --county Lofa`): weekly scope, political/economic kinds, and county filters (a Monrovia story counts for Montserrado — cities resolve to their county). Variants are computed live, never cached; unknown scope/kind/county is a 400. The briefing carries a `social_note` that is honestly empty until an authorized social source connects.
+- **Knowledge coverage** (`pulse seed`, 166 locations / 47 facilities / 5 statistics): Grand Kru's 2008 district populations filled from the Wikipedia Grand Kru County page (see seed/liberia.zig).
+- **Social ingestion — gated**: the registry is fed only by authorized connector data. The Facebook connector is built (Graph API + webhooks, authorized pages only, never scraped or faked) and activates when `PULSE_FACEBOOK_ACCESS_TOKEN` is set — a Page token from a long-lived user token via `GET /me/accounts`. Until then the unified query's `facebook` leg reports `not_configured`. No scrapers, no faked posts.
+- **Semantic search — blocked**: the external embedding provider exists but has no API key and is never called live. Deep queries use the lexical local embedder.
 
-## Trust & Intelligence Engine — Phase 1
+## Trust & Intelligence Engine — removed
 
-Source profiles + county categorization (spec: `~/workspace/sando-pulse-trust-intelligence-engine.md`, Phase 1 only — no ranking/scoring, monitoring, verification, or Decision Core):
+The Trust Engine's route surface (source profiles, monitor, evidence, scores, rankings, history, actions, decision core, predictions, anomalies, risk) was removed on 2026-11-18 when the API was cut to three routes. The code is gone; the history is in git. What remains: the 12-source registry, per-source health tracking (migration 014, `source_health.last_new_at`, stamped by the worker), and the seeded county/location data. Credibility scoring and claim assessment no longer exist — `/v1/query` answers from evidence only, and says `sufficient: false` when it has none.
 
-- **Profiles** (`GET /v1/sources/profiles`, `?id=`, `?county=`, `?status=`): the 12 real registry sources, each with identity (account name, platform, URLs), location (base county, district/community null), coverage (`general` — topic profiling from ingested articles is a later phase), activity (`documents_total` live from the store; posting frequency / last update null until the worker tracks per-source freshness), reliability (the registry's design-doc grade 0.70 — **not** a credibility score; the 1–5 score is Phase 4), evidence (documents indexed), performance (null — not measured until Phase 4), status (`active` 9 / `removed` 3). One profile's history (`profile_created` at boot) rides on the `?id=` detail view.
-- **County categorization** (`GET /v1/counties`): all 15 counties with capitals and source counts. `county` is the outlet's **base** county (headquarters), not its coverage: all 12 are national outlets based in Monrovia, Montserrado, so Montserrado holds 12 and the other 14 counties honestly report zero until Phase 2 registers genuine county sources. Never invented to fill a county.
-- **Storage**: migration 013 (`source_profiles` + `source_profile_history`, 12 profiles + 12 `profile_created` rows seeded, re-runs are no-ops).
-- **Honest gaps**: Local Voices Liberia's base county is **unverified** (not stated on its site) — recorded as Montserrado with `county_confidence: "unverified"`; KMTV's Monrovia base was verified live from its own structured data (Camp Johnson Road, Monrovia, Montserrado). `reliability` renders as `0.699999988079071` in JSON — the f32 0.70 approximation, same as the existing `/v1/sources` field.
-
-## Trust & Intelligence Engine — Phase 2
-
-Live account monitoring (spec: `~/workspace/sando-pulse-trust-intelligence-engine.md`, Phase 2 — "live account-monitoring system", spec section 4, mapped onto the existing worker + Facebook connector instead of a parallel system):
-
-- **Monitor** (`GET /v1/monitor`, `?source=`, `?channel=rss|facebook`): one status per registry source — last check, last success, last new item (`last_new_at`, migration 014; moves only when a run inserts a document, never on a fetch that returns nothing new), consecutive failures, documents total, last error, newest document (title + URL + fetch time), and `freshness` (`fresh` = last success within twice the ingest interval, `stale` = older, `unknown` = never succeeded). Change detection is labelled per channel: RSS is `new_items_only` (a feed cannot report edits or deletions); Facebook is `webhook_events` (Meta webhooks + poll reconciliation); disabled sources are `none`. The response also carries the Facebook connector state (available/reason, registered pages, pending pages, polls, pending webhook notifications) — honestly unavailable until a token + pages are configured.
-- **Evidence** (`GET /v1/evidence?event=<id>` or `?claim=<text>`, `GET /v1/claims?event=<id>` — Phase 3): claim extraction (title + lead sentence, copied from the document, never generated) and an evidence assessment per claim — `verified` (4+ independent sources agree, no flags), `corroborated` (2–3 sources), `partially_confirmed` (publisher corrected part of the story), `unconfirmed` (one source or none), `disputed` (contradiction flags among the supporting documents, or the publisher retracted the report), `outdated` (a newer report on the same topic exists and this one is over 30 days old). Each record cites its supporting documents and flags with a plain-words explanation and a documented confidence formula — and there is deliberately NO `false` status: calling a claim false is a verdict, and Pulse never issues verdicts (see STATUS.md).
-- **Scores + rankings** (`GET /v1/sources/scores`, `GET /v1/rankings?county=` — Phase 4): credibility scores computed on demand from the last 30 days of documents + events. Weights: accuracy 30%, corroboration 20%, evidence 15%, original reporting 10%, timeliness 10%, corrections 10%, local knowledge 5%. Rating 1–5 from the weighted total; a source with fewer than 5 documents in the window is provisional (rating null, reason stated). Score changes are written to the registry history log (`score_changed`), so a source can see why its score moved. Rankings cover registered sources only, top 20 per county — a county with no registered sources ranks nothing, honestly.
-- **History** (`GET /v1/history?query=&year=&county=`, `GET /v1/history/similar?event=<id>` — Phase 5): historical search over the persisted events (the R7.5 event grouping, read back). An event counts for a county when at least one of its documents mentions it. The response also carries a monthly timeline of the matches and the recurring (topic, county) groups — a story that shows up in two or more distinct months. Similar events match by title similarity (>= 0.5) or the same topic in a shared county. Never grouped by person name alone (entity resolution is Phase 7).
-- **Action Engine** (`POST /v1/actions`, `GET /v1/actions/jobs?id=`, `GET /v1/actions/watches` — Phase 6): plain-words requests become typed actions — latest from a source, verify a claim, monitor an account, what is happening, system status, a person's history, watch a story. Actions run synchronously and the job is already done when the POST returns; polling re-fetches the finished result (REST only — no WebSocket, no SSE). An unrecognized request is never guessed: the job completes with a plain-words message and examples of what works. Watches are recorded, not pushed — there is no push channel, so they are listed on `/v1/actions/watches` and on `/v1/alerts` for the client to re-check.
-- **Decision Core + knowledge graph** (`POST /v1/decisions`, `GET /v1/graph?event=&entity=` — Phase 7): a rule-based claim assessment (supporting documents, distinct sources, contradiction flags, official-source presence, recency, volume) that returns its FULL REASONING — every rule, what it saw, what it concluded — as the audit trail (the call is also recorded in the audit log). The status is an assessment, never a verdict. The graph links entities, events, sources and claims (mentions, reported_by, same_event, corroborates, contradicts); same-name persons in different counties are separate nodes.
-- **Predictive intelligence** (`GET /v1/predictions?topic=&county=`, `GET /v1/anomalies?topic=`, `GET /v1/risk?county=` — Phase 8): per-topic monthly trend (least-squares slope → rising / falling / flat) with the R7.1 linear forecast (next month's predicted volume + confidence + basis), monthly anomalies (the R7.1 |z| >= 2 rule, 4+ months) and NEW daily anomalies (last 30 days bucketed by day, same |z| >= 2 rule, all 30 days counted including zero-volume days, nothing flagged on a near-empty store). Risk is a per-county assessment — low / elevated / high — from four signals (anomalies 35%, rising trends 25%, contradiction density 20%, breaking-alert frequency 20%) with a plain-words reason for every signal that contributed. Every prediction carries the disclaimer that it is a statistical extrapolation from past volume, never a fact about the future; risk is an assessment of conditions, never a prediction of a specific event.
-- **Storage**: migration 014 (`source_health.last_new_at`); the pipeline's `recordHealth` stamps it on inserting runs and preserves it otherwise.
-- **Honest gaps**: county-source discovery was described in Phase 1 docs as "Phase 2" — it is not: Phase 2 monitors the 12 registered sources; no new county sources are registered here, and none are invented. Registration of county bloggers/pages is still an open step (Phase 4 ranks whatever is registered). `last_new_at` is null for every source until a worker run inserts a document after migration 014.
 
 ## Sources (12 Liberian outlets)
 

@@ -1,5 +1,5 @@
-//! Prometheus metrics (Roadmap 1.5): counters rendered as exposition text
-//! on GET /metrics. Single-threaded in Phase 1; no internal locking.
+//! Prometheus-style counters, kept in memory. No /metrics route —
+//! the server reports health and results only.
 
 const std = @import("std");
 

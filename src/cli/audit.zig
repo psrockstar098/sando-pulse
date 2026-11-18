@@ -31,7 +31,7 @@ fn check(id: []const u8, status: Status, detail: []const u8) Check {
 pub fn checkApiKey(cfg: config.Config) Check {
     if (cfg.api_key != null) return check("api_key", .pass, "PULSE_API_KEY is set");
     if (cfg.api_key_previous != null) return check("api_key", .warn, "only PULSE_API_KEY_PREVIOUS is set — finish the rotation (set PULSE_API_KEY)");
-    return check("api_key", .fail, "no API key configured — /v1/query and /v1/ingest are open");
+    return check("api_key", .fail, "no API key configured — /v1/query is open");
 }
 
 /// Rotation state sane? Same value in both slots means the rotation

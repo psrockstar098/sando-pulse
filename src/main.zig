@@ -45,9 +45,6 @@ const metrics = @import("api/metrics.zig");
 const server = @import("api/server.zig");
 const l1cache = @import("api/l1cache.zig");
 const popular = @import("api/popular.zig");
-const social = @import("intelligence/social.zig");
-const trust_registry = @import("intelligence/trust/source_registry.zig");
-const job_manager = @import("intelligence/actions/job_manager.zig");
 const cache = @import("api/cache.zig");
 const memindex = @import("engine/memindex.zig");
 const autotune = @import("engine/autotune.zig");
@@ -207,7 +204,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (cfg.api_key == null and cfg.api_key_previous == null) {
-        logging.warn("PULSE_API_KEY is not set: API runs in open dev mode (no auth on /v1/query and /v1/ingest)", &.{});
+        logging.warn("PULSE_API_KEY is not set: API runs in open dev mode (no auth on /v1/query)", &.{});
     }
     if (cfg.api_key_previous != null) {
         logging.info("API key rotation active: previous key still accepted (remove PULSE_API_KEY_PREVIOUS once clients migrate)", &.{});
@@ -309,15 +306,13 @@ pub fn main(init: std.process.Init) !void {
     // sites (query search + ingest) already fall back to lexical on
     // embed failure. The local provider is never wrapped — it cannot
     // fail and does no I/O. The breaker lives in the process arena
-    // (never deinited); the server keeps the pointer for /metrics.
-    var embed_breaker: ?*breaker.CircuitBreaker = null;
+    // (never deinited).
     if (embedder != null and std.mem.eql(u8, cfg.embedding_provider, "external")) {
         const eb = try alloc.create(breaker.CircuitBreaker);
         eb.* = breaker.CircuitBreaker.init(cfg.embed_breaker_failures, cfg.embed_breaker_cooldown_s * 1000);
         const wrapped = try alloc.create(breaker.BreakerEmbedding);
         wrapped.* = .{ .inner = embedder.?, .breaker = eb, .io = io };
         embedder = wrapped.provider();
-        embed_breaker = eb;
     }
 
     // --- facebook connector (Roadmap 3.2) ---
@@ -589,22 +584,6 @@ pub fn main(init: std.process.Init) !void {
         });
     }
 
-    // Social registry (Roadmap 7.7, GATED): fed only by authorized
-    // connector collection jobs. Empty until a social connector is
-    // authorized — the endpoints report that honestly.
-    var social_registry = social.SocialRegistry.init(alloc);
-    defer social_registry.deinit();
-
-    // Trust & Intelligence Engine, Phase 1: source profiles + county
-    // categorization. Static (the 12 real sources); the history log
-    // is seeded with one profile_created entry per source at boot.
-    var trust_reg = try trust_registry.Registry.init(alloc, timex.nowSeconds(io));
-    defer trust_reg.deinit();
-
-    // Trust & Intelligence Engine, Phase 6: in-memory job + watch
-    // store for the Action Engine (bounded, forgotten on restart).
-    var actions_store = job_manager.JobStore.init(alloc);
-
     var srv = server.Server{
         .alloc = alloc,
         .io = io,
@@ -613,12 +592,8 @@ pub fn main(init: std.process.Init) !void {
         .store_name = store_name,
         .metrics = &m,
         .limiter = &limiter,
-        .sink = sink,
         .embedder = embedder,
         .knowledge = ks,
-        .social = &social_registry,
-        .trust_registry = &trust_reg,
-        .actions = &actions_store,
         .environ = init.environ_map,
         .facebook = &fb_connector,
         .redis = redis_client,
@@ -632,7 +607,6 @@ pub fn main(init: std.process.Init) !void {
         .autotuner = autotune.Autotuner.init(cfg.autotune_enabled, cfg.l1_ttl_s, cfg.fanout_timeout_ms, cfg.max_concurrent_sources),
         .fanout_timeout_ms = cfg.fanout_timeout_ms,
         .redis_breaker = breaker.CircuitBreaker.init(cfg.redis_breaker_failures, cfg.redis_breaker_cooldown_s * 1000),
-        .embed_breaker = embed_breaker,
         .reindex_interval_s = cfg.reindex_interval_s,
         .req_arena = std.heap.ArenaAllocator.init(alloc),
     };

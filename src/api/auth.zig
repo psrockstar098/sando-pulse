@@ -1,9 +1,9 @@
 //! API-key authentication middleware (Roadmap 1.2).
 //! - If no API key is configured, the API runs in open dev mode and every
 //!   request is allowed (a warning is logged at boot; see main.zig).
-//! - If a key is configured, /v1/query and /v1/ingest require
+//! - If a key is configured, /v1/query requires
 //!   `Authorization: Bearer <key>`. Comparison is constant-time.
-//! - /v1/health, /v1/sources, and /metrics are public by design.
+//! - /v1/health and the Facebook webhook are public by design.
 //! Keys are managed via env var PULSE_API_KEY; `pulse keygen` prints a fresh
 //! random key for the operator to put in the environment. Raw keys are never
 //! written to any file and never logged.

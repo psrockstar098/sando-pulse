@@ -290,12 +290,29 @@ fn escapeLikeValue(alloc: Allocator, s: []const u8) ![]u8 {
 /// (to_timestamp($1), LIMIT $1, ST_MakePoint($1, $2)).
 const ParamBuilder = struct {
     params: std.ArrayList(?[]const u8) = .empty,
+    /// Strings this builder allocated (int/float formats, LIKE
+    /// patterns, owned literals). Freed by deinit, after the query
+    /// is sent — never before, the params list holds slices of them.
+    owned: std.ArrayList([]const u8) = .empty,
+
+    fn deinit(self: *ParamBuilder, alloc: Allocator) void {
+        for (self.owned.items) |s| alloc.free(s);
+        self.owned.deinit(alloc);
+        self.params.deinit(alloc);
+    }
 
     fn param(self: *ParamBuilder, sql: *std.ArrayList(u8), alloc: Allocator, value: []const u8) !void {
         try self.params.append(alloc, value);
         var nb: [16]u8 = undefined;
         const s = try std.fmt.bufPrint(&nb, "${d}", .{self.params.items.len});
         try sql.appendSlice(alloc, s);
+    }
+
+    /// Like param, but the builder owns the value and frees it in
+    /// deinit. Use for strings allocated just for this query.
+    fn paramOwned(self: *ParamBuilder, sql: *std.ArrayList(u8), alloc: Allocator, value: []const u8) !void {
+        try self.owned.append(alloc, value);
+        try self.param(sql, alloc, value);
     }
 
     fn nullParam(self: *ParamBuilder, sql: *std.ArrayList(u8), alloc: Allocator) !void {
@@ -306,20 +323,20 @@ const ParamBuilder = struct {
     }
 
     fn likeParam(self: *ParamBuilder, sql: *std.ArrayList(u8), alloc: Allocator, value: []const u8) !void {
-        // The pattern string is NOT freed here: the params list holds
-        // a slice of it until queryParams sends it. It lives in the
-        // caller's arena, freed as a whole when the query completes.
         const pat = try escapeLikeValue(alloc, value);
+        try self.owned.append(alloc, pat);
         try self.param(sql, alloc, pat);
     }
 
     fn intParam(self: *ParamBuilder, sql: *std.ArrayList(u8), alloc: Allocator, value: i64) !void {
         const s = try std.fmt.allocPrint(alloc, "{d}", .{value});
+        try self.owned.append(alloc, s);
         try self.param(sql, alloc, s);
     }
 
     fn floatParam(self: *ParamBuilder, sql: *std.ArrayList(u8), alloc: Allocator, value: f64) !void {
         const s = try std.fmt.allocPrint(alloc, "{d}", .{value});
+        try self.owned.append(alloc, s);
         try self.param(sql, alloc, s);
     }
 };
@@ -1650,7 +1667,7 @@ pub const PostgresStore = struct {
         // a $N parameter — NULLs are null params, never the string
         // "NULL", and no value is ever interpolated into the SQL.
         var pb = ParamBuilder{};
-        defer pb.params.deinit(a);
+        defer pb.deinit(a);
         // The source row must exist for the FK; the feed URL is unknown here,
         // so the source home URL stands in for it.
         var src_sql: std.ArrayList(u8) = .empty;
@@ -1701,7 +1718,7 @@ pub const PostgresStore = struct {
         try pb.floatParam(&doc_sql, a, doc.reliability);
         try doc_sql.appendSlice(a, ", ");
         const topics_lit = try formatTextArrayLiteral(a, doc.topics);
-        try pb.param(&doc_sql, a, topics_lit);
+        try pb.paramOwned(&doc_sql, a, topics_lit);
         try doc_sql.appendSlice(a, "::text[], ");
         try pb.param(&doc_sql, a, doc.content_hash);
         try doc_sql.appendSlice(a, ", ");
@@ -1733,7 +1750,7 @@ pub const PostgresStore = struct {
         try doc_sql.appendSlice(a, "), 4326)::geography, ");
         if (doc.embedding) |vec| {
             const lit = try formatVectorText(a, vec);
-            try pb.param(&doc_sql, a, lit);
+            try pb.paramOwned(&doc_sql, a, lit);
             try doc_sql.appendSlice(a, "::vector, ");
         } else {
             try pb.nullParam(&doc_sql, a);
@@ -1784,7 +1801,7 @@ pub const PostgresStore = struct {
         // The param strings live in the caller's arena until the
         // query is sent.
         var pb = ParamBuilder{};
-        defer pb.params.deinit(alloc);
+        defer pb.deinit(alloc);
         if (q.terms.len > 0 or q.query_embedding != null) {
             // FTS over the joined terms, OR per-term ILIKE fallback, OR
             // trigram similarity when fuzzy, OR pgvector closeness when a
@@ -1793,13 +1810,11 @@ pub const PostgresStore = struct {
             var first = true;
             if (q.terms.len > 0) {
                 const joined = try std.mem.join(alloc, " ", q.terms);
-                // NOT freed here: pb.params holds a slice of it until
-                // queryParams sends it below. (A `defer alloc.free`
-                // here was the 6.8 use-after-free: the allocator
-                // refills freed memory with 0xaa and the server
-                // rejected the param as invalid UTF-8.)
+                // Owned by the builder: freed by pb.deinit after the
+                // query is sent, not here (the params list holds a
+                // slice until queryParams sends it).
                 try where.appendSlice(alloc, "d.search_vector @@ websearch_to_tsquery('english', ");
-                try pb.param(&where, alloc, joined);
+                try pb.paramOwned(&where, alloc, joined);
                 try where.appendSlice(alloc, ")");
                 first = false;
                 for (q.terms) |term| {
@@ -1826,10 +1841,9 @@ pub const PostgresStore = struct {
             if (q.query_embedding) |vec| {
                 if (!first) try where.appendSlice(alloc, " OR ");
                 const lit = try formatVectorText(alloc, vec);
-                // NOT freed here: same reason as `joined` above —
-                // pb.params holds a slice until queryParams sends it.
+                // Owned by the builder, freed by pb.deinit after send.
                 try where.appendSlice(alloc, "d.embedding <=> ");
-                try pb.param(&where, alloc, lit);
+                try pb.paramOwned(&where, alloc, lit);
                 try where.appendSlice(alloc, "::vector < 0.6");
             }
             try where.appendSlice(alloc, ")");
@@ -1975,7 +1989,7 @@ pub const PostgresStore = struct {
             \\FROM documents d JOIN sources s ON s.id = d.source_id
         );
         var pb = ParamBuilder{};
-        defer pb.params.deinit(alloc);
+        defer pb.deinit(alloc);
         if (before_ts) |cut| {
             try sql.appendSlice(alloc, " WHERE d.fetched_at <= to_timestamp(");
             try pb.intParam(&sql, alloc, cut);
@@ -2011,7 +2025,7 @@ pub const PostgresStore = struct {
             \\ WHERE d.id =
         );
         var pb = ParamBuilder{};
-        defer pb.params.deinit(alloc);
+        defer pb.deinit(alloc);
         try pb.param(&sql, alloc, id);
         var res = try client.queryParams(alloc, sql.items, pb.params.items);
         defer res.deinit(alloc);
@@ -2032,7 +2046,7 @@ pub const PostgresStore = struct {
         // Parameterised IN-list (Roadmap 6.8): one $N per id, the same
         // params list bound to both statements.
         var pb = ParamBuilder{};
-        defer pb.params.deinit(a);
+        defer pb.deinit(a);
         var list: std.ArrayList(u8) = .empty;
         defer list.deinit(a);
         for (ids, 0..) |id, i| {
@@ -3125,7 +3139,14 @@ test "postgres: live TLS require fails on a plaintext server" {
     const url = try std.fmt.allocPrint(alloc, "{s}?sslmode=require", .{base});
     defer alloc.free(url);
 
-    try testing.expectError(error.TlsNotAvailable, PgClient.connect(alloc, io, url));
+    // The negative case only exists on a plaintext server. A server
+    // with TLS on answers the upgrade, so there is nothing to fail.
+    var client = PgClient.connect(alloc, io, url) catch |e| {
+        try testing.expectEqual(error.TlsNotAvailable, e);
+        return;
+    };
+    client.close();
+    std.debug.print("skip: test server supports TLS, no plaintext failure to prove\n", .{});
 }
 
 test "postgres: live TLS verify-ca fails without a trusted CA" {

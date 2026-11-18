@@ -14,8 +14,8 @@ it) up to that point.
   CPUs and ~500 MB free RAM, so it cannot prove 5 ms hot paths or
   10K concurrency — the numbers here are what this machine measured,
   nothing more.
-- RSS is read from `/proc/self/statm` (`pulse_process_rss_bytes` in
-  `/metrics`); CPU is measured as process CPU time per 1k queries
+- RSS is read from `/proc/self/statm` (kept as an in-memory counter);
+  CPU is measured as process CPU time per 1k queries
   from the same source. Baselines are recorded before an optimization
   and after it; an optimization that does not move a measured number
   is recorded as no win, not claimed as one.
@@ -137,11 +137,9 @@ threaded accept loop is the follow-up, not part of Roadmap 6.
 
 ### Auto-tuning knobs + bounds (Roadmap 6.10)
 
-`GET /v1/autotune` reports the live values; the tuner moves at
-most one knob per 100 queries, only from measured signals, and
-logs every adjustment. `POST /v1/admin/autotune/reset` restores
-the configured defaults. A manual set via
-`POST /v1/admin/config` becomes the tuner's new baseline.
+The tuner moves at most one knob per 100 queries, only from measured
+signals, and logs every adjustment. There is no endpoint for the live
+values; restarting restores the configured defaults.
 
 | Knob | Default | Min | Max | Step | Signal |
 |---|---|---|---|---|---|
@@ -196,10 +194,10 @@ or an explicit reason, not built on principle:
   provider would hang every query and ingest; the breaker makes it
   fail fast. The Redis L2 breaker makes a dead cache cost one
   branch instead of a refused connection per request. Both are
-  measured in `/metrics` (state, trips, skipped).
-- **Hot config reload — BUILT.** `POST /v1/admin/config` for the
-  three safe settings (L1 TTL, fan-out timeout, reindex interval).
-  Secrets, auth, rate limits, and retention need a restart.
+  counted in memory (state, trips, skipped).
+- **Hot config reload — REMOVED 2026-11-18** with the admin routes.
+  Settings come from the environment at startup; secrets, auth,
+  rate limits, and retention need a restart.
 - **Automatic index maintenance — BUILT.** `pulse maintenance` runs
   a bare `ANALYZE` after retention; `pulse audit` reports index
   health (counts, never-scanned, last ANALYZE). VACUUM is
@@ -442,7 +440,7 @@ live source was connected during the benchmarks).
   L1 hits dominate the repeated queries (instant path);
   distinct queries are L1+L2 misses by construction. The
   ratio is scenario-defined, not a single number — the
-  `/metrics` counters (`pulse_l1_cache_hits_total`,
+  in-memory counters (`pulse_l1_cache_hits_total`,
   `pulse_queries_cache_hits_total` and their misses) are the
   source of truth per run.
 - Postgres connections during a run: **~3 server connections**

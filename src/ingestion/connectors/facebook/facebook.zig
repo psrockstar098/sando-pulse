@@ -259,24 +259,6 @@ pub const FacebookConnector = struct {
         return pend.len;
     }
 
-    /// Status JSON for GET /v1/connectors/facebook. Never includes
-    /// a credential value.
-    pub fn statusJson(self: *FacebookConnector, alloc: std.mem.Allocator) ![]u8 {
-        const reason = self.validate();
-        const pending: usize = self.pendingNotificationCount(alloc);
-        return std.fmt.allocPrint(alloc,
-            \\{{"connector":"facebook","available":{},"reason":{s},"registered_pages":{d},"pending_pages":{d},"pages_polled_total":{d},"pages_failed_total":{d},"notifications_pending":{d},"api_version":"{s}"}}
-        , .{
-            reason == null,
-            if (reason) |r| try std.fmt.allocPrint(alloc, "\"{s}\"", .{r}) else "null",
-            self.registeredPages(),
-            self.pendingPages(),
-            self.pages_polled_total,
-            self.pages_failed_total,
-            pending,
-            self.auth_cfg.api_version,
-        });
-    }
 
     pub fn verifyWebhookSignature(self: *FacebookConnector, body: []const u8, header: ?[]const u8) bool {
         return webhooks.verifySignature(self.auth_cfg.app_secret, body, header);
@@ -306,10 +288,6 @@ test "connector validates unconfigured; collect returns empty without contacting
     const c = fb.connector();
     try std.testing.expect(c.check(alloc, &env) == .unavailable);
     try std.testing.expectError(error.Unavailable, c.fetch(alloc, io, "https://graph.facebook.com/v27.0/1/posts", &env));
-    // Status JSON never leaks a token (there is none) and reports why.
-    const status = try fb.statusJson(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, status, "\"available\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status, "PULSE_FACEBOOK_ACCESS_TOKEN") != null);
 }
 
 test "connector records a webhook notification and marks the page due" {

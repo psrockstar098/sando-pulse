@@ -107,7 +107,7 @@ pub const QueryPlan = struct {
     sources: []const []const u8,
 };
 
-/// One source's document count, for /v1/sources.
+/// One source's document count.
 pub const SourceCount = struct {
     source_id: []const u8,
     count: usize,

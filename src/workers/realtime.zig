@@ -1,7 +1,7 @@
 //! Real-time processing (Roadmap 4.3): Redis Streams event processing
 //! for the `pulse:events` stream.
 //!
-//! The ingestion pipeline and /v1/ingest publish one
+//! The ingestion pipeline publishes one
 //! `document.collected` event per document (via the Redis EventBus).
 //! The worker consumes them through a consumer group:
 //!

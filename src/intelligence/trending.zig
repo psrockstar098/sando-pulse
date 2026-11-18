@@ -16,7 +16,7 @@ const types = @import("../common/types.zig");
 const knowledge = @import("../storage/knowledge.zig");
 const entities_mod = @import("../engine/entities.zig");
 
-/// Trending window names accepted by /v1/trends (?window=...).
+/// Trending window names (day, week, month).
 pub fn parseWindow(s: ?[]const u8) ?u64 {
     const w = s orelse return 86400;
     if (std.mem.eql(u8, w, "24h")) return 86400;
@@ -232,7 +232,7 @@ pub fn historicalRankings(alloc: std.mem.Allocator, aggregates: []const knowledg
 }
 
 /// The Geez lane: entertainment-category trends, in rank order, capped
-/// at `limit`. Shared by /v1/trends and the precomputed briefing (4.4).
+/// at `limit`. Used by the precomputed briefing.
 pub fn topGeez(alloc: std.mem.Allocator, trends: []const TopicTrend, limit: usize) ![]TopicTrend {
     var out: std.ArrayList(TopicTrend) = .empty;
     errdefer out.deinit(alloc);

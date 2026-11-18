@@ -11,7 +11,7 @@ pub const Config = struct {
     host: []const u8 = "0.0.0.0",
     port: u16 = 9000,
     /// If null, the API runs in open dev mode and logs a warning on boot.
-    /// Set PULSE_API_KEY to require Bearer auth on /v1/query and /v1/ingest.
+    /// Set PULSE_API_KEY to require Bearer auth on /v1/query.
     api_key: ?[]const u8 = null,
     /// Previous key, accepted alongside api_key during rotation
     /// (Roadmap 5.1). Remove it once clients have migrated.

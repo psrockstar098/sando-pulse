@@ -1,7 +1,7 @@
 //! Audit records (Roadmap 5.3): who called what, when, and whether
 //! they were allowed.
 //!
-//! Every authenticated call to /v1/query, /v1/ingest and /v1/usage
+//! Every authenticated call to /v1/query
 //! writes one record: UTC timestamp, consumer name, a fingerprint of
 //! the presented API key (first 8 hex chars of its SHA-256 — the key
 //! itself never appears anywhere), route, method, HTTP status, and the

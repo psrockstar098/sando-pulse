@@ -64,7 +64,7 @@ is a legitimate target.
 
 ## Audit records
 
-Every authenticated `/v1/query`, `/v1/ingest` and `/v1/usage` call
+Every authenticated `/v1/query` call
 writes one record — including denials (bad key, unknown consumer,
 missing scope, rate limit, quota). A record holds: UTC timestamp,
 consumer, key fingerprint, route, method, HTTP status, request id.

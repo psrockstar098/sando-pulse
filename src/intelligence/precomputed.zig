@@ -331,7 +331,7 @@ pub fn computeReport(
         .county = opts.county,
         .social_available = opts.social_available,
         .social_note = if (opts.social_available)
-            "Social trends come from authorized connectors only (Facebook Pages with an approved Meta app; see /v1/connectors/facebook)."
+            "Social trends come from authorized connectors only (Facebook Pages with an approved Meta app)."
         else
             "No authorized social data is connected — the social section is empty by design. Connect an authorized source to fill it; nothing here is scraped or invented.",
         .top_stories = try stories.toOwnedSlice(alloc),
