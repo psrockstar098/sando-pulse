@@ -11,6 +11,12 @@
 #   PULSE_PORT (default 9000), PULSE_PG_DB (default pulse).
 # DATABASE_URL / REDIS_URL, if set, win over the derived defaults.
 #
+# If DATABASE_URL points at a host other than localhost, the database
+# lives outside this container: local Postgres is skipped entirely
+# (no initdb, no server, no createdb) and Pulse connects to it
+# directly — this is how a hosted deploy keeps its data across
+# restarts. Pulse migrates on boot, so the database only needs to exist.
+#
 # Auth: Postgres uses trust on localhost only, superuser `postgres`.
 # This image is for LOCAL use — do not expose port 9000 publicly
 # without setting PULSE_API_KEY.
@@ -27,6 +33,29 @@ export DATABASE_URL="${DATABASE_URL:-postgres://postgres@127.0.0.1:${PGPORT}/${P
 export REDIS_URL="${REDIS_URL:-redis://127.0.0.1:${REDISPORT}}"
 export PULSE_HOST PULSE_PORT
 
+# --- External database? -----------------------------------------------------
+# Parse the host out of DATABASE_URL (credentials are never printed).
+# Local default (127.0.0.1/localhost/::1) means the bundled Postgres;
+# anything else means the database lives outside this container.
+EXTERNAL_DB=0
+DB_HOST="127.0.0.1"
+if [ -n "${DATABASE_URL:-}" ]; then
+    _db_host="${DATABASE_URL#*://}"    # strip scheme
+    _db_host="${_db_host#*@}"          # strip userinfo
+    if [[ "$_db_host" == \[* ]]; then
+        _db_host="${_db_host%%\]*}"    # IPv6: up to ]
+        _db_host="${_db_host#[}"       # strip [
+    else
+        _db_host="${_db_host%%:*}"     # strip port
+        _db_host="${_db_host%%/*}"     # strip path
+    fi
+    DB_HOST="$_db_host"
+    case "$_db_host" in
+        127.0.0.1|localhost|::1|"") ;;
+        *) EXTERNAL_DB=1 ;;
+    esac
+fi
+
 PG_BIN=/usr/lib/postgresql/16/bin
 
 # /var/run is tmpfs: recreate the socket dir on every container start.
@@ -34,6 +63,10 @@ mkdir -p /var/run/postgresql /var/lib/redis /var/log/redis
 chown postgres:postgres /var/run/postgresql
 chown redis:redis /var/lib/redis /var/log/redis
 
+# --- Postgres: local only, skipped for an external database ---------------
+if [ "$EXTERNAL_DB" -eq 1 ]; then
+    echo "[entrypoint] using external database at $DB_HOST — skipping local postgres"
+else
 # --- Postgres: init on first run -------------------------------------------
 if [ ! -s "$PGDATA/PG_VERSION" ]; then
     echo "[entrypoint] initialising postgres data dir $PGDATA"
@@ -59,6 +92,7 @@ su postgres -c "$PG_BIN/pg_isready -h 127.0.0.1 -p '$PGPORT'"
 if ! su postgres -c "psql -h 127.0.0.1 -p '$PGPORT' -tAc \"SELECT 1 FROM pg_database WHERE datname='$PGDATABASE'\"" | grep -q 1; then
     echo "[entrypoint] creating database $PGDATABASE"
     su postgres -c "createdb -h 127.0.0.1 -p '$PGPORT' '$PGDATABASE'"
+fi
 fi
 
 # --- Redis: start if not running -------------------------------------------
@@ -111,5 +145,9 @@ echo "[entrypoint] worker starting in background (pid $!)"
 
 # --- Pulse: migrates on boot, then serves ----------------------------------
 cd /app
-echo "[entrypoint] starting pulse on $PULSE_HOST:$PULSE_PORT (db $PGDATABASE on $PGPORT, redis on $REDISPORT)"
+if [ "$EXTERNAL_DB" -eq 1 ]; then
+    echo "[entrypoint] starting pulse on $PULSE_HOST:$PULSE_PORT (external db at $DB_HOST, redis on $REDISPORT)"
+else
+    echo "[entrypoint] starting pulse on $PULSE_HOST:$PULSE_PORT (db $PGDATABASE on $PGPORT, redis on $REDISPORT)"
+fi
 exec /usr/local/bin/pulse serve
