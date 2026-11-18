@@ -12,11 +12,23 @@
 //!   NOT thread-safe — each slot is used by at most one caller at a time
 //!   (checkout exclusivity), and a dead connection is dropped and
 //!   re-established lazily on the next checkout.
-//! * Plaintext only. `sslmode` is parsed and recorded; `require` /
-//!   `verify-ca` / `verify-full` are REFUSED at connect time with
-//!   `error.TlsNotImplemented` because TLS is out of scope for Phase 1.
-//!   `prefer` (the default) and `disable` connect plaintext, which is the
-//!   intended deployment: the compose network / localhost.
+//! * TLS (Postgres SSLRequest flow, `std.crypto.tls.Client`): `sslmode`
+//!   controls the transport. `disable` never sends SSLRequest;
+//!   `prefer` (the default) tries TLS first and falls back to plaintext
+//!   only when the server answers 'N'; `require` encrypts without
+//!   verifying the certificate; `verify-ca` encrypts and verifies the
+//!   server certificate chain against the system roots
+//!   (`Certificate.Bundle.rescan`); `verify-full` additionally verifies
+//!   the hostname (SNI + SAN check). When TLS is required and the
+//!   server answers 'N', connect fails with `error.TlsNotAvailable` —
+//!   it never silently falls back to plaintext. The TLS state lives in
+//!   a heap-allocated `TlsState` because `tls.Client` holds pointers
+//!   into its buffers; `PgClient` itself moves by value into pool
+//!   slots, so only a pointer to it is stored. The plaintext path is
+//!   unchanged for local setups (Render all-in-one, local dev).
+//!   Test hook: `PULSE_TEST_PG_CA_FILE` (a PEM file) is added to the
+//!   verification bundle when set — used by the live TLS tests with a
+//!   self-signed server cert. Production never sets it.
 //! * Timeouts: NONE are available in std 0.17.1's Threaded Io — passing a
 //!   connect timeout panics the process ("TODO implement
 //!   netConnectIpPosix with timeout", verified 2026-11-12), and there is no
@@ -50,7 +62,10 @@ pub const PgError = error{
     InvalidHost,
     UnknownHost,
     UnsupportedSslMode,
-    TlsNotImplemented,
+    /// The server answered 'N' to SSLRequest while the sslmode
+    /// (require / verify-ca / verify-full) demanded TLS. Never a
+    /// silent plaintext fallback.
+    TlsNotAvailable,
     UnsupportedAuthMethod,
     UnsupportedSaslMechanism,
     ScramServerNonceMismatch,
@@ -421,6 +436,35 @@ pub const QueryResult = struct {
     }
 };
 
+/// SSLRequest message (no type byte): int32 len (8) + int32 80877103.
+/// Sent before the startup message when sslmode is not `disable`;
+/// the server answers with a single byte: 'S' (TLS supported) or
+/// 'N' (no TLS). See buildSslRequest test for the exact bytes.
+fn buildSslRequest() [8]u8 {
+    var out: [8]u8 = undefined;
+    std.mem.writeInt(u32, out[0..4], 8, .big);
+    std.mem.writeInt(u32, out[4..8], 80877103, .big);
+    return out;
+}
+
+/// Heap-allocated TLS transport state. `std.crypto.tls.Client` holds
+/// pointers into these buffers (its input/output readers and the CA
+/// bundle), so this struct must never move after the handshake —
+/// `PgClient` itself moves by value into pool slots, so only a
+/// pointer to it is stored on the client. Created in `upgradeToTls`,
+/// freed in `closeStreamOnly`.
+const TlsState = struct {
+    socket_read_buf: [std.crypto.tls.Client.min_buffer_len + 8192]u8 = undefined,
+    socket_write_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
+    tls_read_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
+    tls_write_buf: [std.crypto.tls.Client.min_buffer_len + 8192]u8 = undefined,
+    stream_reader: std.Io.net.Stream.Reader = undefined,
+    stream_writer: std.Io.net.Stream.Writer = undefined,
+    client: std.crypto.tls.Client = undefined,
+    ca_bundle: std.crypto.Certificate.Bundle = .empty,
+    ca_lock: std.Io.RwLock = .init,
+};
+
 /// Startup message (no type byte): length + protocol 196608 + params.
 /// Layout: int32 len | int32 196608 | "user\0" user "\0" "database\0" db "\0" "\0".
 fn buildStartupMessage(alloc: Allocator, user: []const u8, database: []const u8) ![]u8 {
@@ -529,6 +573,10 @@ pub const PgClient = struct {
     io: std.Io,
     info: ConnInfo,
     stream: std.Io.net.Stream,
+    /// Non-null once the connection was upgraded to TLS (see
+    /// `upgradeToTls`). Heap-allocated: the TLS client holds pointers
+    /// into it, and this struct moves by value into pool slots.
+    tls: ?*TlsState = null,
     read_buf: [8192]u8 = undefined,
     read_pos: usize = 0,
     read_len: usize = 0,
@@ -543,10 +591,6 @@ pub const PgClient = struct {
         // (Without the flag the two errdefers would double-free.)
         var info_owned = true;
         errdefer if (info_owned) info.deinit(alloc);
-        switch (info.sslmode) {
-            .require, .verify_ca, .verify_full => return error.TlsNotImplemented,
-            .disable, .prefer => {},
-        }
         const addr = try resolveHost(io, info.host, info.port);
         const stream = std.Io.net.IpAddress.connect(&addr, io, .{
             .mode = .stream,
@@ -568,11 +612,105 @@ pub const PgClient = struct {
         };
         info_owned = false;
         errdefer self.closeStreamOnly();
+        // TLS negotiation (SSLRequest) runs before the startup message.
+        // `disable` skips it entirely; `prefer` falls back to plaintext
+        // on 'N'; the strict modes fail cleanly on 'N' instead of
+        // silently downgrading (see `negotiateTls`).
+        try self.negotiateTls();
         const startup = try buildStartupMessage(alloc, info.user, info.database);
         defer alloc.free(startup);
         try self.sendRaw(startup);
         try self.authenticate();
         return self;
+    }
+
+    /// SSLRequest negotiation per `self.info.sslmode`. Sends SSLRequest
+    /// (unless `disable`) and reads the server's 1-byte reply:
+    ///   'S' -> perform the TLS handshake over the same socket.
+    ///   'N' -> `prefer` continues plaintext; the strict modes
+    ///          (`require` / `verify-ca` / `verify-full`) fail with
+    ///          `error.TlsNotAvailable`.
+    /// Any other reply byte is a protocol error. A handshake failure
+    /// after 'S' is returned as-is — never a plaintext fallback.
+    fn negotiateTls(self: *PgClient) !void {
+        if (self.info.sslmode == .disable) return;
+        const req = buildSslRequest();
+        try self.sendRaw(&req);
+        const reply = try self.readByte();
+        switch (reply) {
+            'S' => try self.upgradeToTls(),
+            'N' => switch (self.info.sslmode) {
+                .prefer => {},
+                .require, .verify_ca, .verify_full => return error.TlsNotAvailable,
+                .disable => unreachable, // returned above
+            },
+            else => return error.ProtocolError,
+        }
+    }
+
+    /// Perform the TLS handshake over the established socket. The
+    /// server has already answered 'S' to SSLRequest. Verification
+    /// follows sslmode: `require` encrypts without verifying;
+    /// `verify-ca` verifies the chain against the system roots;
+    /// `verify-full` additionally verifies the hostname (SNI + SAN).
+    /// `prefer` after an 'S' reply verifies like `require` (encrypt,
+    /// no verification) — libpq's prefer never verifies either.
+    fn upgradeToTls(self: *PgClient) !void {
+        const tls = try self.alloc.create(TlsState);
+        errdefer self.alloc.destroy(tls);
+        tls.* = .{};
+        tls.stream_reader = self.stream.reader(self.io, &tls.socket_read_buf);
+        tls.stream_writer = self.stream.writer(self.io, &tls.socket_write_buf);
+        const verify = self.info.sslmode == .verify_ca or self.info.sslmode == .verify_full;
+        if (verify) {
+            const now = std.Io.Timestamp.now(self.io, .real);
+            // System roots first; a missing store leaves the bundle
+            // empty and verification fails closed at handshake time.
+            tls.ca_bundle.rescan(self.alloc, self.io, now) catch |err| {
+                return err;
+            };
+            // Test hook: an extra PEM CA file (self-signed test cert)
+            // is added to the bundle when PULSE_TEST_PG_CA_FILE is
+            // set. Production never sets this.
+            if (try getTestEnvVar(self.alloc, self.io, "PULSE_TEST_PG_CA_FILE")) |ca_file| {
+                defer self.alloc.free(ca_file);
+                tls.ca_bundle.addCertsFromFilePathAbsolute(self.alloc, self.io, now, ca_file) catch |err| {
+                    tls.ca_bundle.deinit(self.alloc);
+                    return err;
+                };
+            }
+        }
+        var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
+        self.io.random(&entropy);
+        tls.client = std.crypto.tls.Client.init(
+            &tls.stream_reader.interface,
+            &tls.stream_writer.interface,
+            .{
+                .host = if (self.info.sslmode == .verify_full)
+                    .{ .explicit = self.info.host }
+                else
+                    .no_verification,
+                .ca = if (verify)
+                    .{ .bundle = .{
+                        .gpa = self.alloc,
+                        .io = self.io,
+                        .lock = &tls.ca_lock,
+                        .bundle = &tls.ca_bundle,
+                    } }
+                else
+                    .no_verification,
+                .read_buffer = &tls.tls_read_buf,
+                .write_buffer = &tls.tls_write_buf,
+                .entropy = &entropy,
+                .realtime_now = std.Io.Timestamp.now(self.io, .real),
+            },
+        ) catch |err| {
+            // The handshake failed: free the half-built state and let
+            // the caller see the TLS error (never fall back).
+            tls.ca_bundle.deinit(self.alloc);
+            return err;
+        };
+        self.tls = tls;
     }
 
     pub fn close(self: *PgClient) void {
@@ -586,6 +724,13 @@ pub const PgClient = struct {
     fn closeStreamOnly(self: *PgClient) void {
         if (!self.open) return;
         self.open = false;
+        if (self.tls) |tls| {
+            // Best-effort close_notify; ignore failure, we are closing anyway.
+            tls.client.end() catch {};
+            tls.ca_bundle.deinit(self.alloc);
+            self.alloc.destroy(tls);
+            self.tls = null;
+        }
         self.stream.close(self.io);
         self.info.deinit(self.alloc);
         if (self.last_error) |e| self.alloc.free(e);
@@ -708,6 +853,15 @@ pub const PgClient = struct {
     // ---- low-level I/O ----
 
     fn sendRaw(self: *PgClient, data: []const u8) !void {
+        if (self.tls) |tls| {
+            try tls.client.writer.writeAll(data);
+            try tls.client.writer.flush();
+            // The TLS writer encrypts into the socket writer's buffer
+            // but does NOT flush it — without this the bytes sit unsent
+            // (proven in the ingestion fetcher: servers wait forever).
+            try tls.stream_writer.interface.flush();
+            return;
+        }
         var wbuf: [4096]u8 = undefined;
         var w = self.stream.writer(self.io, &wbuf);
         try w.interface.writeAll(data);
@@ -716,6 +870,23 @@ pub const PgClient = struct {
 
     /// Read exactly `buf.len` bytes, refilling the internal buffer as needed.
     fn readExact(self: *PgClient, buf: []u8) !void {
+        if (self.tls) |tls| {
+            // Read straight through the TLS reader, asking for exactly
+            // `buf.len` bytes. NEVER refill the 8 KiB `read_buf` with
+            // `readVec` here: `Reader.readVec` issues another vtable
+            // read whenever the destination is not filled, and the TLS
+            // vtable read blocks for the next record — but the server
+            // sends nothing more until it gets our reply, so that
+            // deadlocks until the server's 60 s auth timeout closes
+            // the connection (proven live: the backend sat in
+            // "authentication" while the client sat in readVec).
+            // `readSliceAll` stops as soon as `buf` is full: it only
+            // ever waits for bytes the server has already sent.
+            // (The TLS reader's own buffer holds decrypted records,
+            // so small reads stay cheap without our cache.)
+            try tls.client.reader.readSliceAll(buf);
+            return;
+        }
         var done: usize = 0;
         while (done < buf.len) {
             if (self.read_pos < self.read_len) {
@@ -1119,9 +1290,7 @@ pub fn runMigrations(alloc: Allocator, io: std.Io, conninfo: []const u8, dir: []
         const version = fname[0 .. fname.len - ".sql".len];
         const esc_version = try escapeLiteral(alloc, version);
         defer alloc.free(esc_version);
-        const check_sql = try std.fmt.allocPrint(alloc,
-            "SELECT 1 FROM schema_migrations WHERE version = {s}",
-            .{esc_version});
+        const check_sql = try std.fmt.allocPrint(alloc, "SELECT 1 FROM schema_migrations WHERE version = {s}", .{esc_version});
         defer alloc.free(check_sql);
         var res = try client.query(alloc, check_sql);
         defer res.deinit(alloc);
@@ -1135,9 +1304,7 @@ pub fn runMigrations(alloc: Allocator, io: std.Io, conninfo: []const u8, dir: []
             client.exec(alloc, "ROLLBACK;") catch {};
             return err;
         };
-        const ins = try std.fmt.allocPrint(alloc,
-            "INSERT INTO schema_migrations(version) VALUES ({s})",
-            .{esc_version});
+        const ins = try std.fmt.allocPrint(alloc, "INSERT INTO schema_migrations(version) VALUES ({s})", .{esc_version});
         defer alloc.free(ins);
         try client.exec(alloc, ins);
     }
@@ -1887,7 +2054,8 @@ pub const PostgresStore = struct {
         errdefer self.dropRead(conn);
         defer self.checkinRead(conn);
         const client = conn.client;
-        var res = try client.query(alloc,
+        var res = try client.query(
+            alloc,
             "SELECT source_id, count(*) FROM documents GROUP BY source_id ORDER BY count(*) DESC",
         );
         defer res.deinit(alloc);
@@ -2079,7 +2247,7 @@ test "postgres: parseConnInfo" {
     try testing.expectEqualStrings("p@ss", pct.password.?);
     try testing.expectEqualStrings("d b", pct.database);
 
-    // postgresql:// scheme + sslmode=require parses (connect refuses it).
+    // postgresql:// scheme + sslmode=require parses (connect negotiates TLS).
     var req = try parseConnInfo(alloc, "postgresql://u:p@h/db?sslmode=require");
     defer req.deinit(alloc);
     try testing.expectEqual(SslMode.require, req.sslmode);
@@ -2141,6 +2309,217 @@ pub fn getTestEnvVar(alloc: Allocator, io: std.Io, name: []const u8) !?[]u8 {
         }
     }
     return null;
+}
+
+test "postgres: sslrequest bytes" {
+    // SSLRequest: int32 len (8) + int32 80877103 (0x04D2162F).
+    const req = buildSslRequest();
+    try testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 8, 0x04, 0xD2, 0x16, 0x2F }, &req);
+}
+
+/// Read exactly `buf.len` bytes through a persistent stream reader
+/// (test helper). The reader MUST live for the whole connection: a
+/// fresh reader per read would silently drop bytes it over-read into
+/// its own buffer (one socket read returns the whole pending chunk),
+/// and the next read would then block forever on bytes already
+/// consumed. That exact bug hung this test file until it was fixed.
+fn fakeReadExact(reader: *std.Io.Reader, buf: []u8) !void {
+    try reader.readSliceAll(buf);
+}
+
+/// Write bytes through a persistent stream writer (test helper).
+fn fakeWriteAll(writer: *std.Io.Writer, data: []const u8) !void {
+    try writer.writeAll(data);
+    try writer.flush();
+}
+
+/// Send AuthenticationOk + ReadyForQuery (the two messages `connect`
+/// waits for after the startup message).
+fn fakeAuthOk(writer: *std.Io.Writer) !void {
+    // 'R' | len 8 | int32 0 (AuthenticationOk)
+    try fakeWriteAll(writer, &[_]u8{ 'R', 0, 0, 0, 8, 0, 0, 0, 0 });
+    // 'Z' | len 5 | 'I' (ReadyForQuery, idle)
+    try fakeWriteAll(writer, &[_]u8{ 'Z', 0, 0, 0, 5, 'I' });
+}
+
+test "postgres: sslmode=prefer falls back to plaintext on 'N'" {
+    const alloc = testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Server: expect SSLRequest, answer 'N', then complete the
+    // plaintext startup handshake.
+    const Server = struct {
+        fn run(srv: *std.Io.net.Server, io2: std.Io) void {
+            var conn = srv.accept(io2) catch return;
+            defer conn.close(io2);
+            var rbuf: [4096]u8 = undefined;
+            var wbuf: [4096]u8 = undefined;
+            var reader = conn.reader(io2, &rbuf);
+            var writer = conn.writer(io2, &wbuf);
+            const r = &reader.interface;
+            const w = &writer.interface;
+            var req: [8]u8 = undefined;
+            fakeReadExact(r, &req) catch return;
+            // Must be the SSLRequest bytes, nothing else.
+            if (!std.mem.eql(u8, &req, &buildSslRequest())) return;
+            fakeWriteAll(w, "N") catch return;
+            // Startup message: int32 len, then the body.
+            var lenb: [4]u8 = undefined;
+            fakeReadExact(r, &lenb) catch return;
+            const len = std.mem.readInt(u32, &lenb, .big);
+            if (len < 4 or len > 1024) return;
+            var body_buf: [1024]u8 = undefined;
+            const body = body_buf[0 .. len - 4];
+            fakeReadExact(r, body) catch return;
+            // Body starts with protocol 196608 (0x00030000).
+            if (body.len < 4 or std.mem.readInt(u32, body[0..4], .big) != 196608) return;
+            fakeAuthOk(w) catch return;
+            // Hold the connection briefly so the client can close cleanly.
+            PgPool.sleepNanos(50_000_000);
+        }
+    };
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 18778);
+    var server = std.Io.net.IpAddress.listen(&addr, io, .{ .reuse_address = true }) catch |err| {
+        std.debug.print("skip: cannot bind test listener: {any}\n", .{err});
+        return;
+    };
+    defer server.deinit(io);
+    const t = try std.Thread.spawn(.{}, Server.run, .{ &server, io });
+    var client = try PgClient.connect(alloc, io, "postgres://postgres:pw@127.0.0.1:18778/pulse?sslmode=prefer");
+    defer client.close();
+    // Plaintext fallback: no TLS state on the client.
+    try testing.expect(client.tls == null);
+    t.join();
+}
+
+test "postgres: sslmode=require fails cleanly on 'N'" {
+    const alloc = testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const Server = struct {
+        fn run(srv: *std.Io.net.Server, io2: std.Io) void {
+            var conn = srv.accept(io2) catch return;
+            defer conn.close(io2);
+            var rbuf: [4096]u8 = undefined;
+            var wbuf: [4096]u8 = undefined;
+            var reader = conn.reader(io2, &rbuf);
+            var writer = conn.writer(io2, &wbuf);
+            var req: [8]u8 = undefined;
+            fakeReadExact(&reader.interface, &req) catch return;
+            fakeWriteAll(&writer.interface, "N") catch return;
+            PgPool.sleepNanos(50_000_000);
+        }
+    };
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 18779);
+    var server = std.Io.net.IpAddress.listen(&addr, io, .{ .reuse_address = true }) catch |err| {
+        std.debug.print("skip: cannot bind test listener: {any}\n", .{err});
+        return;
+    };
+    defer server.deinit(io);
+    const t = try std.Thread.spawn(.{}, Server.run, .{ &server, io });
+    // Must fail with TlsNotAvailable — never a silent plaintext fallback.
+    try testing.expectError(error.TlsNotAvailable, PgClient.connect(alloc, io, "postgres://postgres:pw@127.0.0.1:18779/pulse?sslmode=require"));
+    t.join();
+}
+
+test "postgres: sslmode=require sends TLS ClientHello after 'S', never plaintext" {
+    const alloc = testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var first_byte = std.atomic.Value(u8).init(0);
+    const Server = struct {
+        first: *std.atomic.Value(u8),
+        fn run(self: *@This(), srv: *std.Io.net.Server, io2: std.Io) void {
+            var conn = srv.accept(io2) catch return;
+            defer conn.close(io2);
+            var rbuf: [4096]u8 = undefined;
+            var wbuf: [4096]u8 = undefined;
+            var reader = conn.reader(io2, &rbuf);
+            var writer = conn.writer(io2, &wbuf);
+            var req: [8]u8 = undefined;
+            fakeReadExact(&reader.interface, &req) catch return;
+            fakeWriteAll(&writer.interface, "S") catch return;
+            // Record the first byte the client sends next: a TLS
+            // ClientHello starts with 0x16 (handshake record); a
+            // plaintext startup message starts with 0x00 (length).
+            var b: [1]u8 = undefined;
+            fakeReadExact(&reader.interface, &b) catch return;
+            self.first.store(b[0], .seq_cst);
+            PgPool.sleepNanos(50_000_000);
+        }
+    };
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 18780);
+    var server = std.Io.net.IpAddress.listen(&addr, io, .{ .reuse_address = true }) catch |err| {
+        std.debug.print("skip: cannot bind test listener: {any}\n", .{err});
+        return;
+    };
+    defer server.deinit(io);
+    var srv_ctx = Server{ .first = &first_byte };
+    const t = try std.Thread.spawn(.{}, Server.run, .{ &srv_ctx, &server, io });
+    // The server closes after 'S' without a TLS stack, so the handshake
+    // must fail — the point is it fails, never succeeds plaintext.
+    const res = PgClient.connect(alloc, io, "postgres://postgres:pw@127.0.0.1:18780/pulse?sslmode=require");
+    if (res) |c| {
+        var cl = c;
+        cl.close();
+        t.join();
+        return error.TestUnexpectedResult;
+    } else |err| {
+        // Not TlsNotAvailable: the server DID offer TLS; the failure is
+        // the handshake itself (EOF / truncated / alert).
+        try testing.expect(err != error.TlsNotAvailable);
+    }
+    t.join();
+    // The client began a TLS handshake (0x16), not a plaintext startup.
+    try testing.expectEqual(@as(u8, 0x16), first_byte.load(.seq_cst));
+}
+
+test "postgres: sslmode=disable sends no SSLRequest" {
+    const alloc = testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const Server = struct {
+        fn run(srv: *std.Io.net.Server, io2: std.Io) void {
+            var conn = srv.accept(io2) catch return;
+            defer conn.close(io2);
+            var rbuf: [4096]u8 = undefined;
+            var wbuf: [4096]u8 = undefined;
+            var reader = conn.reader(io2, &rbuf);
+            var writer = conn.writer(io2, &wbuf);
+            const r = &reader.interface;
+            const w = &writer.interface;
+            // First bytes must be the startup message itself: int32 len
+            // 38 for user "postgres" / db "pulse", then protocol 196608.
+            var lenb: [4]u8 = undefined;
+            fakeReadExact(r, &lenb) catch return;
+            const len = std.mem.readInt(u32, &lenb, .big);
+            if (len != 38) return;
+            var body: [34]u8 = undefined;
+            fakeReadExact(r, &body) catch return;
+            if (std.mem.readInt(u32, body[0..4], .big) != 196608) return;
+            fakeAuthOk(w) catch return;
+            PgPool.sleepNanos(50_000_000);
+        }
+    };
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 18781);
+    var server = std.Io.net.IpAddress.listen(&addr, io, .{ .reuse_address = true }) catch |err| {
+        std.debug.print("skip: cannot bind test listener: {any}\n", .{err});
+        return;
+    };
+    defer server.deinit(io);
+    const t = try std.Thread.spawn(.{}, Server.run, .{ &server, io });
+    var client = try PgClient.connect(alloc, io, "postgres://postgres:pw@127.0.0.1:18781/pulse?sslmode=disable");
+    defer client.close();
+    try testing.expect(client.tls == null);
+    t.join();
 }
 
 test "postgres: server dying mid-handshake fails cleanly" {
@@ -2601,4 +2980,183 @@ test "PgPool: two threads hold two connections at once (live)" {
     const c = try pool.checkout();
     try c.ping();
     pool.checkin(c);
+}
+
+/// Build a test URL for the SSL Postgres: PULSE_TEST_POSTGRES_SSL_URL
+/// plus an sslmode query param. Null (skip the test) when the env var
+/// is unset. The base URL carries no sslmode of its own.
+fn sslTestUrl(alloc: Allocator, io: std.Io, sslmode: []const u8) !?[]u8 {
+    const base = (try getTestEnvVar(alloc, io, "PULSE_TEST_POSTGRES_SSL_URL")) orelse return null;
+    defer alloc.free(base);
+    return try std.fmt.allocPrint(alloc, "{s}?sslmode={s}", .{ base, sslmode });
+}
+
+test "postgres: live TLS require" {
+    const alloc = testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const url = (try sslTestUrl(alloc, io, "require")) orelse {
+        std.debug.print("skip: PULSE_TEST_POSTGRES_SSL_URL not set\n", .{});
+        return;
+    };
+    defer alloc.free(url);
+
+    var client = PgClient.connect(alloc, io, url) catch |err| {
+        std.debug.print("live TLS test: connect failed: {any}\n", .{err});
+        return err;
+    };
+    defer client.close();
+    // The connection really was upgraded: TLS state exists.
+    try testing.expect(client.tls != null);
+    try client.ping();
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var res = try client.query(a, "SELECT 1 AS one, 'tls' AS mode");
+    defer res.deinit(a);
+    try testing.expectEqual(@as(usize, 1), res.rows.len);
+    try testing.expectEqualStrings("1", res.rows[0].cols[0].?);
+    try testing.expectEqualStrings("tls", res.rows[0].cols[1].?);
+    // A parameterised query over the TLS connection works too.
+    var prepped = try client.queryParams(a, "SELECT $1::int AS a", &.{"42"});
+    defer prepped.deinit(a);
+    try testing.expectEqualStrings("42", prepped.rows[0].cols[0].?);
+}
+
+test "postgres: live TLS verify-ca" {
+    const alloc = testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ca_file = (try getTestEnvVar(alloc, io, "PULSE_TEST_PG_CA_FILE")) orelse {
+        std.debug.print("skip: PULSE_TEST_PG_CA_FILE not set\n", .{});
+        return;
+    };
+    defer alloc.free(ca_file);
+    const url = (try sslTestUrl(alloc, io, "verify-ca")) orelse {
+        std.debug.print("skip: PULSE_TEST_POSTGRES_SSL_URL not set\n", .{});
+        return;
+    };
+    defer alloc.free(url);
+
+    var client = PgClient.connect(alloc, io, url) catch |err| {
+        std.debug.print("live TLS verify-ca test: connect failed: {any}\n", .{err});
+        return err;
+    };
+    defer client.close();
+    try testing.expect(client.tls != null);
+    try client.ping();
+}
+
+test "postgres: live TLS verify-full" {
+    const alloc = testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ca_file = (try getTestEnvVar(alloc, io, "PULSE_TEST_PG_CA_FILE")) orelse {
+        std.debug.print("skip: PULSE_TEST_PG_CA_FILE not set\n", .{});
+        return;
+    };
+    defer alloc.free(ca_file);
+    const url = (try sslTestUrl(alloc, io, "verify-full")) orelse {
+        std.debug.print("skip: PULSE_TEST_POSTGRES_SSL_URL not set\n", .{});
+        return;
+    };
+    defer alloc.free(url);
+
+    var client = PgClient.connect(alloc, io, url) catch |err| {
+        std.debug.print("live TLS verify-full test: connect failed: {any}\n", .{err});
+        return err;
+    };
+    defer client.close();
+    try testing.expect(client.tls != null);
+    try client.ping();
+}
+
+test "postgres: live TLS prefer uses TLS on an SSL server" {
+    const alloc = testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const url = (try sslTestUrl(alloc, io, "prefer")) orelse {
+        std.debug.print("skip: PULSE_TEST_POSTGRES_SSL_URL not set\n", .{});
+        return;
+    };
+    defer alloc.free(url);
+
+    var client = try PgClient.connect(alloc, io, url);
+    defer client.close();
+    try testing.expect(client.tls != null);
+    try client.ping();
+}
+
+test "postgres: live TLS disable stays plaintext on an SSL server" {
+    const alloc = testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const url = (try sslTestUrl(alloc, io, "disable")) orelse {
+        std.debug.print("skip: PULSE_TEST_POSTGRES_SSL_URL not set\n", .{});
+        return;
+    };
+    defer alloc.free(url);
+
+    var client = try PgClient.connect(alloc, io, url);
+    defer client.close();
+    // No SSLRequest was sent, so no TLS state — yet the server still
+    // accepts the plaintext connection (ssl=on does not force TLS
+    // unless pg_hba requires hostssl).
+    try testing.expect(client.tls == null);
+    try client.ping();
+}
+
+test "postgres: live TLS require fails on a plaintext server" {
+    const alloc = testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const base = (try getTestEnvVar(alloc, io, "PULSE_TEST_POSTGRES_URL")) orelse {
+        std.debug.print("skip: PULSE_TEST_POSTGRES_URL not set\n", .{});
+        return;
+    };
+    defer alloc.free(base);
+    const url = try std.fmt.allocPrint(alloc, "{s}?sslmode=require", .{base});
+    defer alloc.free(url);
+
+    try testing.expectError(error.TlsNotAvailable, PgClient.connect(alloc, io, url));
+}
+
+test "postgres: live TLS verify-ca fails without a trusted CA" {
+    // The negative half of verify-ca: with no CA file in the
+    // environment, the self-signed server cert is not in the system
+    // roots, so the handshake must fail closed. Skipped whenever
+    // PULSE_TEST_PG_CA_FILE is set (the positive tests own that run).
+    const alloc = testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    if (try getTestEnvVar(alloc, io, "PULSE_TEST_PG_CA_FILE")) |ca| {
+        alloc.free(ca);
+        std.debug.print("skip: PULSE_TEST_PG_CA_FILE is set (positive run)\n", .{});
+        return;
+    }
+    const url = (try sslTestUrl(alloc, io, "verify-ca")) orelse {
+        std.debug.print("skip: PULSE_TEST_POSTGRES_SSL_URL not set\n", .{});
+        return;
+    };
+    defer alloc.free(url);
+
+    const res = PgClient.connect(alloc, io, url);
+    if (res) |c| {
+        var cl = c;
+        cl.close();
+        return error.TestUnexpectedResult;
+    } else |err| {
+        // Not TlsNotAvailable: the server DID offer TLS; the failure
+        // is the certificate verification itself.
+        std.debug.print("verify-ca without CA failed as expected: {any}\n", .{err});
+        try testing.expect(err != error.TlsNotAvailable);
+    }
 }
