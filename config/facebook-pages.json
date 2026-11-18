@@ -1,0 +1,109 @@
+{
+  "pages": [
+    {
+      "category": "community",
+      "name": "Chronic circle",
+      "notes": "Dominic's own page. Page access token verified live 2026-11-18 (490 fans, posts readable).",
+      "page_id": "106003915444667",
+      "priority": 1
+    },
+    {
+      "category": "media",
+      "name": "FrontPage Africa",
+      "notes": "Liberian news organization. Page ID to be added after partnership / authorized Page access is arranged.",
+      "page_id": "",
+      "priority": 1
+    },
+    {
+      "category": "media",
+      "name": "Spoon Network",
+      "notes": "Liberian media network (Spoon TV / Spoon FM). Page ID to be added after partnership / authorized Page access is arranged.",
+      "page_id": "",
+      "priority": 1
+    },
+    {
+      "category": "media",
+      "name": "The Daily Observer",
+      "notes": "Liberian newspaper. Page ID to be added after partnership / authorized Page access is arranged.",
+      "page_id": "",
+      "priority": 1
+    },
+    {
+      "category": "media",
+      "name": "OK FM",
+      "notes": "Liberian radio station. Page ID to be added after partnership / authorized Page access is arranged.",
+      "page_id": "",
+      "priority": 1
+    },
+    {
+      "category": "community",
+      "name": "Monrovia community",
+      "notes": "Public community Page for Monrovia. Specific Page to be agreed with its administrators.",
+      "page_id": "",
+      "priority": 2
+    },
+    {
+      "category": "community",
+      "name": "Red Light community",
+      "notes": "Public community Page for Red Light, Paynesville. Specific Page to be agreed with its administrators.",
+      "page_id": "",
+      "priority": 2
+    },
+    {
+      "category": "community",
+      "name": "Paynesville community",
+      "notes": "Public community Page for Paynesville. Specific Page to be agreed with its administrators.",
+      "page_id": "",
+      "priority": 2
+    },
+    {
+      "category": "community",
+      "name": "Lofa community",
+      "notes": "Public community Page for Lofa County. Specific Page to be agreed with its administrators.",
+      "page_id": "",
+      "priority": 2
+    },
+    {
+      "category": "community",
+      "name": "Nimba community",
+      "notes": "Public community Page for Nimba County. Specific Page to be agreed with its administrators.",
+      "page_id": "",
+      "priority": 2
+    },
+    {
+      "category": "community",
+      "name": "Bong community",
+      "notes": "Public community Page for Bong County. Specific Page to be agreed with its administrators.",
+      "page_id": "",
+      "priority": 2
+    },
+    {
+      "category": "community",
+      "name": "Grand Bassa community",
+      "notes": "Public community Page for Grand Bassa County. Specific Page to be agreed with its administrators.",
+      "page_id": "",
+      "priority": 2
+    },
+    {
+      "category": "official",
+      "name": "Government of Liberia — official",
+      "notes": "Public-interest / official source: government institutions, election announcements, emergency information, education, public service. Specific Page to be agreed.",
+      "page_id": "",
+      "priority": 3
+    },
+    {
+      "category": "official",
+      "name": "National Elections Commission — official",
+      "notes": "Election announcements and results. Specific Page to be agreed.",
+      "page_id": "",
+      "priority": 3
+    },
+    {
+      "category": "official",
+      "name": "Emergency / public service — official",
+      "notes": "Emergency information and public service announcements. Specific Page to be agreed.",
+      "page_id": "",
+      "priority": 3
+    }
+  ]
+}

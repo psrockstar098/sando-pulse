@@ -2,7 +2,7 @@
 
 Last verified: **2026-11-14 ~21:20 GMT**. Zig 0.17.1 (`~/.local/bin/zig`).
 
-**2026-11-18 simplification (Dominic's order): the API was cut from 35 routes to 3 — `POST /v1/query`, `GET /v1/health`, `GET/POST /v1/webhooks/facebook`. The Trust Engine modules (trust, history, actions, decision, prediction, monitor, forecast, quality, social) and their tests are deleted; the route table, OpenAPI spec and API guide were rewritten to match. Verified same day: 285/285 tests pass on a clean cache, and the all-in-one image against the live VM DB returns health 200 with 120 documents before and after a container restart. The notes below are history from before the cut — endpoint lists and counts in them no longer describe the API.**
+**2026-11-18 simplification (Dominic's order): the API was cut from 35 routes to 3 — `POST /v1/query`, `GET /v1/health`, `GET/POST /v1/webhooks/facebook`. The Trust Engine modules (trust, history, actions, decision, prediction, monitor, forecast, quality, social) and their tests are deleted; the route table, OpenAPI spec and API guide were rewritten to match. Verified same day: 277/285 tests pass on a clean cache — the 8 failures are live-Postgres tests that cannot connect because no test database exists on the VM right now (port 5432 is held by the live Pulse DB), not a code problem — and the all-in-one image against the live VM DB returns health 200 with 120 documents before and after a container restart. The notes below are history from before the cut — endpoint lists and counts in them no longer describe the API.**
 
 ⚠ Environment note (2026-11-14 ~20:10–20:35): the VM was REPLACED —
 PostgreSQL and Redis packages were gone entirely and the `pulse_test`

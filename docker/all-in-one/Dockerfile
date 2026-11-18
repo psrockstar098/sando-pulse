@@ -76,6 +76,7 @@ RUN python3 -m venv /opt/searxng-venv \
 # Pulse binary (built on the host by build.sh) + migrations + entrypoint.
 COPY docker/all-in-one/pulse /usr/local/bin/pulse
 COPY migrations /app/migrations
+COPY config /app/config
 COPY docker/all-in-one/entrypoint.sh /usr/local/bin/pulse-entrypoint.sh
 RUN chmod +x /usr/local/bin/pulse /usr/local/bin/pulse-entrypoint.sh
 
